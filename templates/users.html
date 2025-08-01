@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>User Management</title>
+    <style>
+        body { font-family: Arial, sans-serif; background-color: #f0f2f5; margin: 0; padding: 20px; }
+        .header { background-color: #007bff; color: white; padding: 10px 20px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;}
+        .header h1 { margin: 0; font-size: 24px; }
+        .header .auth-status { font-size: 14px; }
+        .header .auth-status a { color: white; text-decoration: none; margin-left: 15px; }
+        .header .auth-status a:hover { text-decoration: underline; }
+
+        .container { max-width: 800px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1); }
+        h2 { text-align: center; margin-bottom: 25px; color: #333; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        .form-section { margin-top: 30px; border-top: 1px solid #eee; padding-top: 20px; }
+        .form-group { margin-bottom: 15px; }
+        .form-group label { display: block; margin-bottom: 5px; font-weight: bold; color: #555; }
+        .form-group input[type="text"], .form-group input[type="password"] { width: calc(100% - 20px); padding: 10px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+        .form-group input[type="checkbox"] { margin-right: 8px; }
+        button { padding: 10px 20px; background-color: #28a745; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; transition: background-color 0.3s ease; }
+        button:hover { background-color: #218838; }
+        .flash-messages { list-style-type: none; padding: 0; margin-bottom: 20px; }
+        .flash-messages li { padding: 8px 15px; margin-bottom: 10px; border-radius: 4px; font-size: 0.9em; }
+        .flash-messages li.info { background-color: #e0f7fa; color: #007bb6; border: 1px solid #00acc1; }
+        .flash-messages li.warning { background-color: #fffde7; color: #c58600; border: 1px solid #ffeb3b; }
+        .flash-messages li.error { background-color: #ffebee; color: #d32f2f; border: 1px solid #f44336; }
+        .flash-messages li.success { background-color: #e8f5e9; color: #2e7d32; border: 1px solid #4caf50; }
+        .flash-messages li.flash-critical { background-color: #ffcdd2; color: #b71c1c; border: 1px solid #e53935; font-weight: bold; }
+        .back-link { display: block; text-align: center; margin-top: 20px; color: #007bff; text-decoration: none; }
+        .back-link:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>User Management</h1>
+        <div class="auth-status">
+            Logged in as {{ current_user.id }} | <a href="{{ url_for('logout') }}">Logout</a>
+        </div>
+    </div>
+    <div class="container">
+        <ul class="flash-messages">
+            {% for message in messages %}
+                <li class="{{ message.css_class }}">{{ message.message }}</li>
+            {% endfor %}
+        </ul>
+
+        <h2>Existing Users</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Username</th>
+                    <th>Corrections Made</th>
+                    <th>Is Admin</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for user in users %}
+                <tr>
+                    <td>{{ user.id }}</td>
+                    <td>{{ user.correction_count }}</td>
+                    <td>{{ 'Yes' if user.is_admin else 'No' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        {% if current_user.is_admin %}
+        <div class="form-section">
+            <h2>Add New User</h2>
+            <form action="{{ url_for('add_user') }}" method="POST">
+                <div class="form-group">
+                    <label for="username">Username:</label>
+                    <input type="text" id="username" name="username" required>
+                </div>
+                <div class="form-group">
+                    <label for="password">Password:</label>
+                    <input type="password" id="password" name="password" required>
+                </div>
+                <div class="form-group">
+                    <input type="checkbox" id="is_admin" name="is_admin">
+                    <label for="is_admin">Grant Admin Privileges</label>
+                </div>
+                <button type="submit">Add User</button>
+            </form>
+        </div>
+        {% endif %}
+
+        <a href="{{ url_for('index') }}" class="back-link">Back to QC Tool</a>
+    </div>
+</body>
+</html>
