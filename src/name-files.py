@@ -44,7 +44,7 @@ stain_name_corrections = {
     "CD56": ["CD-56", "CD 56", "CD56.", "C-D56", "C-D-56", "CD56"],
     "KRAS": ["K-RAS", "KRAS", "KRAS.", "K-RAS.", "K-RAS"],
     "NRAS": ["N-RAS", "NRAS", "NRAS.", "N-RAS.", "N-RAS"],
-    "BRAF": ["B-RAF", "BRAF", "BRAF.", "B-RAF.", "B-RAF"],-
+    "BRAF": ["B-RAF", "BRAF", "BRAF.", "B-RAF.", "B-RAF"],
     "CTNNB1": ["CTNNB-1", "CTNNB 1", "CTNNB1.", "C-TNNB1", "C-TNNB-1", "CTNNB1"],
     "ALK": ["A-LK", "ALK", "ALK.", "A-LK."],
 }
@@ -69,15 +69,15 @@ stain_pattern_str = "|".join(re.escape(name) for name in all_stain_variations)
 stain_pattern = re.compile(stain_pattern_str, re.IGNORECASE)
 
 # --- Pattern to extract accession ID ---
-reg_name = "NP22"
+reg_name = "S"
 accession_pattern = re.compile(rf"{reg_name}[- ]\d+", re.IGNORECASE)
 
 # -----------------------------------------------------------------------------
 # File paths (adjust as necessary)
 # -----------------------------------------------------------------------------
 # Use raw strings (r"...") or forward slashes for Windows paths
-input_filename = r"C:\Users\sthakur1\Downloads\Work\WSI-Processing\Correct-Me\NP22-assoc\output-ocr.csv"
-output_filename = r"C:\Users\sthakur1\Downloads\Work\WSI-Processing\Correct-Me\NP22-assoc\output_processed_latest.csv"
+input_filename = r"/Users/siddheshthakur/Work/Projects/Label-Check/2025-07-20/output-ocr-2025-07-20.csv"
+output_filename = r"/Users/siddheshthakur/Work/Projects/Label-Check/2025-07-20/output_processed_latest.csv"
 
 # -----------------------------------------------------------------------------
 # Main processing function

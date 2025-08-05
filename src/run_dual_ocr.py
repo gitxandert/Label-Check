@@ -69,8 +69,8 @@ def process_image_files(input_dir, csv_path, num_workers=4):
             future.result()
 
 
-input_dir = r"Correct-Me\NP22-assoc"
-output_path = r"Correct-Me\NP22-assoc\output-ocr.csv"
+input_dir = r"2025-07-20"
+output_path = r"2025-07-20\output-ocr.csv"
 workers=20
 process_image_files(input_dir, output_path, workers)
 # if __name__ == "__main__":
