@@ -486,9 +486,23 @@
                         <input type="text" id="accession_id" name="accession_id" value="{{ row.AccessionID }}" required>
                     </div>
 
+                    <!-- NEW: Display for the auto-calculated count -->
+                    <div class="form-group">
+                        <label>Accession ID Count:</label>
+                        <p>
+                            <strong>{{ row._accession_id_count if row._accession_id_count is not none else 0 }}</strong> 
+                        </p>
+                    </div>
+
                     <div class="form-group">
                         <label for="stain">Stain:</label>
                         <input type="text" id="stain" name="stain" value="{{ row.Stain }}" required>
+                    </div>
+
+                    <!-- NEW: Input field for Block Number -->
+                    <div class="form-group">
+                        <label for="block_number">Block Number:</label>
+                        <input type="text" id="block_number" name="block_number" value="{{ row.BlockNumber }}">
                     </div>
 
                     <div class="form-group">
@@ -510,7 +524,6 @@
                         <button type="submit" name="action" value="prev" class="nav-btn">Previous</button>
                         <button type="submit" name="action" value="next" class="nav-btn">Next</button>
                         <button type="submit" name="action" value="next_incorrect" class="nav-btn">Next Incomplete</button>
-                        <button type="submit" name="action" value="save" class="save-btn">Save to CSV</button>
                     </div>
                 </form>
                 <div class="form-actions">
@@ -532,6 +545,7 @@
                             {% if filter_active %}Show All{% else %}Show Only Incomplete{% endif %}
                         </button>
                     </form>
+                    
                 </div>
 
             {% elif no_rows_after_filter %}
