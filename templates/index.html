@@ -464,6 +464,46 @@
             100% { transform: translateX(0); }
         }
 
+        .recently-completed {
+            margin-bottom: 20px;
+            padding: 20px;
+            background: var(--card-bg);
+            border-radius: 12px;
+            box-shadow: 0 6px 16px var(--shadow);
+        }
+
+        .recently-completed h3 {
+            margin-top: 0;
+        }
+
+        .recently-completed ul {
+            list-style-type: none;
+            padding: 0;
+            margin: 0;
+        }
+
+        .recently-completed li {
+            display: flex;
+            justify-content: space-between;
+            padding: 10px 0;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .recently-completed li:last-child {
+            border-bottom: none;
+        }
+
+        .recently-completed a {
+            color: var(--primary-color);
+            text-decoration: none;
+            font-weight: 500;
+        }
+
+        .recently-completed .completed-time {
+            font-size: 0.85rem;
+            color: var(--secondary-color);
+        }
+
     </style>
 </head>
 <body>
@@ -473,6 +513,7 @@
             {% if current_user.is_authenticated %}
                 {% if current_user.is_admin %}
                     <a href="{{ url_for('users_management') }}">User Management</a>
+                    <a href="{{ url_for('history') }}">My History</a>
                 {% endif %}
                 <span>Logged in as <b>{{ current_user.id }}</b> (Corrections: {{ current_user.correction_count }})</span>
                 <a href="{{ url_for('logout') }}">Logout</a>
@@ -487,22 +528,49 @@
                 {% endfor %}
             </ul>
 
-            {% if data_loaded and not no_rows_after_filter %}
-                <p class="queue-info">
-                    Current Item: <span>{{ display_index + 1 }}</span> of <span>{{ total_display_count }}</span>
-                    {% if total_display_count != total_original_rows %}
-                        <br>(Filtered from {{ total_original_rows }} total)
-                    {% endif %}
-                    <br>
-                    Patient: <span>{{ row._identifier }}</span> (File <span>{{ row._patient_file_number }}</span> of <span>{{ row._total_patient_files }}</span>)
-                </p>
+            {% if no_items_left %}
+                <div class="no-data-message">
+                    <h2>Queue Complete!</h2>
+                    <p>All items have been processed.</p>
+                    <p>
+                        <b>{{ completed_count }}</b> of <b>{{ total_count }}</b> items are complete.
+                    </p>
+                </div>
+            {% elif data_loaded %}
+                <div class="queue-info">
+                    <h3>Queue Status</h3>
+                    <p>
+                        Pending: <span>{{ queue_stats.pending }}</span> |
+                        Leased: <span>{{ queue_stats.leased }}</span> |
+                        Completed: <span>{{ queue_stats.completed }}</span>
+                    </p>
+                </div>
+
+                {% if lease_info and lease_info.leased_by_id == current_user.id %}
+                    <div class="queue-info" style="border-left: 5px solid var(--success-color);">
+                        <p>
+                            You have leased item with Accession ID: <b>{{ row.AccessionID }}</b>.
+                        </p>
+                        <p style="font-size: 0.85rem; color: var(--secondary-color);">
+                            This lease will expire in approximately {{ (lease_info.leased_at + timedelta(seconds=config.LEASE_DURATION_SECONDS) - datetime.utcnow()).seconds // 60 }} minutes.
+                        </p>
+                    </div>
+                {% elif lease_info %}
+                    <div class="queue-info" style="border-left: 5px solid var(--warning-color);">
+                        <p>
+                            Item with Accession ID: <b>{{ row.AccessionID }}</b> is currently leased by <b>{{ lease_info.leased_by.id }}</b>.
+                        </p>
+                        <p>You are viewing in read-only mode.</p>
+                    </div>
+                {% endif %}
+
 
                 <form action="{{ url_for('update') }}" method="POST" class="form-section">
                     <input type="hidden" name="original_index" value="{{ original_index }}">
 
                     <div class="form-group">
                         <label for="accession_id">Accession ID:</label>
-                        <input type="text" id="accession_id" name="accession_id" value="{{ row.AccessionID }}" required>
+                        <input type="text" id="accession_id" name="accession_id" value="{{ row.AccessionID }}" required {% if lease_info.leased_by_id != current_user.id %}readonly{% endif %}>
                     </div>
 
                     <!-- NEW: Display for the auto-calculated count -->
@@ -515,13 +583,13 @@
 
                     <div class="form-group">
                         <label for="stain">Stain ($):</label>
-                        <input type="text" id="stain" name="stain" value="{{ row.Stain }}" required>
+                        <input type="text" id="stain" name="stain" value="{{ row.Stain }}" required {% if lease_info.leased_by_id != current_user.id %}readonly{% endif %}>
                     </div>
 
                     <!-- NEW: Input field for Block Number -->
                     <div class="form-group">
                         <label for="block_number">Block Number (#):</label>
-                        <input type="text" id="block_number" name="block_number" value="{{ row.BlockNumber }}">
+                        <input type="text" id="block_number" name="block_number" value="{{ row.BlockNumber }}" {% if lease_info.leased_by_id != current_user.id %}readonly{% endif %}>
                     </div>
 
                     <div class="form-group">
@@ -535,43 +603,38 @@
                     </div>
 
                     <div class="form-group form-check">
-                        <input type="checkbox" id="complete" name="complete" {% if row._is_complete %}checked{% endif %}>
+                        <input type="checkbox" id="complete" name="complete" {% if row._is_complete %}checked{% endif %} {% if lease_info.leased_by_id != current_user.id %}disabled{% endif %}>
                         <label for="complete">Mark as Complete</label>
                     </div>
 
                     <div class="form-actions">
-                        <button type="submit" name="action" value="prev" class="nav-btn">Previous</button>
-                        <button type="submit" name="action" value="next" class="nav-btn">Next</button>
-                        <button type="submit" name="action" value="next_incorrect" class="nav-btn">Next Incomplete</button>
+                        {% if lease_info.leased_by_id == current_user.id %}
+                            <button type="submit" name="action" value="next" class="nav-btn">Save and Next</button>
+                            <form action="{{ url_for('release_lease') }}" method="POST" style="display: inline;">
+                                <button type="submit" class="nav-btn" style="background-color: var(--warning-color);">Release Lease</button>
+                            </form>
+                        {% else %}
+                             <a href="{{url_for('index')}}" class="nav-btn">Get Next Available Item</a>
+                        {% endif %}
                     </div>
                 </form>
-                <div class="form-actions">
-                    <form action="{{ url_for('jump') }}" method="POST" class="jump-input">
-                        <input type="hidden" name="original_index" value="{{ original_index }}">
-                        <label for="jump_to_index">Jump to Display Index:</label>
-                        <input type="number" id="jump_to_index" name="jump_to_index" min="1" max="{{ total_display_count }}">
-                        <button type="submit">Jump</button>
-                    </form>
-                    <form action="{{ url_for('search') }}" method="POST" class="search-input">
-                        <input type="hidden" name="original_index" value="{{ original_index }}">
-                        <label for="search_term">Search ID:</label>
-                        <input type="text" id="search_term" name="search_term" placeholder="Accession/File ID">
-                        <button type="submit">Search</button>
-                    </form>
-                    <form action="{{ url_for('index') }}" method="GET">
-                        <input type="hidden" name="filter" value="{% if filter_active %}all{% else %}incomplete{% endif %}">
-                        <button type="submit" class="filter-btn">
-                            {% if filter_active %}Show All{% else %}Show Only Incomplete{% endif %}
-                        </button>
-                    </form>
-                    
+                
+                <div class="recently-completed">
+                    <h3>Recently Completed</h3>
+                    {% if recently_completed %}
+                        <ul>
+                            {% for item in recently_completed %}
+                                <li>
+                                    <a href="{{ url_for('index', index=item.original_index) }}">{{ item.accession_id }}</a>
+                                    <span class="completed-time">{{ item.completed_at.strftime('%Y-%m-%d %H:%M:%S') }} UTC</span>
+                                </li>
+                            {% endfor %}
+                        </ul>
+                    {% else %}
+                        <p>You have not completed any items yet.</p>
+                    {% endif %}
                 </div>
 
-            {% elif no_rows_after_filter %}
-                <div class="no-data-message">
-                    <p>No incomplete rows to display based on current filter.</p>
-                    <p><a href="{{ url_for('index', filter='all') }}">Click here to show all rows.</a></p>
-                </div>
             {% else %}
                 <div class="no-data-message">
                     <p>No data loaded or available.</p>

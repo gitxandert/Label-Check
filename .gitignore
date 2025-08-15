@@ -209,3 +209,4 @@ __marimo__/
 output-ocr*
 csv_backups/*
 Data/*
+.DS_Store

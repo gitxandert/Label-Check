@@ -19,10 +19,10 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
 # !!! IMPORTANT: VERIFY THESE PATHS ARE CORRECT FOR YOUR SYSTEM !!!
-CSV_FILE_PATH = r'2025-07-20/output_processed_latest.csv'
-IMAGE_BASE_DIR = r'2025-07-20'
+CSV_FILE_PATH = r'Data/combined_data_ocr_processed.csv'
+IMAGE_BASE_DIR = r'Data'
 BACKUP_DIR = 'csv_backups'
-INTERMEDIATE_BACKUP_FILE = r'2025-07-20/output-ocr-2025-07-20_bkup.csv'
+INTERMEDIATE_BACKUP_FILE = r'Data/Data_ocr_bkup.csv'
 INTERMEDIATE_BACKUP_FREQUENCY = 10
 # --- End Configuration ---
 

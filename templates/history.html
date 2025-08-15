@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>My Annotation History</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary-color: #007bff;
+            --primary-dark: #0056b3;
+            --secondary-color: #6c757d;
+            --secondary-dark: #5a6268;
+            --success-color: #28a745;
+            --success-dark: #218838;
+            --info-color: #17a2b8;
+            --info-dark: #138496;
+            --warning-color: #ffc107;
+            --warning-dark: #e0a800;
+            --danger-color: #dc3545;
+            --danger-dark: #c82333;
+            --light-bg: #f8f9fa;
+            --dark-bg: #e9ecef;
+            --text-color: #343a40;
+            --border-color: #dee2e6;
+            --card-bg: #ffffff;
+            --shadow: rgba(0, 0, 0, 0.08);
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--light-bg);
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            min-height: 100vh;
+            color: var(--text-color);
+        }
+
+        .header {
+            background: linear-gradient(90deg, var(--primary-color), var(--primary-dark));
+            color: white;
+            padding: 15px 30px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 4px 10px var(--shadow);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .header h1 {
+            margin: 0;
+            font-size: 1.6rem;
+            font-weight: 700;
+        }
+
+        .header-links a {
+            color: white;
+            text-decoration: none;
+            font-weight: 500;
+            transition: color 0.2s ease-in-out;
+            padding: 6px 12px;
+            background: rgba(255,255,255,0.08);
+            border-radius: 5px;
+        }
+
+        .header-links a:hover {
+            background: rgba(255,255,255,0.15);
+        }
+
+        .content-wrapper {
+            padding: 20px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+            background: var(--card-bg);
+            border-radius: 12px;
+            box-shadow: 0 6px 16px var(--shadow);
+        }
+
+        th, td {
+            padding: 15px;
+            text-align: left;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        th {
+            background-color: var(--dark-bg);
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        tr:hover {
+            background-color: var(--light-bg);
+        }
+
+        .flash-messages {
+            list-style-type: none;
+            padding: 0;
+            margin-bottom: 20px;
+            width: 100%;
+        }
+
+        .flash-messages li {
+            border-radius: 8px;
+            font-size: 0.9rem;
+            padding: 12px 15px;
+            margin-bottom: 10px;
+            font-weight: 500;
+            border: 1px solid transparent; /* Base border */
+        }
+
+        .flash-messages li.info {
+            background-color: #e0f7fa; /* Light cyan */
+            color: #007bb6; /* Darker blue */
+            border-color: #00acc1; /* Cyan */
+        }
+
+        .flash-messages li.warning {
+            background-color: #fffde7; /* Light yellow */
+            color: #c58600; /* Darker orange */
+            border-color: #ffeb3b; /* Yellow */
+        }
+
+        .flash-messages li.error {
+            background-color: #ffebee; /* Light red */
+            color: #d32f2f; /* Darker red */
+            border-color: #f44336; /* Red */
+        }
+
+        .flash-messages li.success {
+            background-color: #e8f5e9; /* Light green */
+            color: #2e7d32; /* Darker green */
+            border-color: #4caf50; /* Green */
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>My Annotation History</h1>
+        <div class="header-links">
+            <a href="{{ url_for('index') }}">Home</a>
+            {% if current_user.is_authenticated %}
+                <span>Logged in as <b>{{ current_user.id }}</b></span>
+                <a href="{{ url_for('logout') }}">Logout</a>
+            {% endif %}
+        </div>
+    </div>
+    <div class="content-wrapper">
+        <ul class="flash-messages">
+            {% for message in messages %}
+                <li class="{{ message.css_class }}">{{ message.message }}</li>
+            {% endfor %}
+        </ul>
+
+        {% if completed_items %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>Accession ID</th>
+                        <th>Completed At</th>
+                        <th>View</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for item in completed_items %}
+                        <tr>
+                            <td>{{ item.accession_id }}</td>
+                            <td>{{ item.completed_at.strftime('%Y-%m-%d %H:%M:%S') }} UTC</td>
+                            <td><a href="{{ url_for('index', index=item.original_index) }}">View</a></td>
+                        </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        {% else %}
+            <p>You have not completed any items yet.</p>
+        {% endif %}
+    </div>
+</body>
+</html>
