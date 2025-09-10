@@ -584,11 +584,43 @@ def index() -> str:
     current_original_index = item_to_display.original_index
     current_row = data[current_original_index]
     
+    # Create a copy to avoid modifying the global data just by viewing.
+    # This 'display_row' will be passed to the template.
+    display_row = current_row.copy()
+
+    # --- Pre-fill logic based on other records ---
+    prefilled_fields = []
+
+    # 1. Pre-fill AccessionID based on other files from the same patient (_identifier)
+    if not display_row.get('AccessionID') and display_row.get('_identifier'):
+        identifier_to_match = display_row.get('_identifier')
+        for row in data:
+            if row.get('_identifier') == identifier_to_match and row.get('AccessionID'):
+                suggested_accession_id = row.get('AccessionID')
+                display_row['AccessionID'] = suggested_accession_id
+                app.logger.info(f"Pre-filling AccessionID for identifier {identifier_to_match} with value '{suggested_accession_id}'.")
+                prefilled_fields.append(f"Accession ID ('{suggested_accession_id}')")
+                break
+
+    # 2. Pre-fill 'Stain' based on other entries with the same (or newly pre-filled) AccessionID
+    accession_id_to_match = display_row.get('AccessionID')
+    if not display_row.get('Stain') and accession_id_to_match:
+        for row in data:
+            if row.get('AccessionID') == accession_id_to_match and row.get('Stain'):
+                suggested_stain = row.get('Stain')
+                display_row['Stain'] = suggested_stain
+                app.logger.info(f"Pre-filling Stain for AccessionID {accession_id_to_match} with value '{suggested_stain}'.")
+                prefilled_fields.append(f"Stain ('{suggested_stain}')")
+                break
+    
+    if prefilled_fields:
+        flash(f"Prefilled the following fields based on other records: {', '.join(prefilled_fields)}. Please verify.", "info")
+
     # Image path logic
     label_img_path, macro_img_path = None, None
     label_img_exists, macro_img_exists = False, False
-    if current_row.get('_identifier'):
-        base_id = current_row['_identifier']
+    if display_row.get('_identifier'):
+        base_id = display_row['_identifier']
         label_fn, macro_fn = f"{base_id}_label.png", f"{base_id}_macro.png"
         if os.path.exists(os.path.join(Config.IMAGE_BASE_DIR, 'label', label_fn)):
             label_img_path, label_img_exists = url_for('serve_image', subdir='label', filename=label_fn), True
@@ -610,7 +642,7 @@ def index() -> str:
 
     return render_template(
         'index.html',
-        row=current_row,
+        row=display_row,
         original_index=current_original_index,
         total_original_rows=len(data),
         label_img_path=label_img_path,
