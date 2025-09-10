@@ -210,3 +210,6 @@ output-ocr*
 csv_backups/*
 Data/*
 .DS_Store
+Archive/
+sorted/
+logs/
