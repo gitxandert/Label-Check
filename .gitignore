@@ -213,3 +213,5 @@ Data/*
 Archive/
 sorted/
 logs/
+
+backend/node_modules/
