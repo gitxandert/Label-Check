@@ -2,6 +2,7 @@ import argparse
 import csv
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -24,7 +25,9 @@ logger = logging.getLogger(__name__)
 COL_ACCESSION_ID = "AccessionID"
 COL_STAIN = "Stain"
 COL_EXTRACTION_SUCCESSFUL = "ExtractionSuccessful"
-COL_QC_PASSED = "QCPassed"
+COL_QC_PASSED = "ParsingQCPassed"  # Renamed for clarity vs ocr_qc_needed
+
+# Mapping for stain name corrections. This could also be loaded from a JSON/YAML file.
 
 # Mapping for stain name corrections. This could also be loaded from a JSON/YAML file.
 STAIN_NAME_CORRECTIONS = {
@@ -60,6 +63,7 @@ STAIN_NAME_CORRECTIONS = {
     "ALK": ["A-LK", "ALK", "ALK.", "A-LK."],
 }
 
+
 # -----------------------------------------------------------------------------
 # Core Functions
 # -----------------------------------------------------------------------------
@@ -73,127 +77,145 @@ def build_stain_normalizer(
     all_variations = set()
 
     for canonical, variations in corrections.items():
-        # Ensure the canonical name is part of the variations set
-        current_variations = set(v.lower() for v in variations)
+        current_variations = {v.lower() for v in variations}
         current_variations.add(canonical.lower())
-
         all_variations.update(current_variations)
         for var in current_variations:
             variation_lookup[var] = canonical
 
-    # Sort by length descending to match longer variations first (e.g., "H&E" before "H")
     sorted_variations = sorted(list(all_variations), key=len, reverse=True)
     pattern_str = "|".join(re.escape(var) for var in sorted_variations)
     pattern = re.compile(pattern_str, re.IGNORECASE)
-
     return pattern, variation_lookup
 
 
-def process_row(
-    row: List[str],
+def process_csv_row(
+    row: Dict[str, str],
     accession_pattern: re.Pattern,
     stain_pattern: re.Pattern,
     stain_lookup: Dict[str, str],
 ) -> Dict[str, any]:
     """
-    Processes a single CSV row to find and normalize accession ID and stain.
+    Processes a single CSV row dictionary to find and normalize accession ID and stain.
+
+    Args:
+        row (dict): A dictionary representing one row from the CSV.
+        accession_pattern (re.Pattern): Compiled regex for finding accession IDs.
+        stain_pattern (re.Pattern): Compiled regex for finding stain names.
+        stain_lookup (dict): A map from stain variations to their canonical form.
 
     Returns:
-        A dictionary with the extracted and processed data.
+        dict: The original row dictionary, updated with extracted data.
     """
+    updated_row = row.copy()
     accession_id = None
     canonical_stain = None
 
-    # Join the row into a single string for a comprehensive search
-    # This handles cases where an ID or stain is split across cells
-    full_row_text = ";".join(str(field) for field in row if field)
+    # Combine the relevant text fields for a targeted search
+    # Prioritize label_text as it's often more accurate
+    search_text = f"{row.get('label_text', '')} {row.get('macro_text', '')}"
 
     # 1. Find Accession ID
-    accession_match = accession_pattern.search(full_row_text)
+    accession_match = accession_pattern.search(search_text)
     if accession_match:
         accession_id = accession_match.group(0).replace(" ", "-").upper()
 
     # 2. Find Stain Name
-    stain_match = stain_pattern.search(full_row_text)
+    stain_match = stain_pattern.search(search_text)
     if stain_match:
         found_variation = stain_match.group(0).lower()
         canonical_stain = stain_lookup.get(found_variation, found_variation)
 
-    return {
-        COL_ACCESSION_ID: accession_id,
-        COL_STAIN: canonical_stain,
-        COL_EXTRACTION_SUCCESSFUL: bool(accession_id and canonical_stain),
-    }
+    # 3. Add the new data to the row
+    updated_row[COL_ACCESSION_ID] = accession_id
+    updated_row[COL_STAIN] = canonical_stain
+    updated_row[COL_EXTRACTION_SUCCESSFUL] = bool(accession_id and canonical_stain)
+    updated_row[COL_QC_PASSED] = ""  # Left empty for manual QC
+
+    return updated_row
 
 
-def enrich_csv_data(input_path: Path, output_path: Path, delimiter: str = ";"):
+def enrich_csv_with_parsing(
+    input_path: Path, output_path: Path, accession_prefix: str, num_workers: int
+):
     """
-    Reads a CSV, enriches it with extracted data, and saves it to a new file.
+    Reads a CSV, enriches it with extracted data in parallel, and saves it.
     """
     if not input_path.exists():
         logger.error(f"Input file not found: {input_path}")
         return
 
     logger.info("Building regex patterns for extraction...")
-    # --- Pattern to extract accession ID ---
-    reg_name = "S"
-    accession_pattern = re.compile(rf"{reg_name}[- ]\d+", re.IGNORECASE)
+    accession_pattern = re.compile(rf"{accession_prefix}[- ]\d+", re.IGNORECASE)
     stain_pattern, stain_lookup = build_stain_normalizer(STAIN_NAME_CORRECTIONS)
 
-    logger.info(f"Starting CSV enrichment from '{input_path}' to '{output_path}'")
-
+    # Read all data into memory to pass to workers
     try:
-        # First, count rows for the progress bar
-        with open(input_path, mode="r", encoding="utf-8", errors="replace") as f:
-            total_rows = sum(1 for row in f) - 1  # Subtract header
+        with open(input_path, mode="r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            original_rows = list(reader)
+            original_headers = reader.fieldnames
+    except Exception as e:
+        logger.error(f"Failed to read input CSV '{input_path}': {e}")
+        return
 
-        with (
-            open(
-                input_path, mode="r", newline="", encoding="utf-8", errors="replace"
-            ) as infile,
-            open(output_path, mode="w", newline="", encoding="utf-8") as outfile,
-        ):
-            reader = csv.reader(infile, delimiter=delimiter)
-            writer = csv.writer(outfile, delimiter=delimiter)
+    if not original_rows:
+        logger.warning("Input CSV is empty. No data to process.")
+        return
 
-            # Read original header and create the new, enriched header
-            header = next(reader)
-            new_header = header + [
-                COL_ACCESSION_ID,
-                COL_STAIN,
-                COL_EXTRACTION_SUCCESSFUL,
-                COL_QC_PASSED,
-            ]
-            writer.writerow(new_header)
+    logger.info(
+        f"Starting CSV enrichment for {len(original_rows)} rows using {num_workers} workers."
+    )
 
-            successful_extractions = 0
+    updated_rows = []
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        future_to_row = {
+            executor.submit(
+                process_csv_row, row, accession_pattern, stain_pattern, stain_lookup
+            ): row
+            for row in original_rows
+        }
 
-            # Use tqdm for a progress bar
-            for row in tqdm(reader, total=total_rows, desc="Processing rows"):
-                extracted_data = process_row(
-                    row, accession_pattern, stain_pattern, stain_lookup
-                )
+        progress = tqdm(
+            as_completed(future_to_row), total=len(original_rows), desc="Parsing rows"
+        )
+        for future in progress:
+            try:
+                updated_rows.append(future.result())
+            except Exception as e:
+                logger.error(f"A row failed to process: {e}")
 
-                if extracted_data[COL_EXTRACTION_SUCCESSFUL]:
-                    successful_extractions += 1
+    successful_extractions = sum(
+        1 for row in updated_rows if row[COL_EXTRACTION_SUCCESSFUL]
+    )
 
-                # Create the new row by appending extracted data
-                output_row = row + [
-                    extracted_data[COL_ACCESSION_ID] or "",
-                    extracted_data[COL_STAIN] or "",
-                    extracted_data[COL_EXTRACTION_SUCCESSFUL],
-                    "",  # Leave QCPassed column empty for manual review
-                ]
-                writer.writerow(output_row)
+    # Define the final header order
+    new_headers = original_headers + [
+        COL_ACCESSION_ID,
+        COL_STAIN,
+        COL_EXTRACTION_SUCCESSFUL,
+        COL_QC_PASSED,
+    ]
+    # Filter out any headers that might have been added in a previous run to avoid duplication
+    final_headers = list(dict.fromkeys(new_headers))
+
+    logger.info(f"Writing enriched data to '{output_path}'")
+    try:
+        with open(output_path, mode="w", newline="", encoding="utf-8") as outfile:
+            writer = csv.DictWriter(outfile, fieldnames=final_headers)
+            writer.writeheader()
+            writer.writerows(updated_rows)
 
         logger.info("CSV enrichment complete.")
-        logger.info(f"Processed {total_rows} data rows.")
+        logger.info(f"Processed {len(updated_rows)} data rows.")
         logger.info(
             f"Successfully extracted both ID and Stain in {successful_extractions} rows."
         )
 
     except Exception as e:
-        logger.exception(f"An unexpected error occurred: {e}")
+        logger.exception(
+            f"An unexpected error occurred while writing the output file: {e}"
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -201,34 +223,39 @@ def enrich_csv_data(input_path: Path, output_path: Path, delimiter: str = ";"):
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Extracts Accession ID and Stain Name from a CSV, normalizes them, "
-        "and appends the results as new columns to the original data."
+        description="Extracts Accession ID and Stain from OCR text in a CSV, normalizes them, "
+        "and appends the results as new columns."
     )
     parser.add_argument(
-        "-i",
-        "--input-file",
+        "--input-csv",
         type=Path,
         required=True,
-        help="Path to the input CSV file.",
+        help="Path to the input CSV file (e.g., 'mapping_with_ocr.csv').",
     )
     parser.add_argument(
-        "-o",
-        "--output-file",
+        "--output-csv",
         type=Path,
         required=True,
-        help="Path for the enriched output CSV file.",
+        help="Path for the final, enriched output CSV file.",
     )
     parser.add_argument(
-        "-d",
-        "--delimiter",
+        "--accession-prefix",
         type=str,
-        default=";",
-        help="Delimiter used in the CSV file (default: ';').",
+        default="S",
+        help="The letter prefix for the Accession ID (e.g., 'S' for 'S-12345').",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of worker threads for parallel processing.",
     )
 
     args = parser.parse_args()
 
     # Ensure the output directory exists
-    args.output_file.parent.mkdir(parents=True, exist_ok=True)
+    args.output_csv.parent.mkdir(parents=True, exist_ok=True)
 
-    enrich_csv_data(args.input_file, args.output_file, args.delimiter)
+    enrich_csv_with_parsing(
+        args.input_csv, args.output_csv, args.accession_prefix, args.workers
+    )
