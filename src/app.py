@@ -29,6 +29,7 @@ from flask_login import (
     logout_user,
 )
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import func
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.wrappers.request import Request
 
@@ -192,7 +193,7 @@ class QueueItem(db.Model):
 @login_manager.user_loader
 def load_user(user_id: str) -> Optional[User]:
     """Loads a user from the database by their ID for Flask-Login."""
-    return User.query.get(user_id)
+    return db.session.get(User, user_id)
 
 
 # ==============================================================================
@@ -211,10 +212,11 @@ def _release_expired_leases():
     lease_duration = datetime.timedelta(seconds=app.config["LEASE_DURATION_SECONDS"])
     expired_time = datetime.datetime.utcnow() - lease_duration
 
-    # SQLAlchemy < 3.0 style query
-    expired_items = QueueItem.query.filter(
-        QueueItem.status == "leased", QueueItem.leased_at < expired_time
-    ).all()
+    expired_items = db.session.execute(
+        db.select(QueueItem).filter(
+            QueueItem.status == "leased", QueueItem.leased_at < expired_time
+        )
+    ).scalars().all()
 
     if expired_items:
         count = 0
@@ -451,7 +453,7 @@ def login():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        user = User.query.get(username)
+        user = db.session.get(User, username)
         if user and user.verify_password(password):
             login_user(user)
             app.logger.info(f"User '{username}' logged in.")
@@ -474,8 +476,9 @@ def logout():
 def users_management():
     if not current_user.is_admin:
         return redirect(url_for("index"))
+    users = db.session.execute(db.select(User)).scalars().all()
     return render_template(
-        "users.html", users=User.query.all(), messages=flash_messages()
+        "users.html", users=users, messages=flash_messages()
     )
 
 
@@ -489,7 +492,7 @@ def add_user():
     if not username or not password:
         flash("Missing username or password.", "error")
         return redirect(url_for("users_management"))
-    if User.query.get(username):
+    if db.session.get(User, username):
         flash("User exists.", "error")
         return redirect(url_for("users_management"))
     try:
@@ -527,15 +530,19 @@ def index():
             idx = int(req_idx)
             if 0 <= idx < len(data):
                 # Release existing lease if moving to arbitrary index
-                curr_lease = QueueItem.query.filter_by(
-                    leased_by_id=current_user.id, status="leased"
-                ).first()
+                curr_lease = db.session.execute(
+                    db.select(QueueItem).filter_by(
+                        leased_by_id=current_user.id, status="leased"
+                    )
+                ).scalar_one_or_none()
                 if curr_lease and curr_lease.original_index != idx:
                     curr_lease.status = "pending"
                     curr_lease.leased_by = None
                     curr_lease.leased_at = None
 
-                qi = QueueItem.query.filter_by(original_index=idx).first()
+                qi = db.session.execute(
+                    db.select(QueueItem).filter_by(original_index=idx)
+                ).scalar_one_or_none()
                 if qi:
                     if qi.status == "leased" and qi.leased_by_id != current_user.id:
                         flash("Read-only mode: Item leased by another user.", "warning")
@@ -549,18 +556,19 @@ def index():
 
     if not item_to_display:
         # 1. Continue current lease
-        active = QueueItem.query.filter_by(
-            leased_by_id=current_user.id, status="leased"
-        ).first()
+        active = db.session.execute(
+            db.select(QueueItem).filter_by(
+                leased_by_id=current_user.id, status="leased"
+            )
+        ).scalar_one_or_none()
+
         if active:
             item_to_display = active
         else:
             # 2. Get next pending
-            nxt = (
-                QueueItem.query.filter_by(status="pending")
-                .order_by(QueueItem.original_index)
-                .first()
-            )
+            nxt = db.session.execute(
+                db.select(QueueItem).filter_by(status="pending").order_by(QueueItem.original_index)
+            ).scalar_one_or_none()
             if nxt:
                 nxt.status = "leased"
                 nxt.leased_by_id = current_user.id
@@ -569,8 +577,8 @@ def index():
             else:
                 # 3. Nothing left
                 db.session.commit()  # Save any lease releases
-                total = QueueItem.query.count()
-                done = QueueItem.query.filter_by(status="completed").count()
+                total = db.session.query(func.count(QueueItem.id)).scalar()
+                done = db.session.query(func.count(QueueItem.id)).filter_by(status="completed").scalar()
                 return render_template(
                     "index.html",
                     no_items_left=True,
@@ -622,17 +630,17 @@ def index():
 
     # Stats for UI
     q_stats = {
-        "pending": QueueItem.query.filter_by(status="pending").count(),
-        "leased": QueueItem.query.filter_by(status="leased").count(),
-        "completed": QueueItem.query.filter_by(status="completed").count(),
+        "pending": db.session.query(func.count(QueueItem.id)).filter_by(status="pending").scalar(),
+        "leased": db.session.query(func.count(QueueItem.id)).filter_by(status="leased").scalar(),
+        "completed": db.session.query(func.count(QueueItem.id)).filter_by(status="completed").scalar(),
     }
 
-    recent = (
-        QueueItem.query.filter_by(completed_by_id=current_user.id)
+    recent = db.session.execute(
+        db.select(QueueItem)
+        .filter_by(completed_by_id=current_user.id)
         .order_by(QueueItem.completed_at.desc())
         .limit(5)
-        .all()
-    )
+    ).scalars().all()
     for r in recent:
         if r.original_index < len(data):
             r.accession_id = data[r.original_index].get("AccessionID", "N/A")
@@ -651,7 +659,30 @@ def index():
         queue_stats=q_stats,
         lease_info=item_to_display,
         datetime=datetime.datetime,
+        timedelta=datetime.timedelta,
         recently_completed=recent,
+    )
+
+
+@app.route("/history")
+@login_required
+def history():
+    """Displays the user's full history of completed items."""
+    history_items = db.session.execute(
+        db.select(QueueItem)
+        .filter_by(completed_by_id=current_user.id)
+        .order_by(QueueItem.completed_at.desc())
+    ).scalars().all()
+
+    for item in history_items:
+        if item.original_index < len(data):
+            row = data[item.original_index]
+            item.accession_id = row.get("AccessionID", "N/A")
+
+    return render_template(
+        "history.html",
+        completed_items=history_items,
+        messages=flash_messages(),
     )
 
 
@@ -662,7 +693,9 @@ def update():
         return redirect(url_for("index"))
     try:
         idx = int(request.form["original_index"])
-        qi = QueueItem.query.filter_by(original_index=idx).first()
+        qi = db.session.execute(
+            db.select(QueueItem).filter_by(original_index=idx)
+        ).scalar_one_or_none()
 
         # Force complete even if lease expired/stolen if user hits "save"
         forced = False
@@ -740,9 +773,11 @@ def update():
 @app.route("/release", methods=["POST"])
 @login_required
 def release_lease():
-    qi = QueueItem.query.filter_by(
-        leased_by_id=current_user.id, status="leased"
-    ).first()
+    qi = db.session.execute(
+        db.select(QueueItem).filter_by(
+            leased_by_id=current_user.id, status="leased"
+        )
+    ).scalar_one_or_none()
     if qi:
         qi.status = "pending"
         qi.leased_by = None
@@ -811,7 +846,7 @@ def init_db_command():
     print(f"Database path: {app.config['SQLALCHEMY_DATABASE_URI']}")
     db.create_all()
 
-    if not User.query.get("admin"):
+    if not db.session.get(User, "admin"):
         u = User(id="admin", is_admin=True)
         u.set_password(Config.ADMIN_DEFAULT_PASSWORD)
         db.session.add(u)
@@ -821,7 +856,8 @@ def init_db_command():
     if os.path.exists(Config.CSV_FILE_PATH):
         try:
             load_csv_data()
-            existing = {i.original_index for i in QueueItem.query.all()}
+            existing_items = db.session.execute(db.select(QueueItem)).scalars().all()
+            existing = {i.original_index for i in existing_items}
             new_items = []
             for row in data:
                 if row["_original_index"] not in existing:

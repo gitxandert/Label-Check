@@ -17,6 +17,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def clean_and_resolve_path(path_str):
+    """Cleans a Windows-style path string and returns a resolved Path object."""
+    if not path_str:
+        return None
+
+    # 1. Replace Windows backslashes with forward slashes (Unix/Linux standard)
+    cleaned_str = path_str.replace("\\", "/")
+
+    # 2. Strip any leading './' or '.\\' which can mess up absolute resolution
+    #    when joined to a current working directory.
+    if cleaned_str.startswith("./"):
+        cleaned_str = cleaned_str[2:]
+
+    # 3. Create the Path object and resolve it
+    return Path(cleaned_str).resolve()
+
+
 def preprocess_image_for_ocr(image_np: np.ndarray) -> np.ndarray:
     """
     Applies grayscale and Otsu's binarization to improve OCR accuracy.
@@ -59,14 +76,14 @@ def perform_ocr_on_row(row: dict, csv_dir: Path, reader: easyocr.Reader) -> dict
     # A dictionary to hold paths for processing
     paths_to_process = {}
     if label_path_str:
-        label_path = (csv_dir / label_path_str).resolve()
+        label_path = clean_and_resolve_path(label_path_str)
         if label_path.exists():
             paths_to_process["label"] = label_path
         else:
             logger.warning(f"Label image not found at {label_path} for row: {row}")
 
     if macro_path_str:
-        macro_path = (csv_dir / macro_path_str).resolve()
+        macro_path = clean_and_resolve_path(macro_path_str)
         if macro_path.exists():
             paths_to_process["macro"] = macro_path
         else:

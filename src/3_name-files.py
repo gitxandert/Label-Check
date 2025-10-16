@@ -67,8 +67,6 @@ STAIN_NAME_CORRECTIONS = {
 # -----------------------------------------------------------------------------
 # Core Functions
 # -----------------------------------------------------------------------------
-
-
 def build_stain_normalizer(
     corrections: Dict[str, List[str]],
 ) -> Tuple[re.Pattern, Dict[str, str]]:
@@ -97,27 +95,17 @@ def process_csv_row(
 ) -> Dict[str, any]:
     """
     Processes a single CSV row dictionary to find and normalize accession ID and stain.
-
-    Args:
-        row (dict): A dictionary representing one row from the CSV.
-        accession_pattern (re.Pattern): Compiled regex for finding accession IDs.
-        stain_pattern (re.Pattern): Compiled regex for finding stain names.
-        stain_lookup (dict): A map from stain variations to their canonical form.
-
-    Returns:
-        dict: The original row dictionary, updated with extracted data.
     """
     updated_row = row.copy()
     accession_id = None
     canonical_stain = None
 
-    # Combine the relevant text fields for a targeted search
-    # Prioritize label_text as it's often more accurate
     search_text = f"{row.get('label_text', '')} {row.get('macro_text', '')}"
 
     # 1. Find Accession ID
     accession_match = accession_pattern.search(search_text)
     if accession_match:
+        # Normalize the found ID: uppercase and use hyphens
         accession_id = accession_match.group(0).replace(" ", "-").upper()
 
     # 2. Find Stain Name
@@ -130,13 +118,13 @@ def process_csv_row(
     updated_row[COL_ACCESSION_ID] = accession_id
     updated_row[COL_STAIN] = canonical_stain
     updated_row[COL_EXTRACTION_SUCCESSFUL] = bool(accession_id and canonical_stain)
-    updated_row[COL_QC_PASSED] = ""  # Left empty for manual QC
+    updated_row[COL_QC_PASSED] = ""
 
     return updated_row
 
 
 def enrich_csv_with_parsing(
-    input_path: Path, output_path: Path, accession_prefix: str, num_workers: int
+    input_path: Path, output_path: Path, accession_pattern_str: str, num_workers: int
 ):
     """
     Reads a CSV, enriches it with extracted data in parallel, and saves it.
@@ -146,10 +134,18 @@ def enrich_csv_with_parsing(
         return
 
     logger.info("Building regex patterns for extraction...")
-    accession_pattern = re.compile(rf"{accession_prefix}[- ]\d+", re.IGNORECASE)
+    try:
+        # *** CHANGE: Compile the flexible pattern provided by the user ***
+        accession_pattern = re.compile(accession_pattern_str, re.IGNORECASE)
+        logger.info(f"Using accession pattern: {accession_pattern_str}")
+    except re.error as e:
+        logger.error(
+            f"Invalid regex pattern for accession ID: '{accession_pattern_str}'. Error: {e}"
+        )
+        return
+
     stain_pattern, stain_lookup = build_stain_normalizer(STAIN_NAME_CORRECTIONS)
 
-    # Read all data into memory to pass to workers
     try:
         with open(input_path, mode="r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
@@ -189,14 +185,12 @@ def enrich_csv_with_parsing(
         1 for row in updated_rows if row[COL_EXTRACTION_SUCCESSFUL]
     )
 
-    # Define the final header order
-    new_headers = original_headers + [
+    new_headers = (original_headers or []) + [
         COL_ACCESSION_ID,
         COL_STAIN,
         COL_EXTRACTION_SUCCESSFUL,
         COL_QC_PASSED,
     ]
-    # Filter out any headers that might have been added in a previous run to avoid duplication
     final_headers = list(dict.fromkeys(new_headers))
 
     logger.info(f"Writing enriched data to '{output_path}'")
@@ -238,11 +232,13 @@ if __name__ == "__main__":
         required=True,
         help="Path for the final, enriched output CSV file.",
     )
+    # *** CHANGE: New, more powerful argument with a better default ***
     parser.add_argument(
-        "--accession-prefix",
+        "--accession-pattern",
         type=str,
-        default="S",
-        help="The letter prefix for the Accession ID (e.g., 'S' for 'S-12345').",
+        default=r"[A-Z]{1,4}\d{0,2}[- ]\d+",
+        help="Regex pattern to extract the Accession ID. "
+        "Default matches formats like 'S-12345' and 'NP22-950'.",
     )
     parser.add_argument(
         "--workers",
@@ -253,9 +249,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Ensure the output directory exists
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
 
     enrich_csv_with_parsing(
-        args.input_csv, args.output_csv, args.accession_prefix, args.workers
+        args.input_csv, args.output_csv, args.accession_pattern, args.workers
     )

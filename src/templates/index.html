@@ -511,9 +511,9 @@
         <h1>SVS Slide Quality Control</h1>
         <div class="header-links">
             {% if current_user.is_authenticated %}
+                <a href="{{ url_for('history') }}">My History</a>
                 {% if current_user.is_admin %}
                     <a href="{{ url_for('users_management') }}">User Management</a>
-                    <a href="{{ url_for('history') }}">My History</a>
                 {% endif %}
                 <span>Logged in as <b>{{ current_user.id }}</b> (Corrections: {{ current_user.correction_count }})</span>
                 <a href="{{ url_for('logout') }}">Logout</a>
@@ -524,7 +524,7 @@
         <div class="left-panel">
             <ul class="flash-messages">
                 {% for message in messages %}
-                    <li class="{{ message.css_class }}">{{ message.message }}</li>
+                    <li class="{{ message.category }}">{{ message.message }}</li>
                 {% endfor %}
             </ul>
 
@@ -672,15 +672,19 @@
             const nextButton = document.querySelector('button[name="action"][value="next"]');
 
             function toggleNextButtonState() {
-                // Disable the 'Next' button if the 'Mark as Complete' checkbox is not checked
-                nextButton.disabled = !completeCheckbox.checked;
+                if (nextButton) {
+                    // Disable the 'Next' button if the 'Mark as Complete' checkbox is not checked
+                    nextButton.disabled = !completeCheckbox.checked;
+                }
             }
 
-            // Set the initial state of the 'Next' button when the page loads
-            toggleNextButtonState();
+            if (completeCheckbox && nextButton) {
+                // Set the initial state of the 'Next' button when the page loads
+                toggleNextButtonState();
 
-            // Add a listener to the checkbox to toggle the button state whenever it changes
-            completeCheckbox.addEventListener('change', toggleNextButtonState);
+                // Add a listener to the checkbox to toggle the button state whenever it changes
+                completeCheckbox.addEventListener('change', toggleNextButtonState);
+            }
         });
     </script>
 </body>
