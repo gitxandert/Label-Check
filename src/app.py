@@ -48,8 +48,8 @@ class Config:
 
     # Points to the directory containing images and the CSV
     # Assuming structure: Data/final_enriched_mapping.csv and Data/macro/..., Data/label/...
-    IMAGE_BASE_DIR = r"Data"
-    CSV_FILE_PATH = os.path.join(IMAGE_BASE_DIR, "final_enriched_mapping.csv")
+    IMAGE_BASE_DIR = r"..\NP-22-data"
+    CSV_FILE_PATH = os.path.join(IMAGE_BASE_DIR, "ocr_processed_parsed.csv")
     BACKUP_DIR = "csv_backups"
 
     # Admin User Default Password (use environment variable in production)
@@ -212,11 +212,15 @@ def _release_expired_leases():
     lease_duration = datetime.timedelta(seconds=app.config["LEASE_DURATION_SECONDS"])
     expired_time = datetime.datetime.utcnow() - lease_duration
 
-    expired_items = db.session.execute(
-        db.select(QueueItem).filter(
-            QueueItem.status == "leased", QueueItem.leased_at < expired_time
+    expired_items = (
+        db.session.execute(
+            db.select(QueueItem).filter(
+                QueueItem.status == "leased", QueueItem.leased_at < expired_time
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
 
     if expired_items:
         count = 0
@@ -275,7 +279,7 @@ def get_current_display_list_indices() -> List[int]:
 def load_csv_data(file_path: str = Config.CSV_FILE_PATH) -> None:
     """
     Loads data from the new pipeline CSV format into global memory.
-    Expected columns: macro_path, label_path, original_slide_path, label_text,
+    Expected columns: macro_path, label_path, original_slide_location, label_text,
                       macro_text, AccessionID, Stain, ParsingQCPassed, etc.
     """
     global data, headers
@@ -286,7 +290,12 @@ def load_csv_data(file_path: str = Config.CSV_FILE_PATH) -> None:
 
     _data: List[Dict[str, Any]] = []
     # Columns essential for the UI to function
-    critial_headers = ["AccessionID", "Stain", "ParsingQCPassed", "original_slide_path"]
+    critial_headers = [
+        "AccessionID",
+        "Stain",
+        "ParsingQCPassed",
+        "original_slide_location",
+    ]
 
     try:
         with open(file_path, "r", newline="", encoding="utf-8") as csvfile:
@@ -309,7 +318,7 @@ def load_csv_data(file_path: str = Config.CSV_FILE_PATH) -> None:
                 row["_original_index"] = i
 
                 # Derive identifier from original filename for grouping
-                orig_path = row.get("original_slide_path")
+                orig_path = row.get("original_slide_location")
                 row["_identifier"] = (
                     Path(orig_path).stem if orig_path else f"Unknown_{i}"
                 )
@@ -477,9 +486,7 @@ def users_management():
     if not current_user.is_admin:
         return redirect(url_for("index"))
     users = db.session.execute(db.select(User)).scalars().all()
-    return render_template(
-        "users.html", users=users, messages=flash_messages()
-    )
+    return render_template("users.html", users=users, messages=flash_messages())
 
 
 @app.route("/add_user", methods=["POST"])
@@ -529,20 +536,29 @@ def index():
         try:
             idx = int(req_idx)
             if 0 <= idx < len(data):
-                # Release existing lease if moving to arbitrary index
-                curr_lease = db.session.execute(
-                    db.select(QueueItem).filter_by(
-                        leased_by_id=current_user.id, status="leased"
+                # Release existing leases if moving to a different index
+                existing_leases = (
+                    db.session.execute(
+                        db.select(QueueItem).filter_by(
+                            leased_by_id=current_user.id, status="leased"
+                        )
                     )
-                ).scalar_one_or_none()
-                if curr_lease and curr_lease.original_index != idx:
-                    curr_lease.status = "pending"
-                    curr_lease.leased_by = None
-                    curr_lease.leased_at = None
+                    .scalars()
+                    .all()
+                )
+                for lease in existing_leases:
+                    if lease.original_index != idx:
+                        lease.status = "pending"
+                        lease.leased_by = None
+                        lease.leased_at = None
 
-                qi = db.session.execute(
-                    db.select(QueueItem).filter_by(original_index=idx)
-                ).scalar_one_or_none()
+                qi = (
+                    db.session.execute(
+                        db.select(QueueItem).filter_by(original_index=idx)
+                    )
+                    .scalars()
+                    .first()
+                )
                 if qi:
                     if qi.status == "leased" and qi.leased_by_id != current_user.id:
                         flash("Read-only mode: Item leased by another user.", "warning")
@@ -556,19 +572,25 @@ def index():
 
     if not item_to_display:
         # 1. Continue current lease
-        active = db.session.execute(
-            db.select(QueueItem).filter_by(
-                leased_by_id=current_user.id, status="leased"
+        active = (
+            db.session.execute(
+                db.select(QueueItem).filter_by(
+                    leased_by_id=current_user.id, status="leased"
+                )
             )
-        ).scalar_one_or_none()
+            .scalars()
+            .first()
+        )
 
         if active:
             item_to_display = active
         else:
             # 2. Get next pending
             nxt = db.session.execute(
-                db.select(QueueItem).filter_by(status="pending").order_by(QueueItem.original_index)
-            ).scalar_one_or_none()
+                db.select(QueueItem)
+                .filter_by(status="pending")
+                .order_by(QueueItem.original_index)
+            ).scalars().first()
             if nxt:
                 nxt.status = "leased"
                 nxt.leased_by_id = current_user.id
@@ -578,7 +600,11 @@ def index():
                 # 3. Nothing left
                 db.session.commit()  # Save any lease releases
                 total = db.session.query(func.count(QueueItem.id)).scalar()
-                done = db.session.query(func.count(QueueItem.id)).filter_by(status="completed").scalar()
+                done = (
+                    db.session.query(func.count(QueueItem.id))
+                    .filter_by(status="completed")
+                    .scalar()
+                )
                 return render_template(
                     "index.html",
                     no_items_left=True,
@@ -615,6 +641,12 @@ def index():
 
     csv_lbl_path = display_row.get("_label_path")
     if csv_lbl_path:
+        # If path from CSV incorrectly contains the base dir, remove it
+        if 'NP-22-data' in csv_lbl_path:
+            path_parts = csv_lbl_path.split('NP-22-data', 1)
+            if len(path_parts) > 1:
+                csv_lbl_path = path_parts[1].lstrip('.\\/')
+
         full_path = os.path.join(Config.IMAGE_BASE_DIR, csv_lbl_path)
         if os.path.exists(full_path):
             # Pass the relative path from CSV to the serving route
@@ -623,6 +655,12 @@ def index():
 
     csv_mac_path = display_row.get("_macro_path")
     if csv_mac_path:
+        # If path from CSV incorrectly contains the base dir, remove it
+        if 'NP-22-data' in csv_mac_path:
+            path_parts = csv_mac_path.split('NP-22-data', 1)
+            if len(path_parts) > 1:
+                csv_mac_path = path_parts[1].lstrip('.\\/')
+
         full_path = os.path.join(Config.IMAGE_BASE_DIR, csv_mac_path)
         if os.path.exists(full_path):
             mac_url = url_for("serve_relative_image", filepath=csv_mac_path)
@@ -630,17 +668,27 @@ def index():
 
     # Stats for UI
     q_stats = {
-        "pending": db.session.query(func.count(QueueItem.id)).filter_by(status="pending").scalar(),
-        "leased": db.session.query(func.count(QueueItem.id)).filter_by(status="leased").scalar(),
-        "completed": db.session.query(func.count(QueueItem.id)).filter_by(status="completed").scalar(),
+        "pending": db.session.query(func.count(QueueItem.id))
+        .filter_by(status="pending")
+        .scalar(),
+        "leased": db.session.query(func.count(QueueItem.id))
+        .filter_by(status="leased")
+        .scalar(),
+        "completed": db.session.query(func.count(QueueItem.id))
+        .filter_by(status="completed")
+        .scalar(),
     }
 
-    recent = db.session.execute(
-        db.select(QueueItem)
-        .filter_by(completed_by_id=current_user.id)
-        .order_by(QueueItem.completed_at.desc())
-        .limit(5)
-    ).scalars().all()
+    recent = (
+        db.session.execute(
+            db.select(QueueItem)
+            .filter_by(completed_by_id=current_user.id)
+            .order_by(QueueItem.completed_at.desc())
+            .limit(5)
+        )
+        .scalars()
+        .all()
+    )
     for r in recent:
         if r.original_index < len(data):
             r.accession_id = data[r.original_index].get("AccessionID", "N/A")
@@ -668,11 +716,15 @@ def index():
 @login_required
 def history():
     """Displays the user's full history of completed items."""
-    history_items = db.session.execute(
-        db.select(QueueItem)
-        .filter_by(completed_by_id=current_user.id)
-        .order_by(QueueItem.completed_at.desc())
-    ).scalars().all()
+    history_items = (
+        db.session.execute(
+            db.select(QueueItem)
+            .filter_by(completed_by_id=current_user.id)
+            .order_by(QueueItem.completed_at.desc())
+        )
+        .scalars()
+        .all()
+    )
 
     for item in history_items:
         if item.original_index < len(data):
@@ -693,9 +745,11 @@ def update():
         return redirect(url_for("index"))
     try:
         idx = int(request.form["original_index"])
-        qi = db.session.execute(
-            db.select(QueueItem).filter_by(original_index=idx)
-        ).scalar_one_or_none()
+        qi = (
+            db.session.execute(db.select(QueueItem).filter_by(original_index=idx))
+            .scalars()
+            .first()
+        )
 
         # Force complete even if lease expired/stolen if user hits "save"
         forced = False
@@ -773,17 +827,22 @@ def update():
 @app.route("/release", methods=["POST"])
 @login_required
 def release_lease():
-    qi = db.session.execute(
-        db.select(QueueItem).filter_by(
-            leased_by_id=current_user.id, status="leased"
+    leases = (
+        db.session.execute(
+            db.select(QueueItem).filter_by(
+                leased_by_id=current_user.id, status="leased"
+            )
         )
-    ).scalar_one_or_none()
-    if qi:
-        qi.status = "pending"
-        qi.leased_by = None
-        qi.leased_at = None
+        .scalars()
+        .all()
+    )
+    if leases:
+        for lease in leases:
+            lease.status = "pending"
+            lease.leased_by = None
+            lease.leased_at = None
         db.session.commit()
-        flash("Lease released.", "info")
+        flash(f"Released {len(leases)} lease(s).", "info")
     return redirect(url_for("index"))
 
 
