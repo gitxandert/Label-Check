@@ -256,15 +256,13 @@ def parse_arg_spec(name: str, value: ast.Call, path: Path) -> ArgSpec:
                         offset=kw.value.col_offset,
                     )
 
+                # validate_val(val, arg, kind.attr, path)
+
                 specs[arg] = val
             case 'tuple':
                 match arg:
                     case 'default' | 'form':
-                        try:
-                            val = parse_tuple(arg, kw, path)
-                        except Exception as e:
-                            print(e, file=sys.stderr)
-                            continue
+                        val = parse_tuple(arg, kw, path)
                     case _:
                         if isinstance(kw.value, ast.Constant):
                             val = kw.value.value
