@@ -3,7 +3,7 @@ This program allows for both seamless running of scripts in sequence (i.e. can r
 
 Instead of parsing multiple command line arguments, this program parses a single .runner.config file in the directory from which this script is called. Running this program with the '--config' flag brings up an interface through which the user can schedule scripts and configure their arguments within .runner.config. (Note: running with '--config' ignores all other arguments.) If there is no .runner.config, the program will generate one and prompt the user to select scripts and provide arguments to run these scripts in sequence. Generating the config file with `runner.py --config` will ensure that the program cannot be run until all of the scripts are syntactically and validly annotated, and that the user has provided all of the required arugments. If the user generates the .runner.config file manually, then if an argument that is necessary to run any of the scripts is missing, the program will terminate before any scripts are run and specify what is necessary to run the pipeline.
 
-Any script that can be run by this program should be placed in the scripts/ directory. When this program is run with '--config', it checks all of the scripts in this directory for the syntax class Args and parses arguments for every script with this annotation. If a script does not have this annotation, the user will be prompted to create one; however, the user is only obligated to provided annotations for scripts that are scheduled to be run.
+Any script that can be run by this program should be placed in the scripts/ directory. When this program is run with '--config', it checks all of the scripts in this directory for the syntax class Args and parses arguments for every script with this annotation. If a script does not have this annotation, the user will be prompted to create one; however, the user is only obligated to provided annotations for scripts that are scheduled to be run. 
 
 The annotation should be formatted in the following style (an argument's name does not need to be formatted according to any certain convention):
     
@@ -20,7 +20,7 @@ Each argument's value must be declared with Arg.[type]() (all of the allowed typ
 
 Rather than manually formatting a class Args in each script, the user should instead generate this class with `runner.py --config`. If a script in scripts/ does not have a class Args, the program will prompt the user to create one interactively, ensure formatting step-by-step, and annotate the script with this class after approval. However, if the user decides to manually format the class, `runner.py --config` will still validate the annotation and bring to light any syntax and/or value errors.
 
-Scripts with valid Args annotations can be scheduled to run with `runner.py --config`. Valid scripts are selected to run in a specific order, and the arguments necessary to run each script will be saved to .runner.config. If a script already has an entry in .runner.config, the user will be prompted to edit it for a specific run, if they choose; if a script does not have an entry in .runner.config, the user must supply at least the required arguments to run this script. When the program runs normally (i.e. without the --config flag), it will look in .runner.config for all of the scripts it is to run and will run each script sequentially in subprocess(), with its configured arguments. 
+Scripts with valid Args annotations can be scheduled to run with `runner.py --config`. Valid scripts are selected to run in a specific order, and the arguments necessary to run each script will be saved to .runner.config. If a script already has an entry in .runner.config, the user will be prompted to edit it for a specific run, if they choose; if a script does not have an entry in .runner.config, the user must supply at least the required arguments to run this script. (If a script does not require any arguments to run, then the annotation need only include an Arg.desc() argument, to describe the function and purpose of the script.) When the program runs normally (i.e. without the --config flag), it will look in .runner.config for all of the scripts it is to run and will run each script sequentially in subprocess(), with its configured arguments. 
 
 Although --config makes certain that the annotations are syntactically correct and valid, and that all required arguments are validated and stored in .runner.config, this does not guarantee that the scripts will accept the provided arguments, if the Args annotation allows for incorrect arguments. The user should understand exactly what types each argument to a script requires, and format the Args annotation accordingly.
 
@@ -115,7 +115,7 @@ def extract_args_node(script_path: Path) -> ast.ClassDef:
         )
 
 
-def parse_tuple(arg, kw, path) -> tuple:
+def parse_tuple(arg: str, kw: ast.keyword, path: Path) -> tuple:
     match arg:
         case 'default':
             if isinstance(kw.value, ast.Tuple):
@@ -291,8 +291,8 @@ def parse_arg_spec(name: str, value: ast.Call, path: Path) -> ArgSpec:
         )
 
 
-# eventually return ScriptArgs
-def parse_node(class_node: ast.ClassDef, script_path: Path):
+def parse_node(class_node: ast.ClassDef, script_path: Path) -> ScriptArgs:
+    specs = {}
     for stmt in class_node.body:
         if not isinstance(stmt, ast.Assign):
             continue
@@ -315,7 +315,6 @@ def parse_node(class_node: ast.ClassDef, script_path: Path):
                 )
 
         name = stmt.targets[0].id
-        kind = value.func.attr
 
         try:
             spec = parse_arg_spec(name, value, script_path)
@@ -323,22 +322,34 @@ def parse_node(class_node: ast.ClassDef, script_path: Path):
             print(e, file=sys.stderr)
             continue
 
-        # need to match against different kinds
-        # to process keywords variously
-        # (desc doesn't even have any keywords)
+        specs[name] = spec
+    
+    name = script_path.name
+    spdesc = specs.get("desc", None)
+    if spdesc is not None:
+        desc = spdesc.desc
+    else:
+        desc = None
+    required = {}
+    optional = {}
 
-        # keywords = [k for k in value.keywords]
-        # specs = {}
-        # for kw in keywords:
-            # spec = kw.arg
-            # val = ast.dump(kw.value)
-            # specs[spec] = val
-        print(f"\t{name}: {kind}")
-        print(f"\t\t{spec}")
+    for spec in specs.values():
+        if spec.required == True:
+            required[spec.name] = spec
+        else:
+            optional[spec.name] = spec
+
+    return ScriptArgs(
+            name=name,
+            desc=desc,
+            required=required,
+            optional=optional,
+        )
+    
 
 
 def process_script_args(scripts_dir: Path):
-    # scripts = {}
+    scripts = {}
     for script in scripts_dir.glob("*.py"):
         try:
             node = extract_args_node(script)
@@ -352,7 +363,34 @@ def process_script_args(scripts_dir: Path):
             print(e, file=sys.stderr)
             continue
 
-   # print(scripts)
+        scripts[script.name] = args
+
+    for sc, ar in scripts.items():
+        print(sc)
+        if ar.desc is not None:
+            print(f"\t{ar.desc}")
+        print(f"\tRequired args:")
+        for spec, args in ar.required.items():
+            print(f"\t\t{spec}")
+            if args.desc is not None:
+                print(f"\t\t\tdesc -- {args.desc}")
+            print(f"\t\t\ttype -- {args.kind}")
+            if args.form is not None:
+                print(f"\t\t\tformat -- {args.form}")
+            if args.default is not None:
+                print(f"\t\t\tdefault -- {args.default}")
+        print(f"\tOptional args:")
+        for spec, args in ar.optional.items():
+            if spec != 'desc':
+                print(f"\t\t{spec}")
+                if args.desc is not None:
+                    print(f"\t\t\tdesc -- {args.desc}")
+                print(f"\t\t\ttype -- {args.kind}")
+                if args.form is not None:
+                    print(f"\t\t\tformat -- {args.form}")
+                if args.default is not None:
+                    print(f"\t\t\tdefault -- {args.default}")
+
 
 def edit_config():
     sys.exit(0)
