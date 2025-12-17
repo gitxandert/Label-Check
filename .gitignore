@@ -226,3 +226,7 @@ src/audit_logs/*
 src/ocr_audit_logs/
 docker-compose.yml
 tests/
+
+# Vim stuff
+*~
+*.swp
