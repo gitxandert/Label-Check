@@ -19,6 +19,39 @@ Key libraries used:
 - tqdm: For displaying a progress bar during file processing.
 """
 
+# parsed by runner.py as AST node
+class Args:
+    desc = Arg.desc(
+            "Extract associated images (macro, label, thumbnail) from whole-slide image files."
+            )
+    input_dir = Arg.path(
+            required=True,
+            desc="Input directory containing slide files."
+        )
+    output_dir = Arg.path(
+            required=True,
+            desc="Output directory for extracted images."
+        )
+    csv_path = Arg.path(
+            default="slide_mapping.csv",
+            desc="Path to save the CSV mapping file."
+        )
+    workers = Arg.int(
+            default=4,
+            desc="Number of worker threads for parallel processing."
+        )
+    extensions = Arg.list(
+            form=[str],
+            default=["svs"],
+            desc="List of file extensions to process (e.g. svs, tif, ndpi)"
+        )
+    thumbnail_size = Arg.tuple(
+            form=(int, int),
+            default=(300,300),
+            desc="Size of thumbnails to generate if not present. Default: (300, 300)"
+        )
+
+
 import argparse
 import csv
 import logging
