@@ -175,6 +175,72 @@ def parse_tuple(arg: str, kw: ast.keyword, path: Path) -> tuple:
                 )
 
 
+def parse_list(arg: str, kw: ast.keyword, path: Path) -> list:
+    match arg:
+        case 'default':
+            if isinstance(kw.value, ast.List):
+                elts = kw.value.elts
+
+                values = []
+                for e in elts:
+                    if isinstance(e, ast.Constant):
+                        values.append(e.value)
+                    else:
+                        raise ArgsSyntaxError(
+                            "default arguments must be literals",
+                            path=path,
+                            lineno=e.value,
+                            offset=e.value.col_offset,
+                        )
+
+                return values 
+            else:
+                raise ArgsSyntaxError(
+                    f"{arg} must be a list [x, y, ...]",
+                    path=path,
+                    lineno=kw.value.lineno,
+                    offset=kw.value.col_offset,
+                )
+        case 'form':
+            if isinstance(kw.value, ast.List):
+                elts = kw.value.elts
+
+                values = []
+                if len(elts) > 1:
+                    raise ArgsSyntaxError(
+                            "lists can only be of one type",
+                            path=path,
+                            lineno=kw.value.lineno,
+                            offset=kw.value.col_offset,
+                        )
+                
+                e = elts[0]
+                if isinstance(e, ast.Name):
+                    if e.id in {'str', 'int', 'float', 'Path'}:
+                        return  '[' + e.id + ']'
+                    else:
+                        raise ArgsSyntaxError(
+                                f"Unknown type '{e.id}",
+                                path=path,
+                                lineno=e.lineno,
+                                offset=e.col_offset,
+                            )
+                else:
+                    raise ArgsSyntaxError(
+                        "form argument must be a type name",
+                        path=path,
+                        lineno=e.value,
+                        offset=e.value.col_offset,
+                    )
+            else:
+                raise ArgsSyntaxError(
+                    f"{arg} must be a list[x, y, ...]",
+                    path=path,
+                    lineno=kw.value.lineno,
+                    offset=kw.value.col_offset,
+                )
+
+
 def parse_arg_spec(name: str, value: ast.Call, path: Path) -> ArgSpec:
     required = False
     desc = None
@@ -275,6 +341,22 @@ def parse_arg_spec(name: str, value: ast.Call, path: Path) -> ArgSpec:
                             )
 
                 specs[arg] = val
+            case 'list':
+                match arg:
+                    case 'default' | 'form':
+                        val = parse_list(arg, kw, path)
+                    case _:
+                        if isinstance(kw.value, ast.Constant):
+                            val = kw.value.value
+                        else:
+                            raise ArgsSyntaxError(
+                                f"Argument must be a literal",
+                                path=path,
+                                lineno=kw.value.lineno,
+                                offset=kw.value.col_offset,
+                            )
+                specs[arg] = val
+
 
     required = specs.get('required', required)
     desc = specs.get('desc', desc)
