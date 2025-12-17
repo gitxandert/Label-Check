@@ -48,7 +48,7 @@ class Args:
     thumbnail_size = Arg.tuple(
             form=(int, int),
             default=(300,300),
-            desc="Size of thumbnails to generate if not present. Default: (300, 300)"
+            desc="Size of thumbnails to generate if not present."
         )
 
 
