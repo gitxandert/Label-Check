@@ -115,6 +115,35 @@ def extract_args_node(script_path: Path) -> ast.ClassDef:
         )
 
 
+def validate_default(path: Path, stmt: ast.Call, ty: str, default: Any, form: Any = None):
+    match ty:
+        case 'int':
+            if not isinstance(default, int):
+                raise ArgsSyntaxError(
+                        f"{default} is not an integer",
+                        path=path,
+                        lineno=stmt.lineno,
+                        offset=stmt.col_offset,
+                    )
+        case 'float':
+            if not isinstance(default, float):
+                raise ArgsSyntaxError(
+                        f"{default} is not a float",
+                        path=path,
+                        lineno=stmt.lineno,
+                        offset=stmt.col_offset,
+                    )
+        case 'tuple':
+            for i, ty in enumerate(form):
+                validate_default(path, stmt, ty, default[i])
+        case 'list':
+            for item in default:
+                validate_default(path, stmt, form[0], item)
+        case _:
+            # str and path can be pretty much be anything, so pointless to validate
+            pass
+
+
 def parse_tuple(arg: str, kw: ast.keyword, path: Path) -> tuple:
     match arg:
         case 'default':
@@ -340,6 +369,7 @@ def parse_arg_spec(name: str, value: ast.Call, path: Path) -> ArgSpec:
                                 offset=kw.value.col_offset,
                             )
 
+
                 specs[arg] = val
             case 'list':
                 match arg:
@@ -357,11 +387,22 @@ def parse_arg_spec(name: str, value: ast.Call, path: Path) -> ArgSpec:
                             )
                 specs[arg] = val
 
+    form = specs.get('form', form)
+    if kind.attr in {'tuple', 'list'}:
+        if form is None:
+            raise ArgsSyntaxErrr(
+                    f"{kind.attr} requires a form argument",
+                    path=script_path,
+                    lineno=value.lineno,
+                    offset=value.col_offset,
+                )
+        
+    default = specs.get('default', default)
+    if default is not None:
+        validate_default(path, value, kind.attr, default, form)
 
     required = specs.get('required', required)
     desc = specs.get('desc', desc)
-    form = specs.get('form', form)
-    default = specs.get('default', default)
       
     return ArgSpec(
             name=name,
@@ -458,7 +499,7 @@ def process_script_args(scripts_dir: Path):
                 print(f"\t\t\tdesc -- {args.desc}")
             print(f"\t\t\ttype -- {args.kind}")
             if args.form is not None:
-                print(f"\t\t\tformat -- {args.form}")
+                print(f"\t\t\tform -- {args.form}")
             if args.default is not None:
                 print(f"\t\t\tdefault -- {args.default}")
         print(f"\tOptional args:")
@@ -469,12 +510,56 @@ def process_script_args(scripts_dir: Path):
                     print(f"\t\t\tdesc -- {args.desc}")
                 print(f"\t\t\ttype -- {args.kind}")
                 if args.form is not None:
-                    print(f"\t\t\tformat -- {args.form}")
+                    print(f"\t\t\tform -- {args.form}")
                 if args.default is not None:
                     print(f"\t\t\tdefault -- {args.default}")
 
 
 def edit_config():
+    try:
+        with open(".runner.config", 'r') as f:
+            config = f.read()
+    except FileNotFoundError:
+        print("Error: no .runner.config in this directory.")
+        create = input("Create a new .runner.config? [y/N] ")
+        match create.lower():
+            case 'y' | "yes":
+                with open(".runner.config", 'w') as f:
+                    f.write("")
+            case _:
+                sys.exit(0)
+
+    while True:
+        if config == "":
+            option = input("[n]ew config | view [s]cripts | [a]bort: ")
+            option = option.lower()
+            if option in {'n', "new", "new config"}:
+                pass
+            elif option in {'s', "scripts", "view scripts"}:
+                process_script_args(Path("scripts"))
+            elif option in {'a', "abort"}:
+                print("Aborted.")
+                break
+            else:
+                print(f"Unrecognized option '{option}'")
+        else:
+            option = input("[e]dit config | [v]iew config | view [s]cripts | [c]ommit changes | [a]bort without saving: ")
+            option = option.lower()
+            if option in {'e', "edit", "edit config"}:
+                print("Editing config.")
+            elif option in {'v', "view", "view config"}:
+                print(f"\n{config}\n")
+            elif option in {'s', "scripts", "view scripts"}:
+                process_script_args(Path("scripts"))
+            elif option in {'c', "commit", "commit changes"}:
+                print("Saved config.")
+                break
+            elif option in {'a', "abort", "abort without saving"}:
+                print("Quit without saving.")
+                break
+            else:
+                print(f"Unrecognized option '{option}'")                   
+
     sys.exit(0)
 
 
@@ -489,8 +574,6 @@ if __name__ == "__main__":
 
     if args.config:
         edit_config()
-
-    process_script_args(Path("scripts"))
 
     # config = Config()
     # print(config.args)
