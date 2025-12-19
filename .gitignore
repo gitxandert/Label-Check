@@ -230,3 +230,6 @@ tests/
 # Vim stuff
 *~
 *.swp
+
+# runner.py stuff
+.runner.config
