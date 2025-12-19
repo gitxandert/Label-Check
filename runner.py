@@ -533,6 +533,40 @@ def list_scripts(enum: bool = False) -> int:
     return count
 
 
+# catch errors with variable creation
+class VariableError(Exception):
+    def __init__(self, message: str):
+        super().__init__(message)
+
+
+def validate_variable(ty: str, val: str, form: str | None = None):
+    match ty:
+        case 'int':
+            try:
+                v = int(val)
+            except:
+                raise VariableError(f"{val} is not a valid {ty}")
+        case 'float':
+            try:
+                v = float(val)
+            except:
+                raise VariableError(f"{val} is not a valid {ty}")
+        case 'tuple':
+            if form is not None:
+                types = form.lstrip("(").rstrip(")").split(", ")
+                vals = val.lstrip("(").rstrip(")").split(", ")
+                for i, t in enumerate(types):
+                    validate_variable(t, vals[i])
+        case 'list':
+            if form is not None:
+                t = form.lstrip("[").rstrip("]")
+                v = val.lstrip("[").rstrip("]")
+                validate_variable(t, v)
+        case _:
+            # check if begins and ends in quotes
+            pass
+
+
 def edit_variables():
     try:
         with open(".runner.var", 'r') as f:
@@ -553,9 +587,100 @@ def edit_variables():
     while True:
         if var == "":
             print("No variables in .runner.var")
-        option = input("[a]dd variable | [e]dit variable | [d]elete variable | [b]ack to config: ")
-        option = option.lower()
-        if option in {'b', "back", "back to config"}:
+        else:
+            print(var)
+        option = input("[a]dd variable | [e]dit variable | [d]elete variable | [c]ommit changes | [b]ack to config: ")
+        option = option.strip().lower()
+        if option in {'a', "add", "add variable"}:
+            name = input("Enter variable name: ")
+            name = name.strip()
+            if name == "":
+                print("Error: must enter valid name")
+                continue
+
+            ty = input("Enter variable type (str, path, int, float, tuple, list): ")
+            ty = ty.strip()
+            if ty not in {"str", "path", "int", "float", "tuple", "list"}:
+                print(f"Error: {ty} is not a valid variable type.")
+                continue
+
+            form = None
+            if ty == "tuple":
+                form = input(f"Enter tuple format (e.g. (str, int)): ")
+                types = form.strip().lstrip("(").rstrip(")").split(", ")
+                for t in types:
+                    if t not in {"str", "path", "int", "float"}:
+                        print(f"Error: {t} is not a valid type.")
+                        continue
+                # if valid, reformat tuple string
+                form = "("
+                for t in types:
+                    form += f"{t}, "
+                form += ")"
+
+            if ty == "list":
+                form = input(f"Enter list format (e.g. [str]): ")
+                t = form.strip().lstrip("[").rstrip("]")
+                if t not in {"str", "path", "int", "float"}:
+                    print(f"Error: {t} is not a valid type")
+                    continue
+                # if valid, reformat list string
+                form = f"[{t}]"
+
+            val = input(f"Enter {ty} value: ")
+            val = val.strip()
+
+            try:
+                validate_variable(ty, val, form)
+            except VariableError as ve:
+                print(f"Error: {ve}")
+                continue
+
+            if form is not None:
+                ty += f": {form}"
+            var += f"%R{name}={val}\t{ty}\n"
+            print(f"Will add {name} to .runner.var.")
+        elif option in {'d', "delete", "delete variable"}:
+            name = input("Enter variable name: ")
+            name = name.strip().lstrip("%R")
+            lines = var.split('\n')
+            variables = {}
+            found = False
+            for line in lines:
+                if line == "":
+                    continue
+                v = ""
+                line = line.lstrip("%R")
+                for ch in line:
+                    if ch != '=':
+                        v += ch
+                    else:
+                        break
+                if v == name:
+                    found = True
+                variables[v] = line
+            if not found:
+                print(f"Error: no variable named {name}")
+                continue
+
+            confirm = input(f"Delete {name}? [y/N] ")
+            confirm = confirm.strip().lower()
+            if confirm in {'y', "yes"}:
+                var = ""
+                for v, line in variables.items():
+                    if v != name:
+                        var += line
+            print(f"Will delete {name} from .runner.var.")
+
+        elif option in {'c', "commit", "commit changes"}:
+            try:
+                with open(".runner.var", 'w') as f:
+                    f.write(var)
+            except Exception as e:
+                print(e, file=sys.stderr)
+            break
+        elif option in {'b', "back", "back to config"}:
+            print("Returning to config without saving...")
             break
         else:
             print(f"Unrecognized option {option}")
@@ -581,7 +706,7 @@ def edit_config():
     while True:
         if config == "":
             option = input("[n]ew config | list [s]cripts | edit [v]ariables | [a]bort: ")
-            option = option.lower()
+            option = option.strip().lower()
             if option in {'n', "new", "new config"}:
                 num_scripts = list_scripts(enum=True)
                 if num_scripts == 0:
