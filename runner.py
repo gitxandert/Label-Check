@@ -102,6 +102,12 @@ class ArgsSyntaxError(Exception):
         super().__init__(prefix + message)
 
 
+# signals that there is no class Args in the script
+class MissingArgsError(Exception):
+    def __init__(self):
+        super().__init__()
+
+
 def extract_args_node(script_path: Path) -> ast.ClassDef:
     tree = ast.parse(script_path.read_text())
     
@@ -109,10 +115,7 @@ def extract_args_node(script_path: Path) -> ast.ClassDef:
         if isinstance(node, ast.ClassDef) and node.name == "Args":
             return node
 
-    raise ArgsSyntaxError(
-            "Contains no class Args",
-            path=script_path,
-        )
+    raise MissingArgsError()
 
 
 def validate_default(path: Path, stmt: ast.Call, ty: str, default: Any, form: Any = None):
@@ -470,12 +473,13 @@ def parse_node(class_node: ast.ClassDef, script_path: Path) -> ScriptArgs:
         )
     
 
-
-def process_script_args(scripts_dir: Path):
+def parse_script_args(scripts_dir: Path):
     scripts = {}
     for script in scripts_dir.glob("*.py"):
         try:
             node = extract_args_node(script)
+        except MissingArgsError:
+            print(script)
         except Exception as e:
             print(f"Error: {e}", file=sys.stderr)
             continue
@@ -515,12 +519,54 @@ def process_script_args(scripts_dir: Path):
                     print(f"\t\t\tdefault -- {args.default}")
 
 
+def list_scripts(enum: bool = False) -> int:
+    count = 0
+    for p in Path("scripts").iterdir():
+        # ignore Vim stuff
+        if not p.name.endswith('~') and not p.name.endswith('.swp'):
+            count += 1
+            if enum:
+                print(f"{count}) {p.name}")
+            else:
+                print(p.name)
+
+    return count
+
+
+def edit_variables():
+    try:
+        with open(".runner.var", 'r') as f:
+            var = f.read()
+    except FileNotFoundError:
+        print("No .runner.var in this directory.")
+        create = input("Create a new .runner.var? [y/N] ")
+        if create:
+            with open(".runner.var", 'w') as f:
+                f.write("")
+            var = ""
+        else:
+            return
+    except Exception as e:
+        print(e, file=sys.stderr)
+        return
+
+    while True:
+        if var == "":
+            print("No variables in .runner.var")
+        option = input("[a]dd variable | [e]dit variable | [d]elete variable | [b]ack to config: ")
+        option = option.lower()
+        if option in {'b', "back", "back to config"}:
+            break
+        else:
+            print(f"Unrecognized option {option}")
+
+
 def edit_config():
     try:
         with open(".runner.config", 'r') as f:
             config = f.read()
     except FileNotFoundError:
-        print("Error: no .runner.config in this directory.")
+        print("No .runner.config in this directory.")
         create = input("Create a new .runner.config? [y/N] ")
         match create.lower():
             case 'y' | "yes":
@@ -528,34 +574,67 @@ def edit_config():
                     f.write("")
             case _:
                 sys.exit(0)
+    except Exception as e:
+        print(e, file=sys.stderr)
+        sys.exit(0)
 
     while True:
         if config == "":
-            option = input("[n]ew config | view [s]cripts | [a]bort: ")
+            option = input("[n]ew config | list [s]cripts | edit [v]ariables | [a]bort: ")
             option = option.lower()
             if option in {'n', "new", "new config"}:
-                pass
-            elif option in {'s', "scripts", "view scripts"}:
-                process_script_args(Path("scripts"))
+                num_scripts = list_scripts(enum=True)
+                if num_scripts == 0:
+                    print("Add scripts to scripts/ to stitch together a pipeline")
+                    continue
+
+                pipeline = input("Select scripts to sequence in pipeline: ") 
+                scripts = pipeline.split()
+                for s in scripts:
+                    try:
+                        s = int(s)
+                    except:
+                        print(f"Error: {s} is not a valid option")
+                        continue
+                    
+                    if s < 1 or s > num_scripts:
+                        print(f"Error: {s} is not a valid option")
+                        continue
+
+            elif option in {'v', "variables", "edit variables"}:
+                edit_variables()    
+            elif option in {'s', "scripts", "list scripts"}:
+                if list_scripts() == 0:
+                    print("No scripts in scripts/")
             elif option in {'a', "abort"}:
                 print("Aborted.")
                 break
             else:
                 print(f"Unrecognized option '{option}'")
         else:
-            option = input("[e]dit config | [v]iew config | view [s]cripts | [c]ommit changes | [a]bort without saving: ")
+            option = input("[e]dit config | [r]eview config | list [s]cripts | edit [v]ariables | [c]ommit changes | [a]bort without saving: ")
             option = option.lower()
             if option in {'e', "edit", "edit config"}:
                 print("Editing config.")
-            elif option in {'v', "view", "view config"}:
+            elif option in {'r', "review", "review config"}:
                 print(f"\n{config}\n")
-            elif option in {'s', "scripts", "view scripts"}:
-                process_script_args(Path("scripts"))
+            elif option in {'s', "scripts", "list scripts"}:
+                if list_scripts() == 0:
+                    print("No scripts in scripts/")
+            elif option in {'v', "variables", "edit variables"}:
+                edit_variables()
             elif option in {'c', "commit", "commit changes"}:
-                print("Saved config.")
+                try:
+                    with open(".runner.config", 'w') as f:
+                        f.write(config)
+                except Exception as e:
+                    print(e, file=sys.stderr)
+                    continue
+
+                print("Committed changes to .runner.config.")
                 break
             elif option in {'a', "abort", "abort without saving"}:
-                print("Quit without saving.")
+                print("Aborted without saving.")
                 break
             else:
                 print(f"Unrecognized option '{option}'")                   
