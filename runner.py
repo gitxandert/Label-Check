@@ -539,32 +539,77 @@ class VariableError(Exception):
         super().__init__(message)
 
 
-def validate_variable(ty: str, val: str, form: str | None = None):
+def validate_variable(ty: str, val: str, form: str | None = None) -> str:
     match ty:
         case 'int':
             try:
                 v = int(val)
             except:
-                raise VariableError(f"{val} is not a valid {ty}")
+                raise VariableError(f"{val} is not a valid {ty}.\n")
+            return val
         case 'float':
             try:
                 v = float(val)
             except:
-                raise VariableError(f"{val} is not a valid {ty}")
+                raise VariableError(f"{val} is not a valid {ty}.\n")
+            return val
         case 'tuple':
             if form is not None:
                 types = form.lstrip("(").rstrip(")").split(", ")
                 vals = val.lstrip("(").rstrip(")").split(", ")
                 for i, t in enumerate(types):
                     validate_variable(t, vals[i])
+                val = "("
+                for i, v in enumerate(vals):
+                    if i < len(vals) - 1:
+                        val += f"{v}, "
+                    else:
+                        val += f"{v})"
+                return val
+            else:
+                raise VariableError("tuple requires form.\n")
         case 'list':
             if form is not None:
                 t = form.lstrip("[").rstrip("]")
-                v = val.lstrip("[").rstrip("]")
-                validate_variable(t, v)
+                vals = val.lstrip("[").rstrip("]").split(", ")
+                for v in vals:
+                    validate_variable(t, v)
+                val = "["
+                for i, v in enumerate(vals):
+                    if i < len(vals) - 1:
+                        val += f"{v}, "
+                    else:
+                        val += f"{v}]"
+                return val
+            else:
+                raise VariableError("list requires form.\n")
         case _:
-            # check if begins and ends in quotes
-            pass
+            # format as str
+            return str(val)
+
+
+def validate_tuple_format(form: str) -> str:
+    types = form.strip().lstrip("(").rstrip(")").split(", ")
+    for t in types:
+        if t not in {"str", "path", "int", "float"}:
+            raise VariableError(f"{t} is not a valid type.\n")
+    # if valid, reformat tuple string
+    form = "("
+    for i, t in enumerate(types):
+        if i != len(types) - 1:
+            form += f"{t}, "
+        else:
+            form += f"{t})"
+    return form
+
+
+def validate_list_format(form: str) -> str:
+    t = form.strip().lstrip("[").rstrip("]")
+    if t not in {"str", "path", "int", "float"}:
+        raise VariableError("Error: {t} is not a valid type.\n")
+    # if valid, reformat list string
+    form = f"[{t}]"
+    return form
 
 
 def edit_variables():
@@ -583,66 +628,69 @@ def edit_variables():
     except Exception as e:
         print(e, file=sys.stderr)
         return
-
+    
+    print("")
     while True:
         if var == "":
-            print("No variables in .runner.var")
+            print("No variables in .runner.var.\n")
         else:
             print(var)
-        option = input("[a]dd variable | [e]dit variable | [d]elete variable | [c]ommit changes | [b]ack to config: ")
+        option = input("[a]dd variable | [e]dit variable | [d]elete variable | [c]ommit changes | [r]eturn to config: ")
         option = option.strip().lower()
         if option in {'a', "add", "add variable"}:
             name = input("Enter variable name: ")
             name = name.strip()
             if name == "":
-                print("Error: must enter valid name")
+                print("Error: must enter valid name.\n")
                 continue
+
+            lines = var.split('\n')
+            for line in lines:
+                line = line.split('=')[0]
+            if name in lines:
+                print(f"Error: '{name}' already exists.\n")
 
             ty = input("Enter variable type (str, path, int, float, tuple, list): ")
             ty = ty.strip()
             if ty not in {"str", "path", "int", "float", "tuple", "list"}:
-                print(f"Error: {ty} is not a valid variable type.")
+                print(f"Error: {ty} is not a valid variable type.\n")
                 continue
 
             form = None
             if ty == "tuple":
                 form = input(f"Enter tuple format (e.g. (str, int)): ")
-                types = form.strip().lstrip("(").rstrip(")").split(", ")
-                for t in types:
-                    if t not in {"str", "path", "int", "float"}:
-                        print(f"Error: {t} is not a valid type.")
-                        continue
-                # if valid, reformat tuple string
-                form = "("
-                for t in types:
-                    form += f"{t}, "
-                form += ")"
+                form = form.strip()
+                try:
+                    form = validate_tuple_format(form)
+                except VariableError as ve:
+                    print(f"Error: {ve}")
+                    continue
 
             if ty == "list":
                 form = input(f"Enter list format (e.g. [str]): ")
-                t = form.strip().lstrip("[").rstrip("]")
-                if t not in {"str", "path", "int", "float"}:
-                    print(f"Error: {t} is not a valid type")
+                form = form.strip()
+                try:
+                    form = validate_list_format(form)
+                except VariableError as ve:
+                    print(f"Error: {ve}")
                     continue
-                # if valid, reformat list string
-                form = f"[{t}]"
 
             val = input(f"Enter {ty} value: ")
             val = val.strip()
 
             try:
-                validate_variable(ty, val, form)
+                val = validate_variable(ty, val, form)
             except VariableError as ve:
                 print(f"Error: {ve}")
                 continue
 
             if form is not None:
                 ty += f": {form}"
-            var += f"%R{name}={val}\t{ty}\n"
-            print(f"Will add {name} to .runner.var.")
-        elif option in {'d', "delete", "delete variable"}:
+            var += f"{name}={val}\t{ty}\n"
+            print(f"Will add {name} to .runner.var.\n")
+        elif option in {'e', "edit", "edit variable"}:
             name = input("Enter variable name: ")
-            name = name.strip().lstrip("%R")
+            name = name.strip()
             lines = var.split('\n')
             variables = {}
             found = False
@@ -650,7 +698,6 @@ def edit_variables():
                 if line == "":
                     continue
                 v = ""
-                line = line.lstrip("%R")
                 for ch in line:
                     if ch != '=':
                         v += ch
@@ -660,7 +707,95 @@ def edit_variables():
                     found = True
                 variables[v] = line
             if not found:
-                print(f"Error: no variable named {name}")
+                print(f"Error: no variable named {name}.\n")
+                continue
+
+            confirm = input(f"Edit {name}? [y/N] ")
+            confirm = confirm.strip().lower()
+            if confirm in {'y', "yes"}:
+                val_and_type = variables[name].split('=')[1].split('\t')
+                new_name = name
+                new_val = val_and_type[0]
+                new_type = val_and_type[1]
+
+                edit_name = input(f"Edit {name}'s name? [y/N] ")
+                edit_name = edit_name.strip().lower()
+                if edit_name in {'y', "yes"}:
+                    n_n = input(f"Enter new name for {name}: ")
+                    n_n = n_n.strip()
+                    if n_n in variables.keys():
+                        print("Error: {n_n} already exists.\n")
+                        continue
+                    new_name = n_n
+
+                edit_type = input(f"Edit {name}'s type? [y/N] ")
+                edit_type = edit_type.strip().lower()
+                if edit_type in {'y', "yes"}:
+                    n_t = input(f"Enter new type for {name} (str, path, int, float, tuple, list): ")
+                    n_t = n_t.strip()
+                    if n_t not in {"str", "path", "int", "float", "tuple", "list"}:
+                        print(f"Error: {n_t} is not a valid type.\n")
+                        continue
+                    new_type = n_t
+
+                new_form = None
+                # new_type won't match against the following
+                # if ! edit_type because type is formatted as 
+                # e.g. "tuple: (int, int)" or "list: [str]"
+                if new_type in {"tuple", "list"}:
+                    n_f = input(f"Enter new form for {name} ({new_type}): ")
+                    n_f = n_f.strip()
+                    try:
+                        if new_type == "tuple":
+                            new_form = validate_tuple_format(n_f)
+                        else:
+                            new_form = validate_list_format(n_f)
+                    except VariableError as ve:
+                        print(f"Error: {ve}")
+                        continue
+                
+                edit_val = input(f"Edit value for {name}? [y/N] ")
+                edit_val = edit_val.strip()
+                if edit_val in {'y', "yes"}:
+                    n_v = input(f"Enter new value for {name}: ")
+                    new_val = n_v.strip()
+
+                try:
+                    val = validate_variable(new_type, new_val, new_form)
+                except VariableError as ve:
+                    print(f"Error: {ve}")
+                    continue
+
+                if new_form is not None:
+                    new_type += f": {new_form}"
+
+                var = ""
+                for v, line in variables.items():
+                    if v == name:
+                        var += f"{new_name}={new_val}\t{new_type}\n"
+                    else:
+                        var += f"{line}\n"
+                print(f"Will save '{name}' as '{new_name}'.\n")
+        elif option in {'d', "delete", "delete variable"}:
+            name = input("Enter variable name: ")
+            name = name.strip()
+            lines = var.split('\n')
+            variables = {}
+            found = False
+            for line in lines:
+                if line == "":
+                    continue
+                v = ""
+                for ch in line:
+                    if ch != '=':
+                        v += ch
+                    else:
+                        break
+                if v == name:
+                    found = True
+                variables[v] = line
+            if not found:
+                print(f"Error: no variable named '{name}'.\n")
                 continue
 
             confirm = input(f"Delete {name}? [y/N] ")
@@ -669,21 +804,21 @@ def edit_variables():
                 var = ""
                 for v, line in variables.items():
                     if v != name:
-                        var += line
-            print(f"Will delete {name} from .runner.var.")
-
+                        var += f"{line}\n"
+            print(f"Will delete {name} from .runner.var.\n")
         elif option in {'c', "commit", "commit changes"}:
             try:
                 with open(".runner.var", 'w') as f:
                     f.write(var)
             except Exception as e:
                 print(e, file=sys.stderr)
+            print("Committed changes to .runner.var.\n")
             break
-        elif option in {'b', "back", "back to config"}:
-            print("Returning to config without saving...")
+        elif option in {'r', "return", "return without saving"}:
+            print("Returning to config without saving...\n")
             break
         else:
-            print(f"Unrecognized option {option}")
+            print(f"Unrecognized option '{option}'.\n")
 
 
 def edit_config():
@@ -691,7 +826,7 @@ def edit_config():
         with open(".runner.config", 'r') as f:
             config = f.read()
     except FileNotFoundError:
-        print("No .runner.config in this directory.")
+        print("No .runner.config in this directory.\n")
         create = input("Create a new .runner.config? [y/N] ")
         match create.lower():
             case 'y' | "yes":
@@ -705,12 +840,12 @@ def edit_config():
 
     while True:
         if config == "":
-            option = input("[n]ew config | list [s]cripts | edit [v]ariables | [a]bort: ")
+            option = input("[n]ew config | list [s]cripts | edit [v]ariables | [q]uit: ")
             option = option.strip().lower()
             if option in {'n', "new", "new config"}:
                 num_scripts = list_scripts(enum=True)
                 if num_scripts == 0:
-                    print("Add scripts to scripts/ to stitch together a pipeline")
+                    print("Add scripts to scripts/ to stitch together a pipeline.\n")
                     continue
 
                 pipeline = input("Select scripts to sequence in pipeline: ") 
@@ -719,33 +854,33 @@ def edit_config():
                     try:
                         s = int(s)
                     except:
-                        print(f"Error: {s} is not a valid option")
+                        print(f"Error: {s} is not a valid option.\n")
                         continue
                     
                     if s < 1 or s > num_scripts:
-                        print(f"Error: {s} is not a valid option")
+                        print(f"Error: {s} is not a valid option.\n")
                         continue
 
             elif option in {'v', "variables", "edit variables"}:
                 edit_variables()    
             elif option in {'s', "scripts", "list scripts"}:
                 if list_scripts() == 0:
-                    print("No scripts in scripts/")
-            elif option in {'a', "abort"}:
-                print("Aborted.")
+                    print("No scripts in scripts/.\n")
+            elif option in {'q', "quit", "quit without saving"}:
+                print("Quit --config.")
                 break
             else:
-                print(f"Unrecognized option '{option}'")
+                print(f"Unrecognized option '{option}'.\n")
         else:
-            option = input("[e]dit config | [r]eview config | list [s]cripts | edit [v]ariables | [c]ommit changes | [a]bort without saving: ")
+            option = input("[e]dit config | [r]eview config | list [s]cripts | edit [v]ariables | [c]ommit changes | [q]uit: ")
             option = option.lower()
             if option in {'e', "edit", "edit config"}:
-                print("Editing config.")
+                print("Editing config.\n")
             elif option in {'r', "review", "review config"}:
                 print(f"\n{config}\n")
             elif option in {'s', "scripts", "list scripts"}:
                 if list_scripts() == 0:
-                    print("No scripts in scripts/")
+                    print("No scripts in scripts/.\n")
             elif option in {'v', "variables", "edit variables"}:
                 edit_variables()
             elif option in {'c', "commit", "commit changes"}:
@@ -756,14 +891,13 @@ def edit_config():
                     print(e, file=sys.stderr)
                     continue
 
-                print("Committed changes to .runner.config.")
+                print("Committed changes to .runner.config.\n")
                 break
-            elif option in {'a', "abort", "abort without saving"}:
-                print("Aborted without saving.")
+            elif option in {'q', "quit"}:
+                print("Quit --config.")
                 break
             else:
-                print(f"Unrecognized option '{option}'")                   
-
+                print(f"Unrecognized option '{option}'.\n")                   
     sys.exit(0)
 
 
