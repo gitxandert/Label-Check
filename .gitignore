@@ -234,3 +234,6 @@ tests/
 # runner.py stuff
 .runner.config
 .runner.var
+
+# test stuff
+dummies/
