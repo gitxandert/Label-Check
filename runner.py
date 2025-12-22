@@ -32,7 +32,6 @@ To see logs recorded from the last x runs, the user runs the program with '--log
 
 import os, sys
 import ast
-import json
 import argparse
 from pathlib import Path
 from typing import Optional, Any
@@ -480,7 +479,7 @@ def create_new_args(s: Path, args: list[str] = None):
 
 
 # edit class Args for a script
-def edit_args(s: Path):
+def edit_class_args(s: Path):
     pass
 
 
@@ -522,7 +521,7 @@ def parse_script_args(s: Path) -> ScriptArgs:
         print(f"Error: {ase}")
         fix = input(f"Fix args for {s}? [y/N] ")
         if fix:
-            edit_args(s)
+            edit_class_args(s)
         else:
             raise ParseArgsException(
                     f"Cannot add {s} to pipeline without correctly-configured class Args.\n"
@@ -558,13 +557,15 @@ def parse_script_args(s: Path) -> ScriptArgs:
 """
 
 
-def list_scripts(enum: bool = False) -> list[str]:
+# prints list of script names and returns list of script paths
+# optionally enumerates scripts (so that they can be selected)
+def list_scripts(enum: bool = False) -> list[Path]:
     scripts = []
     count = 0
     for p in Path("scripts").iterdir():
         # ignore Vim stuff
         if not p.name.endswith('~') and not p.name.endswith('.swp'):
-            scripts.append(p.name)
+            scripts.append(p)
             count += 1
             if enum:
                 print(f"{count}) {p.name}")
@@ -914,24 +915,25 @@ def edit_config():
                 pipeline = input("Select scripts to sequence in pipeline: ") 
                 script_nums = pipeline.split()
                 scripts = []
-                for s in script_nums:
+                for idx in script_nums:
                     try:
-                        s = int(s)
+                        idx = int(idx)
                     except:
-                        print(f"Error: {s} is not a valid option.\n")
+                        print(f"Error: {idx} is not a valid option.\n")
                         continue
                     
-                    if s < 1 or s > num_scripts:
-                        print(f"Error: {s} is not a valid option.\n")
+                    if idx < 1 or idx > num_scripts:
+                        print(f"Error: {idx} is not a valid option.\n")
                         continue
                     
-                    scr = listed[s - 1] # list starts at 1
+                    scr = listed[idx - 1] # list starts at 1
                     if scr in scripts:
-                        print(f"Error: {scr} already selected")
+                        print(f"Error: {scr} already selected.\n")
                         continue
                     else:
                         scripts.append(scr)
 
+                script_args = {}
                 for s in scripts:
                     try:
                         args = parse_script_args(s)
@@ -940,10 +942,12 @@ def edit_config():
                         # but class Args was configured after the first pass
                         args = parse_script_args(s)
                     except ParseArgsException as ce:
-                        # raised if the user refuses to config class Args correctly
+                        # raised if the user declines to config class Args correctly
                         print(ce)
                         scripts.remove(s)
+                        continue
                     
+                    script_args[s] = args
 
             elif option in {'v', "variables", "edit variables"}:
                 edit_variables()    
