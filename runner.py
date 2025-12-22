@@ -38,20 +38,7 @@ from pathlib import Path
 from typing import Optional, Any
 from dataclasses import dataclass
 
-# loads arguments from .runner.config
-class Config:
-    def __init__(self):
-        try:
-            with open('.runner.config', 'r', encoding='utf-8') as f:
-                self.args = self.get_args(f)
-        except FileNotFoundError:
-            print(f"Error: No .runner.config found in the current directory", file=sys.stderr)
-            print("You can create a new .runner.config by running this script with the '--config' flag")
-            sys.exit(1)
-        except Exception as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
-
+#---------------- ARGS PARSING ----------------#
 
 # ArgSpec: dataclass to store details for singular argument
 # Args can be of the following types:
@@ -104,6 +91,18 @@ class ArgsSyntaxError(Exception):
 
 # signals that there is no class Args in the script
 class MissingArgsError(Exception):
+    def __init__(self):
+        super().__init__()
+
+
+# throws when the user declines to fix or init class Args
+class ParseArgsException(Exception):
+    def __init__(self, message: str):
+        super().__init__(message)
+
+
+# retry an operation (usually after some required configuring)
+class RetryException(Exception):
     def __init__(self):
         super().__init__()
 
@@ -393,7 +392,7 @@ def parse_arg_spec(name: str, value: ast.Call, path: Path) -> ArgSpec:
     form = specs.get('form', form)
     if kind.attr in {'tuple', 'list'}:
         if form is None:
-            raise ArgsSyntaxErrr(
+            raise ArgsSyntaxError(
                     f"{kind.attr} requires a form argument",
                     path=script_path,
                     lineno=value.lineno,
@@ -442,11 +441,8 @@ def parse_node(class_node: ast.ClassDef, script_path: Path) -> ScriptArgs:
 
         name = stmt.targets[0].id
 
-        try:
-            spec = parse_arg_spec(name, value, script_path)
-        except Exception as e:
-            print(e, file=sys.stderr)
-            continue
+        # propagates ArgsSyntaxError up to parse_script_args
+        spec = parse_arg_spec(name, value, script_path)
 
         specs[name] = spec
     
@@ -471,27 +467,69 @@ def parse_node(class_node: ast.ClassDef, script_path: Path) -> ScriptArgs:
             required=required,
             optional=optional,
         )
-    
 
-def parse_script_args(scripts_dir: Path):
-    scripts = {}
-    for script in scripts_dir.glob("*.py"):
-        try:
-            node = extract_args_node(script)
-        except MissingArgsError:
-            print(script)
-        except Exception as e:
-            print(f"Error: {e}", file=sys.stderr)
-            continue
 
-        try:
-            args = parse_node(node, script)
-        except Exception as e:
-            print(e, file=sys.stderr)
-            continue
+# consider returning ArgSpecs/ScriptArgs
+def search_for_args(s: Path) -> list[str]:
+    pass
 
-        scripts[script.name] = args
 
+# optionally configures list of args found in search_for_args
+def create_new_args(s: Path, args: list[str] = None):
+    pass
+
+
+# edit class Args for a script
+def edit_args(s: Path):
+    pass
+
+
+def parse_script_args(s: Path) -> ScriptArgs:
+    try:
+        node = extract_args_node(s)
+    except MissingArgsError:
+        print(f"{s} doesn't have a class Args.")
+        create = input(f"Create class Args for {s}? [y/N] ")
+        create = create.strip().lower()
+        if create:
+            potential_args = search_for_args(s)
+            if potential_args = "":
+                print(f"Couldn't find any potential args for {s} globally or in a 'main'.")
+                do_it = input(f"Create class Args for {s} anyway? [y/N] ")
+            else:
+                print(f"Found the following potential args for {s}:")
+                for pa in potential_args:
+                    print(f"\t{pa}")
+                do_it = input(f"Create class Args for {s} out of the above? [y/N] ")
+            do_it = do_it.strip().lower()
+            if do_it:
+                create_new_args(s, potential_args)
+                # signal to retry this function 
+                # with newly-configured class Args
+                raise RetryException()
+            else:
+                raise ParseArgsException(
+                        f"Cannot add {s} to pipeline without class Args.\n"
+                    )
+        else:
+            raise ParseArgsException(
+                    f"Cannot add {s} to pipeline without class Args.\n"
+                )
+
+    try:
+        args = parse_node(node, s)
+    except ArgsSyntaxError as ase:
+        print(f"Error: {ase}")
+        fix = input(f"Fix args for {s}? [y/N] ")
+        if fix:
+            edit_args(s)
+        else:
+            raise ParseArgsException(
+                    f"Cannot add {s} to pipeline without correctly-configured class Args.\n"
+                )
+   
+   return args
+"""
     for sc, ar in scripts.items():
         print(sc)
         if ar.desc is not None:
@@ -517,20 +555,27 @@ def parse_script_args(scripts_dir: Path):
                     print(f"\t\t\tform -- {args.form}")
                 if args.default is not None:
                     print(f"\t\t\tdefault -- {args.default}")
+"""
 
 
-def list_scripts(enum: bool = False) -> int:
+def list_scripts(enum: bool = False) -> list[str]:
+    scripts = []
     count = 0
     for p in Path("scripts").iterdir():
         # ignore Vim stuff
         if not p.name.endswith('~') and not p.name.endswith('.swp'):
+            scripts.append(p.name)
             count += 1
             if enum:
                 print(f"{count}) {p.name}")
             else:
                 print(p.name)
+    print("")
 
-    return count
+    return scripts
+
+
+#---------------- VARIABLES ----------------#
 
 
 # catch errors with variable creation
@@ -821,6 +866,24 @@ def edit_variables():
             print(f"Unrecognized option '{option}'.\n")
 
 
+#---------------- CONFIG ----------------#
+
+
+# loads arguments from .runner.config
+class Config:
+    def __init__(self):
+        try:
+            with open('.runner.config', 'r', encoding='utf-8') as f:
+                self.args = self.get_args(f)
+        except FileNotFoundError:
+            print(f"Error: No .runner.config found in the current directory", file=sys.stderr)
+            print("You can create a new .runner.config by running this script with the '--config' flag")
+            sys.exit(1)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+
 def edit_config():
     try:
         with open(".runner.config", 'r') as f:
@@ -843,14 +906,15 @@ def edit_config():
             option = input("[n]ew config | list [s]cripts | edit [v]ariables | [q]uit: ")
             option = option.strip().lower()
             if option in {'n', "new", "new config"}:
-                num_scripts = list_scripts(enum=True)
-                if num_scripts == 0:
+                listed = list_scripts(enum=True)
+                if len(listed) == 0:
                     print("Add scripts to scripts/ to stitch together a pipeline.\n")
                     continue
 
                 pipeline = input("Select scripts to sequence in pipeline: ") 
-                scripts = pipeline.split()
-                for s in scripts:
+                script_nums = pipeline.split()
+                scripts = []
+                for s in script_nums:
                     try:
                         s = int(s)
                     except:
@@ -860,13 +924,33 @@ def edit_config():
                     if s < 1 or s > num_scripts:
                         print(f"Error: {s} is not a valid option.\n")
                         continue
+                    
+                    scr = listed[s - 1] # list starts at 1
+                    if scr in scripts:
+                        print(f"Error: {scr} already selected")
+                        continue
+                    else:
+                        scripts.append(scr)
+
+                for s in scripts:
+                    try:
+                        args = parse_script_args(s)
+                    except RetryException as re:
+                        # raised if the current script had no class Args,
+                        # but class Args was configured after the first pass
+                        args = parse_script_args(s)
+                    except ParseArgsException as ce:
+                        # raised if the user refuses to config class Args correctly
+                        print(ce)
+                        scripts.remove(s)
+                    
 
             elif option in {'v', "variables", "edit variables"}:
                 edit_variables()    
             elif option in {'s', "scripts", "list scripts"}:
-                if list_scripts() == 0:
+                if len(list_scripts()) == 0:
                     print("No scripts in scripts/.\n")
-            elif option in {'q', "quit", "quit without saving"}:
+            elif option in {'q', "quit"}:
                 print("Quit --config.")
                 break
             else:
@@ -879,7 +963,7 @@ def edit_config():
             elif option in {'r', "review", "review config"}:
                 print(f"\n{config}\n")
             elif option in {'s', "scripts", "list scripts"}:
-                if list_scripts() == 0:
+                if len(list_scripts()) == 0:
                     print("No scripts in scripts/.\n")
             elif option in {'v', "variables", "edit variables"}:
                 edit_variables()
