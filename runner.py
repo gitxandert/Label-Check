@@ -492,7 +492,7 @@ def parse_script_args(s: Path) -> ScriptArgs:
         create = create.strip().lower()
         if create:
             potential_args = search_for_args(s)
-            if potential_args = "":
+            if potential_args == "":
                 print(f"Couldn't find any potential args for {s} globally or in a 'main'.")
                 do_it = input(f"Create class Args for {s} anyway? [y/N] ")
             else:
@@ -527,7 +527,7 @@ def parse_script_args(s: Path) -> ScriptArgs:
                     f"Cannot add {s} to pipeline without correctly-configured class Args.\n"
                 )
    
-   return args
+    return args
 """
     for sc, ar in scripts.items():
         print(sc)
@@ -563,14 +563,16 @@ def list_scripts(enum: bool = False) -> list[Path]:
     scripts = []
     count = 0
     for p in Path("scripts").iterdir():
-        # ignore Vim stuff
-        if not p.name.endswith('~') and not p.name.endswith('.swp'):
-            scripts.append(p)
-            count += 1
-            if enum:
-                print(f"{count}) {p.name}")
-            else:
-                print(p.name)
+        # only register Python scripts (may extend to .sh later)
+        if not p.name.endswith('.py'):
+            continue
+
+        scripts.append(p)
+        count += 1
+        if enum:
+            print(f"{count}) {p.name}")
+        else:
+            print(p.name)
     print("")
 
     return scripts
