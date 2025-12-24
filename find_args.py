@@ -21,9 +21,98 @@ from pathlib import Path
 from typing import Optional, Any
 from runner import ArgSpec, ScriptArgs
 
-def parse_assign(stmt: ast.Assign):
-    print(ast.dump(stmt, indent=4))
 
+class ParseArgsError(Exception):
+    def __init__(self, message: str, path: Path, lineno: int = None, offset: int = None):
+        errstring = path.name
+        if lineno is not None:
+            errstring += f":{lineno}"
+            if offset is not None:
+                errstring += f":{offset}"
+        errstring += f": {message}"
+        super().__init__(errstring)
+
+
+def derive_kind_and_form(path: Path, names: list[str], values = list[Any]) -> (str, Any):
+    return "unknown", None
+
+
+def parse_assign(path: Path, stmt: ast.Assign):
+    names = []
+    if isinstance(stmt.targets[0], ast.Name):
+        names.append(stmt.targets[0].id)
+    elif isinstance(stmt.targets[0], ast.Tuple):
+        elts = stmt.targets[0].elts
+        for n in elts:
+            if isinstance(n, ast.Name):
+                names.append(n.id)
+            else:
+                raise ParseArgsError(
+                        "Unrecognized lvalue",
+                        path=path,
+                        lineno=stmt.lineno,
+                        offset=stmt.col_offset
+                    )
+    else:
+        print(ast.dump(stmt.targets[0], indent=4))
+
+    st_val = stmt.value
+    if isinstance(st_val, ast.Constant):
+        value = st_val.value
+    elif isinstance(st_val, ast.Tuple):
+        vals = []
+        for v in st_val.elts:
+            if isinstance(v, ast.Constant):
+                vals.append(v.value)
+            else:
+                raise ParseArgsError(
+                        "All rvalues must be constant",
+                        path=path,
+                        lineno=st_val.lineno,
+                        offset=st_val.col_offset,
+                    )
+        value = tuple(vals)
+    elif isinstance(st_val, ast.List):
+        value = []
+        for v in st_val.elts:
+            if isinstance(v, ast.Constant):
+                value.append(v.value)
+            else:
+                raise ParseArgsError(
+                        "All rvalues must be constant",
+                        path=path,
+                        lineno=st_val.lineno,
+                        offset=st_val.col_offset,
+                    )
+    else:
+        raise ParseArgsError(
+                "Unrecognized rvalue",
+                path=path,
+                lineno=st_val.lineno,
+                offset=st_val.col_offset
+            )
+
+    kind, form = derive_kind_and_form(path, names, value)
+
+    specs = []
+    print(f"\n{path.name} Arg:")
+    for name in names:
+        sp = ArgSpec(
+                name=name,
+                kind=kind,
+                required=False,
+                form=form,
+                default=value,
+                desc=None,
+            )
+
+        print(f"\tname={sp.name}")
+        print(f"\tkind={sp.kind}")
+        print(f"\tform={sp.form}")
+        print(f"\tdefault={sp.default}\n")
+        specs.append(sp)
+
+    # return specs
 
 def parse_argparse_arg(stmt: ast.Call):
     print(ast.dump(stmt, indent=4))
@@ -33,8 +122,11 @@ if __name__ == "__main__":
     scripts = {}
     for script in Path("dummies").iterdir():
         # only parse Python scripts (might extend to .sh later)
-        if not script.name.endswith('.py'):
+        if script.suffix != ".py":
+            print(f"Unrecognized file extension for {script.name}")
             continue
+
+        print("SHOULD ONLY FOLLOW '.py' FILES")
         tree = ast.parse(script.read_text())
 
         # collect three separate groups of args/variables:
@@ -112,11 +204,19 @@ if __name__ == "__main__":
         if g_opt > 0:
             if convert_g in {'y', 'yes'}:
                 for arg in args['g_var']:
-                    parse_assign(arg)
+                    try:
+                        parse_assign(s, arg)
+                    except ParseArgsError as pae:
+                        print(pae)
+                        continue
         if m_opt > 0:
             if convert_m in {'y', 'yes'}:
                 for arg in args['m_var']:
-                    parse_assign(arg)
+                    try:
+                        parse_assign(s, arg)
+                    except ParseArgsError as pae:
+                        print(pae)
+                        continue
         # annotate script with class Args
         # and optionally import argparse, 
         # add new arguments to parser,
