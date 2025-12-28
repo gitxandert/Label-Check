@@ -62,7 +62,9 @@ def parse_assign(path: Path, stmt: ast.Assign):
     st_val = stmt.value
     if isinstance(st_val, ast.Constant):
         value = st_val.value
-        if isinstance(value, int):
+        if isinstance(value, bool):
+            kind = "bool"
+        elif isinstance(value, int):
             kind = "int"
         elif isinstance(value, float):
             kind = "float"
