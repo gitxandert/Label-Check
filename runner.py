@@ -44,6 +44,7 @@ from dataclasses import dataclass
 # - str
 # - path
 # - int
+# - bool
 # - float
 # - tuple
 # - list
@@ -134,6 +135,14 @@ def validate_default(path: Path, stmt: ast.Call, ty: str, default: Any, form: An
                         lineno=stmt.lineno,
                         offset=stmt.col_offset,
                     )
+        case 'bool':
+            if not isinstance(default, bool):
+                raise ArgsSyntaxError(
+                        f"{default} is not a bool",
+                        path=path,
+                        lineno=stmt.lineno,
+                        offset=stmt.col_offset,
+                    )
         case 'tuple':
             for i, ty in enumerate(form):
                 validate_default(path, stmt, ty, default[i])
@@ -178,7 +187,7 @@ def parse_tuple(arg: str, kw: ast.keyword, path: Path) -> tuple:
                 values = []
                 for e in elts:
                     if isinstance(e, ast.Name):
-                        if e.id in {'str', 'int', 'float', 'Path'}:
+                        if e.id in {'str', 'int', 'float', 'bool', 'path'}:
                             values.append(e.id)
                         else:
                             raise ArgsSyntaxError(
@@ -246,7 +255,7 @@ def parse_list(arg: str, kw: ast.keyword, path: Path) -> list:
                 
                 e = elts[0]
                 if isinstance(e, ast.Name):
-                    if e.id in {'str', 'int', 'float', 'Path'}:
+                    if e.id in {'str', 'int', 'float', 'bool', 'path'}:
                         return  '[' + e.id + ']'
                     else:
                         raise ArgsSyntaxError(
@@ -309,7 +318,7 @@ def parse_arg_spec(name: str, value: ast.Call, path: Path) -> ArgSpec:
                     )
             
             desc = arg.value
-        case 'str' | 'int' | 'float' | 'path' | 'tuple' | 'list':
+        case 'str' | 'int' | 'float' | 'bool' | 'path' | 'tuple' | 'list':
             if not value.keywords:
                 raise ArgsSyntaxError(
                         f"Arg.{kind.attr}() requires keywords",
@@ -341,7 +350,7 @@ def parse_arg_spec(name: str, value: ast.Call, path: Path) -> ArgSpec:
                     )
 
         match kind.attr:
-            case 'str' | 'int' | 'float' | 'path':
+            case 'str' | 'int' | 'float' | 'path' | 'bool':
                 if isinstance(kw.value, ast.Constant):
                     val = kw.value.value
                 else:
@@ -351,9 +360,6 @@ def parse_arg_spec(name: str, value: ast.Call, path: Path) -> ArgSpec:
                         lineno=kw.value.lineno,
                         offset=kw.value.col_offset,
                     )
-
-                # validate_val(val, arg, kind.attr, path)
-
                 specs[arg] = val
             case 'tuple':
                 match arg:
@@ -369,8 +375,6 @@ def parse_arg_spec(name: str, value: ast.Call, path: Path) -> ArgSpec:
                                 lineno=kw.value.lineno,
                                 offset=kw.value.col_offset,
                             )
-
-
                 specs[arg] = val
             case 'list':
                 match arg:
@@ -601,6 +605,10 @@ def validate_variable(ty: str, val: str, form: str | None = None) -> str:
             except:
                 raise VariableError(f"{val} is not a valid {ty}.\n")
             return val
+        case 'bool':
+            if val not in {'True', 'False'}:
+                raise VariableError(f"{val} is not a valid {ty}.\n")
+            return val
         case 'tuple':
             if form is not None:
                 types = form.lstrip("(").rstrip(")").split(", ")
@@ -698,9 +706,9 @@ def edit_variables():
             if name in lines:
                 print(f"Error: '{name}' already exists.\n")
 
-            ty = input("Enter variable type (str, path, int, float, tuple, list): ")
+            ty = input("Enter variable type (str, path, int, float, bool, tuple, list): ")
             ty = ty.strip()
-            if ty not in {"str", "path", "int", "float", "tuple", "list"}:
+            if ty not in {"str", "path", "int", "float", "bool", "tuple", "list"}:
                 print(f"Error: {ty} is not a valid variable type.\n")
                 continue
 
