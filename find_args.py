@@ -33,10 +33,6 @@ class ParseArgsError(Exception):
         super().__init__(errstring)
 
 
-def derive_kind_and_form(path: Path, names: list[str], values = list[Any]) -> (str, Any):
-    return "unknown", None
-
-
 def parse_assign(path: Path, stmt: ast.Assign):
     names = []
     if isinstance(stmt.targets[0], ast.Name):
@@ -55,15 +51,44 @@ def parse_assign(path: Path, stmt: ast.Assign):
                     )
     else:
         print(ast.dump(stmt.targets[0], indent=4))
+        raise ParseArgsError(
+                    "Unrecognized lvalue",
+                    path=path,
+                    lineno=stmt.lineno,
+                    offset=stmt.col_offset
+                )
 
+    form = None
     st_val = stmt.value
     if isinstance(st_val, ast.Constant):
         value = st_val.value
+        if isinstance(value, int):
+            kind = "int"
+        elif isinstance(value, float):
+            kind = "float"
+        elif isinstance(value, str):
+            if '/' in value or '\\' in value:
+                kind = "path"
+            else:
+                kind = "str"
+        else:
+            raise ParseArgsError(
+                    f"Couldn't identify type of {value}",
+                    path=path,
+                    lineno=st_val.lineno,
+                    offset=st_val.col_offset,
+                )
     elif isinstance(st_val, ast.Tuple):
         vals = []
+        form = "("
+        end = st_val.elts[len(st_val.elts) - 1]
         for v in st_val.elts:
             if isinstance(v, ast.Constant):
                 vals.append(v.value)
+                if v == end:
+                    form += f"{type(v.value).__name__})"
+                else:
+                    form += f"{type(v.value).__name__}, "
             else:
                 raise ParseArgsError(
                         "All rvalues must be constant",
@@ -72,11 +97,21 @@ def parse_assign(path: Path, stmt: ast.Assign):
                         offset=st_val.col_offset,
                     )
         value = tuple(vals)
+        kind = "list"
     elif isinstance(st_val, ast.List):
         value = []
+        form = type(st_val.elts[0].value)
         for v in st_val.elts:
             if isinstance(v, ast.Constant):
-                value.append(v.value)
+                if type(v.value) == form:
+                    value.append(v.value)
+                else:
+                    raise ParseArgsError(
+                            "list values must be of same type",
+                            path=path,
+                            lineno=st_val.lineno,
+                            offset=st_val.col_offset,
+                        )
             else:
                 raise ParseArgsError(
                         "All rvalues must be constant",
@@ -84,6 +119,8 @@ def parse_assign(path: Path, stmt: ast.Assign):
                         lineno=st_val.lineno,
                         offset=st_val.col_offset,
                     )
+        kind = "list"
+        form = f"[{form.__name__}]"
     else:
         raise ParseArgsError(
                 "Unrecognized rvalue",
@@ -92,15 +129,13 @@ def parse_assign(path: Path, stmt: ast.Assign):
                 offset=st_val.col_offset
             )
 
-    kind, form = derive_kind_and_form(path, names, value)
-
     specs = []
     print(f"\n{path.name} Arg:")
     for name in names:
         sp = ArgSpec(
                 name=name,
                 kind=kind,
-                required=False,
+                required=True, # default True, since hardcoded
                 form=form,
                 default=value,
                 desc=None,
@@ -123,10 +158,8 @@ if __name__ == "__main__":
     for script in Path("dummies").iterdir():
         # only parse Python scripts (might extend to .sh later)
         if script.suffix != ".py":
-            print(f"Unrecognized file extension for {script.name}")
             continue
 
-        print("SHOULD ONLY FOLLOW '.py' FILES")
         tree = ast.parse(script.read_text())
 
         # collect three separate groups of args/variables:
