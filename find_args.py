@@ -149,8 +149,22 @@ def parse_assign(path: Path, stmt: ast.Assign):
 
     # return specs
 
-def parse_argparse_arg(stmt: ast.Call):
+def parse_argparse_arg(path: Path, stmt: ast.Call):
     print(ast.dump(stmt, indent=4))
+    name = stmt.args[0]
+    if isinstance(name, ast.Constant):
+        i = 0
+        while name.value[i] == '-':
+            i += 1
+        name = name.value[i:]
+    else:
+        raise ParseArgsError(
+                "rvalues must be constants",
+                path=path,
+                lineno=stmt.args.lineno,
+                offset=stmt.args.col_offset,
+            )
+    # gotta parse bools
 
 
 if __name__ == "__main__":
