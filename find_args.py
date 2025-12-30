@@ -153,12 +153,12 @@ def parse_assign(path: Path, stmt: ast.Assign):
 
 def parse_argparse_arg(path: Path, stmt: ast.Call):
     print(ast.dump(stmt, indent=4))
+    # just use the first name
     name = stmt.args[0]
     if isinstance(name, ast.Constant):
-        i = 0
-        while name.value[i] == '-':
-            i += 1
-        name = name.value[i:]
+        # get rid of dashes
+        while name[0] == '-':
+            name = name.lstrip('-')
     else:
         raise ParseArgsError(
                 "rvalues must be constants",
@@ -166,7 +166,90 @@ def parse_argparse_arg(path: Path, stmt: ast.Call):
                 lineno=stmt.args.lineno,
                 offset=stmt.args.col_offset,
             )
-    # gotta parse bools
+
+    kind = None
+    required = False
+    form = None
+    default = None
+    desc = None
+    store_const = False
+
+    for kw in stmt.keywords:
+        match kw.arg:
+            case 'type':
+                kind = kw.value.id
+                break
+            case 'required':
+                required = kw.value.value
+                break
+            case 'help':
+                if not isinstance(kw.value, ast.JoinedStr):
+                    desc = kw.value.value
+                break
+            case 'action':
+                if isinstance(kw.value, ast.Constant):
+                    match kw.value.value:
+                        case 'store_true':
+                            kind = 'bool'
+                            default = 'True'
+                            break
+                        case 'store_false':
+                            kind = 'bool'
+                            default = 'False'
+                            break
+                        case 'store':
+                            # default behavior
+                            break
+                        case 'store_const':
+                            # should be accompanied with
+                            # const argument
+                            store_const = True
+                            break
+                        case _:
+                            raise ParseArgsError(
+                                    "Complicated or incorrectly formed argument",
+                                    path=path,
+                                    lineno=kw.lineno,
+                                    offset=kw.col_offset,
+                                )
+                break
+            case 'nargs':
+                # if nargs is a constant, then format is a tuple,
+                # and metavar argument must be provided
+                break
+            case 'const':
+                default = kw.value.value
+                break
+            case 'choices':
+                break
+            case 'default':
+                break
+            case _:
+                break
+    
+    # ensure type argument was provided
+    if kind = None:
+        raise ParseArgsError(
+                "type argument is required",
+                path=path,
+                lineno=stmt.keywords.lineno,
+                offset=stmt.keywords.col_offset,
+            )
+
+    sp = ArgSpec(
+            name=name,
+            kind=kind,
+            required=required,
+            form=form,
+            default=value,
+            desc=desc,
+        )
+
+    print(f"\tname={sp.name}")
+    print(f"\tkind={sp.kind}")
+    print(f"\tform={sp.form}")
+    print(f"\tdefault={sp.default}\n")
+
 
 
 if __name__ == "__main__":
@@ -249,7 +332,7 @@ if __name__ == "__main__":
         if auto + g_opt + m_opt == 0:
             print("No arguments, global variables, or hardcoded variables in main were found.")
         for arg in args['ap_args']:
-            parse_argparse_arg(arg)
+            parse_argparse_arg(s, arg)
         if g_opt > 0:
             if convert_g in {'y', 'yes'}:
                 for arg in args['g_var']:
