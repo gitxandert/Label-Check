@@ -151,17 +151,16 @@ def parse_assign(path: Path, stmt: ast.Assign):
 
     # return specs
 
+
 def parse_argparse_arg(path: Path, stmt: ast.Call):
     print(ast.dump(stmt, indent=4))
+    return
     # just use the first name
-    name = stmt.args[0]
-    if isinstance(name, ast.Constant):
-        # get rid of dashes
-        while name[0] == '-':
-            name = name.lstrip('-')
+    if isinstance(stmt.args[0], ast.Constant):
+        name = stmt.args[0].value
     else:
         raise ParseArgsError(
-                "rvalues must be constants",
+                "Variable names must be constants",
                 path=path,
                 lineno=stmt.args.lineno,
                 offset=stmt.args.col_offset,
@@ -172,22 +171,70 @@ def parse_argparse_arg(path: Path, stmt: ast.Call):
     form = None
     default = None
     desc = None
+    # store_const means that a default const variable is
+    # stored via argparse.add_argument()
+    # (some alt to 'default' that I don't get the point of)
     store_const = False
+    const = None
+    # nargs can be set to a constant or special char;
+    # if it is not none, the argument to 'kind' becomes the
+    # argument to 'form', and 'kind' becomes either 'tuple'
+    # or 'list' (depending on whether nargs is a constant)
+    nargs = None
 
     for kw in stmt.keywords:
         match kw.arg:
             case 'type':
-                kind = kw.value.id
-                break
+                if isinstance(kw.value.id, ast.Constant):
+                    kind = kw.value.id
+                    break
+                else:
+                    raise ParseArgsError(
+                            f"Invalid type '{kw.value.id}'",
+                            path=path,
+                            lineno=kw.lineno,
+                            offset=kw.col_offset,
+                        )
             case 'required':
-                required = kw.value.value
-                break
+                if kw.value.value == True \
+                        or kw.value.value == False:
+                    required = kw.value.value
+                    break
+                else:
+                    raise ParseArgsError(
+                            f"required argument must be either 'True' or 'False'",
+                            path=path,
+                            lineno=kw.lineno,
+                            offset=kw.col_offset,
+                        )
             case 'help':
                 if not isinstance(kw.value, ast.JoinedStr):
-                    desc = kw.value.value
-                break
+                    if isinstance(kw.value.value, ast.Constant):
+                        desc = kw.value.value
+                        break
+                    else:
+                        raise ParseArgsError(
+                                "help argument must be a str constant",
+                                path=path,
+                                lineno=kw.lineno,
+                                offset=kw.col_offset,
+                            )
+                else:
+                    raise ParseArgsError(
+                            "Cannot parse formatted strings",
+                            path=path,
+                            lineno=kw.lineno,
+                            offset=kw.col_offset,
+                        )
             case 'action':
-                if isinstance(kw.value, ast.Constant):
+                if not isinstance(kw.value, ast.Constant):
+                    raise ParseArgsError(
+                            "action argument requires a constant value",
+                            path=path,
+                            lineno=kw.lineno,
+                            offset=kw.col_offset,
+                        )
+                else:
                     match kw.value.value:
                         case 'store_true':
                             kind = 'bool'
@@ -206,35 +253,176 @@ def parse_argparse_arg(path: Path, stmt: ast.Call):
                             store_const = True
                             break
                         case _:
+                            # don't bother parsing
                             raise ParseArgsError(
-                                    "Complicated or incorrectly formed argument",
+                                    "Possibly complicated or incorrectly formed argument",
                                     path=path,
                                     lineno=kw.lineno,
                                     offset=kw.col_offset,
                                 )
-                break
             case 'nargs':
-                # if nargs is a constant, then format is a tuple,
-                # and metavar argument must be provided
-                break
+                # nargs implies either a list or tuple
+                if isinstance(kw.value.value, ast.Constant):
+                    nargs = kw.value.value
+                    break
+                else:
+                    raise ParseArgsError(
+                            "nargs argument must be a constant value",
+                            path=path,
+                            lineno=kw.lineno,
+                            offset=kw.col_offset,
+                        )
             case 'const':
-                default = kw.value.value
-                break
-            case 'choices':
-                break
+                if isinstance(kw.value.value, ast.Constant):
+                    const = kw.value.value
+                    break
+                else:
+                    raise ParseArgsError(
+                            "const argument must be a constant value",
+                            path=path,
+                            lineno=kw.lineno,
+                            offset=kw.col_offset,
+                        )
             case 'default':
+                if isinstance(kw.value, ast.Constant):
+                    default = kw.value.value
+                elif isinstance(kw.value, ast.List):
+                    elts = kw.value.elts
+                    default = []
+                    for v in elts:
+                        if isinstance(v, ast.Constant):
+                            default.append(v)
+                        else:
+                            raise ParseArgsError(
+                                    "list variables must be constants",
+                                    path=path,
+                                    lineno=v.lineno,
+                                    offset=v.col_offset,
+                                )
+                else:
+                    raise ParseArgsError(
+                            "default arguments must be constants or lists",
+                            path=path,
+                            lineno=kw.value.lineno,
+                            offset=kw.value.col_offset,
+                        )
+                break
+            case 'choices' | 'dest' | 'deprecated':
+                # ignore
                 break
             case _:
-                break
-    
-    # ensure type argument was provided
-    if kind = None:
-        raise ParseArgsError(
-                "type argument is required",
-                path=path,
-                lineno=stmt.keywords.lineno,
-                offset=stmt.keywords.col_offset,
-            )
+                raise ParseArgsError(
+                        f"Unknown argument '{kw.arg}'",
+                        path=path,
+                        lineno=kw.lineno,
+                        offset=kw.col_offset,
+                    )
+
+    # override default with const
+    # (seems silly, but here we are)
+    if store_const:
+        if const is not None:
+            default = store_const
+        else:
+            raise ParseArgsError(
+                    "store_const specified without accompanying const",
+                    path=path,
+                    lineno=stmt.keywords.lineno,
+                    offset=stmt.keywords.col_offset,
+                )
+   
+    # ensure type argument was provided;
+    # if not, sus out type from default and nargs
+    if kind is None:
+        if default is not None:
+            if nargs is None:
+                # is neither list nor tuple
+                if not isinstance(default, list):
+                    kind = type(default).__name__
+                else:
+                    # don't assume tuple(?)
+                    raise ParseArgsError(
+                            "default argument can only be a list with nargs specified",
+                            path=path,
+                            lineno=stmt.keywords.lineno,
+                            offset=stmt.keywords.col_offset,
+                        )
+            else:
+                if isinstance(nargs, int):
+                    kind = 'tuple'
+                    form = '('
+                    end = default[len(default) - 1]
+                    for d in default:
+                        if d != end:
+                            form += "{type(d).__name__}, "
+                    form += "{end})"
+                else:
+                    match nargs:
+                        case '+':
+                            # one or more
+                            required = True
+                            if isinstance(default, list):
+                                k = type(default[0])
+                                for d in default:
+                                    if not instance(d, k):
+                                        raise ParseArgsError(
+                                                "list variables must all be the same type",
+                                                path=path,
+                                                lineno=stmt.keywords.lineno,
+                                                offset=stmt.keywords.col_offset,
+                                            )
+                            else:
+                                # can accept a constant default,
+                                # since nargs suggests a possible list
+                                k = type(default)
+
+                            kind = 'list'
+                            form = '[{k.__name__}]'
+                        case '*':
+                            # possibly 0; not required
+                            if isinstance(default, list):
+                                k = type(default[0])
+                                for d in default:
+                                    if not instance(d, k):
+                                        raise ParseArgsError(
+                                                "list variables must all be the same type",
+                                                path=path,
+                                                lineno=stmt.keywords.lineno,
+                                                offset=stmt.keywords.col_offset,
+                                            )
+                            else:
+                                # can accept a constant default,
+                                # since nargs suggests a possible list
+                                k = type(default)
+
+                            kind = 'list'
+                            form = '[{k.__name__}]'
+                        case '?':
+                            # 0 or 1
+                            required = False
+                            if not isinstance(default, list):
+                                kind = type(default).__name__
+                            else:
+                                raise ParseArgsError(
+                                        "A nargs argument of '?' cannot have a default argument that is a list",
+                                        path=path,
+                                        lineno=stmt.keywords.lineno,
+                                        offset=stmt.keywords.col_offset,
+                                    )
+                        case _:
+                            raise ParseArgsError(
+                                    f"Invalid argument for nargs '{nargs}'",
+                                    path=path,
+                                    lineno=stmt.keywords.lineno,
+                                    offset=stmt.keywords.col_offset,
+                                )
+        else:
+            raise ParseArgsError(
+                    "type or default must be provided",
+                    path=path,
+                    lineno=stmt.keywords.lineno,
+                    offset=stmt.keywords.col_offset,
+                )
 
     sp = ArgSpec(
             name=name,
@@ -249,7 +437,6 @@ def parse_argparse_arg(path: Path, stmt: ast.Call):
     print(f"\tkind={sp.kind}")
     print(f"\tform={sp.form}")
     print(f"\tdefault={sp.default}\n")
-
 
 
 if __name__ == "__main__":
