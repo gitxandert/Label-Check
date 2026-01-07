@@ -33,7 +33,7 @@ class ParseArgsError(Exception):
         super().__init__(errstring)
 
 
-def parse_assign(path: Path, stmt: ast.Assign):
+def parse_assign(path: Path, stmt: ast.Assign) -> list[ArgSpec]:
     names = []
     if isinstance(stmt.targets[0], ast.Name):
         names.append(stmt.targets[0].id)
@@ -132,7 +132,6 @@ def parse_assign(path: Path, stmt: ast.Assign):
             )
 
     specs = []
-    print(f"\n{path.name} Arg:")
     for name in names:
         sp = ArgSpec(
                 name=name,
@@ -142,14 +141,9 @@ def parse_assign(path: Path, stmt: ast.Assign):
                 default=value,
                 desc=None,
             )
-
-        print(f"\tname={sp.name}")
-        print(f"\tkind={sp.kind}")
-        print(f"\tform={sp.form}")
-        print(f"\tdefault={sp.default}\n")
         specs.append(sp)
 
-    # return specs
+    return specs
 
 
 def match_nargs(path: Path, stmt: ast.Call, nargs: int | str, kind: str | None, default: Any) -> (str, str, bool):
@@ -283,7 +277,7 @@ def match_nargs(path: Path, stmt: ast.Call, nargs: int | str, kind: str | None, 
     return kind, form, required
 
 
-def parse_argparse_arg(path: Path, stmt: ast.Call):
+def parse_argparse_arg(path: Path, stmt: ast.Call) -> ArgSpec:
     # just use the first name
     if isinstance(stmt.args[0], ast.Constant):
         name = stmt.args[0].value
@@ -481,7 +475,7 @@ def parse_argparse_arg(path: Path, stmt: ast.Call):
                     offset=stmt.col_offset,
                 )
 
-    sp = ArgSpec(
+    return ArgSpec(
             name=name,
             kind=kind,
             required=required,
@@ -490,12 +484,47 @@ def parse_argparse_arg(path: Path, stmt: ast.Call):
             desc=desc,
         )
 
-    print(f"\tname={sp.name}")
-    if sp.desc is not None:
-        print(f"\tdesc={sp.desc}")
-    print(f"\tkind={sp.kind}")
-    print(f"\tform={sp.form}")
-    print(f"\tdefault={sp.default}\n")
+
+def print_args(spec: ArgSpec):
+    print(f"{spec.name}")
+    if spec.desc is not None:
+        print(f"\tdesc={spec.desc}")
+    print(f"\tkind={spec.kind}")
+    print(f"\trequired={spec.required}")
+    if spec.form is not None:
+        print(f"\tform={spec.form}")
+    if spec.default is not None:
+        print(f"\tdefault={spec.default}")
+
+
+def edit_script(
+        script_path: Path,
+        ap_args: list[ArgSpec], 
+        g_var: list[ArgSpec], 
+        m_var: list[ArgSpec], 
+        parser: str | None
+    ):
+    with open(script_path, 'r') as f:
+        cur = f.read()
+    
+    new = ''
+    if parser is not None:
+        print(f"Adding arguments to {parser}")
+    else:
+        print(f"Importing argparse")
+        new = "import argparse\n\n"
+
+    cur = cur.split('\n')
+    for sp in ap_args:
+        print_args(sp)
+    for sp in g_var:
+        print_args(sp)
+    for sp in m_var:
+        print_args(sp)
+
+    new += cur
+    with open(script_path, 'w') as f:
+        f.write(new)
 
 
 if __name__ == "__main__":
@@ -511,12 +540,10 @@ if __name__ == "__main__":
         # - global variables
         # - hardcoded variables in main
         # - arguments parsed by argparse
-        # The first two groups will be signalled to the user
-        # as able to be optionally-configured into variables
-        # stored in a global .runner.config file; this allows users
-        # to forego hardcoding variables altogether.
         # Arguments parsed by argparse will be automatically
-        # included in class Args.
+        # included in class Args. Optional arguments that user approves
+        # will first be added to main via argparse.add_argument(),
+        # then annotated in class Args.
         args = {}
         g_var = []
         m_var = []
@@ -577,31 +604,39 @@ if __name__ == "__main__":
             convert_m = convert_m.strip().lower()
         if auto + g_opt + m_opt == 0:
             print("No arguments, global variables, or hardcoded variables in main were found.")
+        
+        ap_args = []
+        g_var = []
+        m_var = []
         for arg in args['ap_args']:
             try:
-                parse_argparse_arg(s, arg)
+                spec = parse_argparse_arg(s, arg)
             except ParseArgsError as pae:
                 print(pae)
                 continue
+            ap_args.append(spec)
         if g_opt > 0:
             if convert_g in {'y', 'yes'}:
                 for arg in args['g_var']:
                     try:
-                        parse_assign(s, arg)
+                        specs = parse_assign(s, arg)
                     except ParseArgsError as pae:
                         print(pae)
                         continue
+                    for spec in specs:
+                        g_var.append(spec)
         if m_opt > 0:
             if convert_m in {'y', 'yes'}:
                 for arg in args['m_var']:
                     try:
-                        parse_assign(s, arg)
+                        specs = parse_assign(s, arg)
                     except ParseArgsError as pae:
                         print(pae)
                         continue
+                    for spec in specs:
+                        m_var.append(spec)
         # annotate script with class Args
         # and optionally import argparse, 
         # add new arguments to parser,
         # and/or edit main variables to take input from parser.parse_args()
-        # (also need to find variable that holds parser.parse_args())
-        # edit_script(args)
+        edit_script(Path(s), ap_args, g_var, m_var, args["parser"])
