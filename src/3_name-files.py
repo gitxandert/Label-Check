@@ -60,7 +60,7 @@ COL_QC_PASSED = "ParsingQCPassed"
 # variations that should be mapped to it. This can be easily extended or moved to an
 # external config file (like JSON) for easier management.
 STAIN_NAME_CORRECTIONS = {
-    "H&E": ["Hematoxylin", "Hematoxylir", "H and E", "H+E", "H-E", "HBE", "H&B_", "H8E", "H8E_1", "H8E_", "#&E", "HnE", "H8E", "HnBE", "H&E", "HeE", "H&E_1", "H&E_"],
+    "HE": ["Hematoxylin", "Hematoxylir", "H and E", "H+E", "H-E", "HBE", "H&B_", "H8E", "H8E_1", "H8E_", "#&E", "HnE", "H8E", "HnBE", "H&E", "HeE", "H&E_1", "H&E_", "FS-1", "FS", "{S", "FS 1", "FS1.", "F-S1", "F-S-1", "{S1", "FS1"],
     "TPREP": ["T-PREP", "TPREP", "T PREP", "TP-REP", "TPREP."],
     "IDH": ["IDH1", "IDH-1", "IDHl", "lDH", "IDH.", "IDH"],
     "INI1": ["INI 1", "1NI 1", "IN1 1", "1N1 1", "1N1 I", "INI I", "INI_1", "1NI_1", "IN1_1", "1N1_1", "1N1_I", "INI_I", "1NI1", "IN11", "1N11", "1N1I", "INII", "INI1"],
@@ -85,7 +85,6 @@ STAIN_NAME_CORRECTIONS = {
     "BRCA1": ["BRCA-1", "BRCA 1", "BRCA1.", "B-RCA1", "B-RCA-1", "BRCA1"],
     "HER2": ["HER-2", "HER 2", "HER2.", "H-ER2", "H-ER-2", "HER2"],
     "PTEN": ["P-TEN", "PTEN", "PTEN.", "P-T-EN", "P-T-EN."],
-    "FS1": ["FS-1", "FS 1", "FS1.", "F-S1", "F-S-1", "{S1", "FS1"],
     "TP53": ["TP-53", "TP 53", "TP53.", "T-P53", "T-P-53", "TP53"],
     "CD45": ["CD-45", "CD 45", "CD45.", "C-D45", "C-D-45", "CD45"],
     "CD8": ["CD-8", "CD 8", "CD8.", "C-D8", "C-D-8", "CD8"],
@@ -203,21 +202,25 @@ def process_csv_row(
     search_text = f"{row.get('label_text', '')} {row.get('macro_text', '')}"
 
     # --- Step 1: Find and Normalize the Accession ID ---
-    accession_match = accession_pattern.search(search_text)
-    if accession_match:
-        # If a match is found, normalize it to a standard format (uppercase, hyphens, no spaces).
-        accession_id = accession_match.group(0).replace(" ", "-").upper()
-        # Remove the match from the search text so that the regex doesn't attempt to find block number in the accession ID
-        search_text = search_text.replace(accession_match.group(0), "")
+    # first check if the path string already contains the accession ID
+    file_path = row.get('original_slide_path', '')
+    cleaned_path = re.sub(r'\\+', '/', file_path)
+    file_name = cleaned_path.split('/')[-1]
+    # accession ID will be the first field in the name;
+    # if the QR code is unable to be read, the name is a random hash instead,
+    # so only extract if the name is delimited by semicolons
+    file_name_split = file_name.split(';')
+    if len(file_name_split) > 1:
+        accession_id = file_name_split[0]
     else:
-        # If no match is found, see if the filename contains the accession ID
-        file_path = row.get('original_slide_path', '')
-        cleaned_path = re.sub(r'\\+', '/', file_path)
-        file_name = cleaned_path.split('/')[-1]
-        accession_match = accession_pattern.search(file_name)
+        # If no match is found, look in the label text
+        accession_match = accession_pattern.search(search_text)
+        # If a match is found, normalize it to a standard format (uppercase, hyphens, no spaces).
         if accession_match:
             accession_id = accession_match.group(0).replace(" ", "-").upper()
-
+            # Remove the match from the search text so that the regex doesn't attempt to find block number in the accession ID
+            search_text = search_text.replace(accession_match.group(0), "")
+        
     # --- Step 2: Find and Normalize the Stain Name ---
     stain_match = stain_pattern.search(search_text)
     if stain_match:
