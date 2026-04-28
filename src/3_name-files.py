@@ -60,7 +60,9 @@ COL_QC_PASSED = "ParsingQCPassed"
 # variations that should be mapped to it. This can be easily extended or moved to an
 # external config file (like JSON) for easier management.
 STAIN_NAME_CORRECTIONS = {
-    "HE": ["Hematoxylin", "Hematoxylir", "H and E", "H+E", "H-E", "HBE", "H&B_", "H8E", "H8E_1", "H8E_", "#&E", "HnE", "H8E", "HnBE", "H&E", "HeE", "H&E_1", "H&E_", "FS-1", "FS", "{S", "FS 1", "FS1.", "F-S1", "F-S-1", "{S1", "FS1"],
+    "HE": ["Hematoxylin", "Hematoxylir", "H and E", "H+E", "H-E", "HBE", "H&B_", "H8E", "H8E_1", "H8E_", "#&E", "HnE", "H8E", "HnBE", "H&E", "HeE", "H&E_1", "H&E_"],
+    "FS": ["FS", "{S"],
+    "FS1": ["FS-1", "FS 1", "FS1.", "F-S1", "F-S-1", "{S1", "FS1"],
     "TPREP": ["T-PREP", "TPREP", "T PREP", "TP-REP", "TPREP."],
     "IDH": ["IDH1", "IDH-1", "IDHl", "lDH", "IDH.", "IDH"],
     "INI1": ["INI 1", "1NI 1", "IN1 1", "1N1 1", "1N1 I", "INI I", "INI_1", "1NI_1", "IN1_1", "1N1_1", "1N1_I", "INI_I", "1NI1", "IN11", "1N11", "1N1I", "INII", "INI1"],
