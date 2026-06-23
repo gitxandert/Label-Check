@@ -64,6 +64,26 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 
 
+def copytree_pure_data(src, dst):
+    """
+    Recursively copies a directory tree using ONLY shutil.copyfile.
+    Completely ignores all file and directory metadata.
+    """
+    for root, dirs, files in os.walk(src):
+        # Determine the relative path to recreate the structure
+        rel_path = os.path.relpath(root, src)
+        target_dir = dst if rel_path == "." else os.path.join(dst, rel_path)
+
+        # Safely create the directory on the external drive
+        os.makedirs(target_dir, exist_ok=True)
+
+        # Copy raw file data only
+        for file in files:
+            src_file = os.path.join(root, file)
+            dst_file = os.path.join(target_dir, file)
+            shutil.copyfile(src_file, dst_file)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
             description="Pipeline for the separate modules inside of Label-Check. Streamlines the process to QC and handles argument passing between modules."
@@ -77,25 +97,32 @@ if __name__ == "__main__":
     parser.add_argument(
             "--start_from", required=False, help="Stage of the pipeline to start from (1/macro, 2/ocr, 3/name, app)", choices=['1', 'macro', '2', 'ocr', '3', 'name', 'app']
     )
+    parser.add_argument(
+            "--input_mode", required=False, help="Stage 1 input mode (auto/slides/images)", choices=['auto', 'slides', 'images']
+    )
     # create a config file for all of the other arguments, but these two must be provided at runtime
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
     start_from = args.start_from
+    input_mode = args.input_mode
    
     if start_from in [None, '1', 'macro']:
         print("\x1b[1mExecuting 1_get_macro.py...\x1b[0m\n")
         try:
-            subprocess.run(
-                    [
+            stage_one_cmd = [
                         "python", 
                         "src/1_get_macro.py", 
                         "--input_dir", 
                         input_dir, 
                         "--output_dir", 
                         output_dir
-                    ], 
+                    ]
+            if input_mode:
+                stage_one_cmd.extend(["--input-mode", input_mode])
+            subprocess.run(
+                    stage_one_cmd, 
                     check=True, 
                     text=True
             )
@@ -146,13 +173,13 @@ if __name__ == "__main__":
             parse_except(e)
 
     output_src = output_dir / "src"
+    output_app = output_src / "app.py"
     output_templates = output_src / "templates"
     os.makedirs(output_src, exist_ok=True)
 
-    shutil.copy("src/app.py", output_src)
-    shutil.copytree("src/templates/", output_templates, dirs_exist_ok=True)
+    shutil.copyfile("src/app.py", output_app)
+    copytree_pure_data("src/templates/", output_templates)
 
-    output_app = output_src / "app.py"
 
     print("\n\x1b[1mInitializing database...\x1b[0m\n")
     try:

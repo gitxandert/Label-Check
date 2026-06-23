@@ -159,7 +159,10 @@ def perform_ocr_on_row(row: dict, csv_dir: Path, reader: easyocr.Reader) -> dict
 
     # Also strip csv_dir from thumbnail_path for the flask app
     thumbnail_path = clean_and_resolve_path(row.get("thumbnail_path"))
-    updated_row["thumbnail_path"] = thumbnail_path.relative_to(csv_dir)
+    if thumbnail_path and thumbnail_path.exists():
+        updated_row["thumbnail_path"] = thumbnail_path.relative_to(csv_dir)
+    else:
+        updated_row["thumbnail_path"] = ""
 
     # Proceed only if at least one image file was found.
     if paths_to_process:

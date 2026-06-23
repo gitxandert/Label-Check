@@ -60,7 +60,7 @@ COL_QC_PASSED = "ParsingQCPassed"
 # variations that should be mapped to it. This can be easily extended or moved to an
 # external config file (like JSON) for easier management.
 STAIN_NAME_CORRECTIONS = {
-    "HE": ["Hematoxylin", "Hematoxylir", "H and E", "H+E", "H-E", "HBE", "H&B_", "H8E", "H8E_1", "H8E_", "#&E", "HnE", "H8E", "HnBE", "H&E", "HeE", "H&E_1", "H&E_"],
+    "HE": ["Hematoxylin", "Hematoxylir", "H and E", "H+E", "H-E", "HBE", "H&B_", "H8E", "H8E_1", "H8E_", "#&E", "HnE", "H8E", "HnBE", "H&E", "HeE", "H&E_1", "H&E_I","H&E_l", "H&E_"],
     "FS": ["FS", "{S"],
     "FS1": ["FS-1", "FS 1", "FS1.", "F-S1", "F-S-1", "{S1", "FS1"],
     "TPREP": ["T-PREP", "TPREP", "T PREP", "TP-REP", "TPREP."],
@@ -76,6 +76,7 @@ STAIN_NAME_CORRECTIONS = {
     "EGFR": ["E-GFR", "EGFR", "EGFR.", "E GFR", "EG-FR"],
     "MGMT": ["M-GMT", "MGMT", "MGMT.", "MGM-T", "M-G-MT"],
     "H3K27M": ["H3-K27M", "H3 K27M", "H3K27M.", "H3K-27M", "H3-K-27M", "H3K27M"],
+    "GFAP-POLY": ["GFAP (polv)", "GFAP (poly)"],
     "GFAP": ["G-FAP", "GFAP", "GFAP.", "GFA-P", "G-F-AP"],
     "CD34": ["CD-34", "CD 34", "CD34.", "CD3-4", "C-D34", "CD34", "CD-3A", "CD 3A", "CD3A.", "CD3-A", "C-D3A", "CD3A"],
     "CD43": ["CD-43", "CD 43", "CD43.", "CD3-4", "C-D43", "CD43", "CD-A3", "CD A3", "CDA3.", "CD3-A", "C-DA3", "CDA3"],
@@ -100,17 +101,17 @@ STAIN_NAME_CORRECTIONS = {
     "CTNNB1": ["CTNNB-1", "CTNNB 1", "CTNNB1.", "C-TNNB1", "C-TNNB-1", "CTNNB1"],
     "ALK": ["A-LK", "ALK", "ALK.", "A-LK."],
     "LANGERIN": ["LANGERIM", "LARGERIN", "LARGERIM", "LANGERIN"],
-    "HBA71_CD99": ["HBA.71 CD99", "HBA 71 CD99", "HBA71 CD99", "HBA.71 CD9g", "HBA 71 CD9g", "HBA71 CD9g", "HBA.71 CDg9", "HBA 71 CDg9", "HBA71 CDg9", "HBA.71 CDgg", "HBA 71 CDgg", "HBA71 CDgg", "HBA71_CD99"],
+    "HBA71-CD99": ["HBA.71 CD99", "HBA 71 CD99", "HBA71 CD99", "HBA.71 CD9g", "HBA 71 CD9g", "HBA71 CD9g", "HBA.71 CDg9", "HBA 71 CDg9", "HBA71 CDg9", "HBA.71 CDgg", "HBA 71 CDgg", "HBA71 CDgg", "HBA71_CD99"],
     "HMBA45": ["HMBA45"],
     "HMB-45-RED": ["HMB-45-RED"],
-    "MELAN_A_RED": ["MELAN A-RED", "MELAN_A_RED"],
+    "MELAN-A-RED": ["MELAN A-RED", "MELAN_A_RED"],
     "SOX-10": ["S0X-10", "S0X-1O", "SOX-1O", "SOX-10"],
     "SOX-10-RED": ["S0X-10-RED", "S0X-1O-RED", "SOX-1O-RED", "SOX-10-RED"],
     "MSH2-FE11": ["MSH? (FE1 1)", "MSH? (FE11)", "MSHZ (FE1 1)", "MSHZ (FE11)", "MSH2 (FE1 1)", "MSH2 (FE11)"],
     "MSH6-EP49": ["MSH6 (EPA9)", "MSH6 (EPA9}", "MSH6 (EP49)"],
     "WT-1": ["WT-1"],
     "PMS2-EP51": ["PMS2-EP51"],
-    "NEUROFILAMENT": ["NEUROFILAMENT"],
+    "NEUROFILAMENT": ["NEUROFILAMONT", "NEUROFILAMEN", "NEUROFILAMENT"],
     "TOXOPLASMA": ["TOXOPLASMA"],
     "RETIC": ["RETIC"],
     "NEUN": ["NEUN"],
@@ -123,7 +124,13 @@ STAIN_NAME_CORRECTIONS = {
     "S100": ["$100", "5100", "S100"],
     "CD14-EPR": ["CD1AEPR", "CD14EPR", "CD1A-EPR", "CD14-EPR"],
     "CD-163": ["CD 163", "CD-163"],
-    "STAT6": ["STAT6"]
+    "STAT6": ["STAT6"],
+    "RECUT": ["RECUT"],
+    "ANDROGEN": ["ANDROGEN"],
+    "MLH1-ES05": ["MLH1 (ESO5)", "MLH1 (ES05)"],
+    "EMA": ["EMA"],
+    "ER": ["ER"],
+    "PR-1294": ["PR 1294"],
 }
 
 
@@ -167,8 +174,10 @@ def build_stain_normalizer(
 
     # Join all variations into a single regex "OR" pattern (e.g., 'h-e|h\+e|h&e').
     # re.escape() is used to handle special characters like '+' correctly.
-    # Wrap in \b anchors to prevent matching against patterns inside of e.g. accession IDs.
-    pattern_str = r"\b(" + "|".join(re.escape(var) for var in sorted_variations) + r")\b"
+    # (?<!\w) means "not preceded by a word character"
+    # (?!\w)  means "not followed by a word character"
+    # ^^ This is used instead of \b, which would terminate a string at the first non-word character
+    pattern_str = r"(?<!\w)(" + "|".join(re.escape(var) for var in sorted_variations) + r")(?!\w)"
     pattern = re.compile(pattern_str, re.IGNORECASE)
 
     return pattern, variation_lookup
@@ -202,6 +211,7 @@ def process_csv_row(
 
     # Combine the OCR text from both label and macro images into a single string for searching.
     search_text = f"{row.get('label_text', '')} {row.get('macro_text', '')}"
+    search_text = search_text.lower()
 
     # --- Step 1: Find and Normalize the Accession ID ---
     # first check if the path string already contains the accession ID

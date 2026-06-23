@@ -226,5 +226,6 @@ src/ocr_audit_logs/
 docker-compose.yml
 tests/
 
-# Claude
+# agent artifacts
 CLAUDE.md
+.codex

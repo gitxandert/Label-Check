@@ -1,3 +1,4 @@
+easyocr
 flask
 flask-login
 flask-sqlalchemy

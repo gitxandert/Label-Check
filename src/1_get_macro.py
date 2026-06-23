@@ -1,48 +1,61 @@
 """
-This script extracts associated images (macro, label, thumbnail) from whole-slide image (WSI)
-files, such as those in SVS format. It processes files in a specified input directory
-recursively, saves the extracted images to an output directory while maintaining the original
-folder structure, and generates a CSV file mapping the original slide paths to the new
-image paths.
-
-The script is designed for efficiency, using a thread pool to process multiple
-files concurrently. It is configurable via command-line arguments for input/output
-directories, file extensions, and the number of parallel workers.
-
-Key libraries used:
-- argparse: For parsing command-line arguments.
-- csv: For writing the output mapping file.
-- logging: For providing informative output about the script's execution.
-- concurrent.futures: For parallel processing of slide files to speed up execution.
-- pathlib: For modern, object-oriented handling of filesystem paths.
-- openslide: A Python library for reading WSI files.
-- tqdm: For displaying a progress bar during file processing.
+This script extracts associated images (macro, label, thumbnail) from whole-slide image
+(WSI) files or ingests already-extracted label/macro image directories. In both modes it
+produces the same CSV schema for the downstream OCR and QC stages.
 """
 
 import argparse
 import csv
 import logging
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-# Third-party libraries
-import openslide
-from tqdm import tqdm
+try:
+    import openslide
+except ImportError:
+    openslide = None
 
-# --- Configuration ---
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **_kwargs):
+        return iterable
 
-# Set up a logger for informative console output.
-# The format includes timestamp, log level, and the message.
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# Define constants for the names of associated images typically found in WSI files.
-# This makes the code cleaner and avoids magic strings.
 ASSOCIATED_IMAGE_TYPES = ["macro", "label", "thumbnail"]
-# Set a default size for thumbnails if the slide file doesn't contain an embedded one.
 DEFAULT_THUMBNAIL_SIZE = (300, 300)
+DEFAULT_IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "tif", "tiff", "bmp"]
+
+
+def write_mapping_csv(results: list[dict], csv_path: Path):
+    """
+    Writes the stage-1 mapping CSV shared by both input modes.
+    """
+    logger.info(f"Writing mapping to {csv_path}...")
+    try:
+        with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
+            header = [f"{img_type}_path" for img_type in ASSOCIATED_IMAGE_TYPES] + [
+                "original_slide_path"
+            ]
+            writer = csv.DictWriter(csvfile, fieldnames=header)
+            writer.writeheader()
+
+            for result in results:
+                row = {}
+                for img_type in ASSOCIATED_IMAGE_TYPES:
+                    row[f"{img_type}_path"] = result.get(img_type) or ""
+                row["original_slide_path"] = result["original"]
+                writer.writerow(row)
+
+        logger.info(f"CSV mapping saved to {csv_path}")
+    except Exception as e:
+        logger.error(f"Failed to write CSV file: {e}")
 
 
 def extract_associated_images(
@@ -53,82 +66,43 @@ def extract_associated_images(
     thumbnail_size: tuple = DEFAULT_THUMBNAIL_SIZE,
 ):
     """
-    Extracts associated images (macro, label, thumbnail) from a single whole-slide image file.
-
-    If a thumbnail is not found in the slide's associated images, one is generated
-    from the slide's base layer at the specified size.
-
-    Args:
-        svs_path (Path): The absolute path to the SVS or other WSI file.
-        input_dir (Path): The root directory where the recursive search for SVS files began.
-                          This is used to determine the relative path for maintaining structure.
-        output_dir (Path): The root directory where the extracted images will be saved.
-        maintain_structure (bool): If True, replicates the sub-directory structure from
-                                   the input_dir in the output_dir.
-        thumbnail_size (tuple): A (width, height) tuple for generating a thumbnail if one
-                                is not already present in the slide file.
-
-    Returns:
-        A dictionary mapping image types ('original', 'macro', 'label', 'thumbnail')
-        to their file paths (as Path objects). Returns None if the slide file cannot be
-        opened or an error occurs.
+    Extracts associated images (macro, label, thumbnail) from a single WSI file.
     """
     try:
-        # Open the whole-slide image file.
+        if openslide is None:
+            raise ImportError(
+                "openslide is required for slide mode but is not installed."
+            )
         slide = openslide.OpenSlide(str(svs_path))
-
-        # Get the base filename without the extension (e.g., "slide01" from "slide01.svs").
         base_name = svs_path.stem
-        # Initialize a dictionary to store the paths of the original slide and extracted images.
         output_paths = {"original": svs_path}
 
-        # --- Determine the output subdirectory ---
-        # This logic ensures that if the input is `data/slides/case1/slide.svs`,
-        # the output will be `output/macro/slides/case1/`.
         if maintain_structure:
-            # Calculate the relative path from the input root to the slide's parent directory.
             relative_sub_dir = svs_path.parent.relative_to(input_dir)
         else:
-            # If not maintaining structure, all images go directly into the top-level output folder.
-            relative_sub_dir = Path()  # An empty path.
+            relative_sub_dir = Path()
 
-        # --- Loop through each associated image type to extract it ---
         for image_type in ASSOCIATED_IMAGE_TYPES:
-            # Construct the full output directory for this specific image type (e.g., output/macro/...).
             image_output_dir = output_dir / image_type / relative_sub_dir
-            # Create the directory if it doesn't exist. `parents=True` creates parent dirs as needed.
             image_output_dir.mkdir(parents=True, exist_ok=True)
 
-            # Define the full path for the output image file.
             output_filename = f"{base_name}_{image_type}.png"
             image_path = image_output_dir / output_filename
 
-            # Check if the associated image exists in the slide file.
             if image_type in slide.associated_images:
-                # Get the image object.
-                image = slide.associated_images[image_type]
-                # Save the image to the specified path.
-                image.save(image_path)
+                slide.associated_images[image_type].save(image_path)
                 logger.debug(f"Extracted {image_type} from {svs_path}")
-            # Special case: if a thumbnail is missing, generate one.
             elif image_type == "thumbnail":
                 logger.warning(f"No thumbnail in {svs_path}, generating one.")
-                # Generate a thumbnail from the slide's primary image data.
-                image = slide.get_thumbnail(thumbnail_size)
-                image.save(image_path)
+                slide.get_thumbnail(thumbnail_size).save(image_path)
             else:
-                # If the image type (e.g., macro) is not found, mark its path as None.
                 image_path = None
 
-            # Store the path (or None) in the results dictionary.
             output_paths[image_type] = image_path
 
-        # Close the slide file to release resources.
         slide.close()
         return output_paths
-
     except Exception as e:
-        # Log any errors that occur during processing of a single slide.
         logger.error(f"Error processing {svs_path}: {e}")
         return None
 
@@ -142,41 +116,25 @@ def process_slide_files(
     thumbnail_size: tuple,
 ):
     """
-    Finds and processes all slide files in a directory and its subdirectories
-    using a thread pool for concurrent execution. It then writes the results
-    to a CSV file.
-
-    Args:
-        input_dir (Path): The directory to search for slide files.
-        output_dir (Path): The root directory to save extracted images.
-        csv_path (Path): The path where the output CSV mapping file will be saved.
-        extensions (list): A list of file extensions (e.g., ['svs', 'tif']) to look for.
-        num_workers (int): The number of worker threads to use for parallel processing.
-        thumbnail_size (tuple): The (width, height) to use for generated thumbnails.
+    Finds and processes WSI files recursively using a thread pool.
     """
     logger.info(f"Scanning for files with extensions {extensions} in {input_dir}...")
 
-    # --- Find all slide files recursively ---
     slide_files = []
     for ext in extensions:
-        # `rglob` finds all files matching the pattern in the directory and subdirectories.
         slide_files.extend(list(input_dir.rglob(f"*.{ext}")))
+        slide_files.extend(list(input_dir.rglob(f"*.{ext.upper()}")))
 
+    slide_files = sorted(set(slide_files))
     if not slide_files:
         logger.warning("No slide files found to process.")
         return
 
     logger.info(f"Found {len(slide_files)} slide files to process.")
-    # Ensure the main output directory exists.
     output_dir.mkdir(parents=True, exist_ok=True)
 
     results = []
-    # --- Use a ThreadPoolExecutor for concurrent processing ---
-    # This creates a pool of `num_workers` threads to execute tasks in parallel.
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        # `executor.submit` schedules a function to be executed and returns a 'future' object.
-        # A future represents a pending result. We store it in a dictionary to link it
-        # back to the original file path.
         future_to_svs = {
             executor.submit(
                 extract_associated_images,
@@ -188,81 +146,166 @@ def process_slide_files(
             for svs_path in slide_files
         }
 
-        # `as_completed` is an iterator that yields futures as they complete.
-        # This allows us to process results as they become available.
-        # `tqdm` wraps this iterator to create a live progress bar.
         progress_bar = tqdm(
             as_completed(future_to_svs),
             total=len(slide_files),
             desc="Processing slides",
         )
         for future in progress_bar:
-            # `future.result()` retrieves the return value from the `extract_associated_images` function.
             result = future.result()
             if result:
                 results.append(result)
 
     if not results:
-        logger.warning(
-            "Processing complete, but no images were successfully extracted."
+        logger.warning("Processing complete, but no images were successfully extracted.")
+        return
+
+    write_mapping_csv(results, csv_path)
+    logger.info(
+        f"Successfully processed {len(results)} out of {len(slide_files)} files."
+    )
+
+
+def normalize_image_stem(path: Path, image_type: str) -> str:
+    """
+    Normalizes a label or macro filename stem for cross-directory pairing.
+    """
+    suffix = f"_{image_type}"
+    stem = path.stem
+    if stem.lower().endswith(suffix):
+        stem = stem[: -len(suffix)]
+    if path.parent == Path():
+        return stem
+    return str(path.parent / stem)
+
+
+def scan_image_dir(
+    image_dir: Path, image_type: str, extensions: list[str]
+) -> dict[str, Path]:
+    """
+    Scans one image subtree and returns normalized stem -> source path mappings.
+    """
+    files = []
+    for ext in extensions:
+        files.extend(list(image_dir.rglob(f"*.{ext}")))
+        files.extend(list(image_dir.rglob(f"*.{ext.upper()}")))
+
+    matches = {}
+    for file_path in sorted(set(files)):
+        relative_path = file_path.relative_to(image_dir)
+        normalized_stem = normalize_image_stem(relative_path, image_type)
+        if normalized_stem in matches:
+            logger.warning(
+                f"Duplicate {image_type} image for '{normalized_stem}'; keeping "
+                f"{matches[normalized_stem]} and skipping {file_path}"
+            )
+            continue
+        matches[normalized_stem] = file_path
+    return matches
+
+
+def build_canonical_output_path(
+    output_dir: Path,
+    image_type: str,
+    normalized_stem: str,
+    source_path: Path,
+) -> Path:
+    """
+    Builds the copied image path for image-directory mode.
+    """
+    stem_path = Path(normalized_stem)
+    filename = f"{stem_path.name}_{image_type}{source_path.suffix.lower()}"
+    return output_dir / image_type / stem_path.parent / filename
+
+
+def process_image_files(
+    input_dir: Path,
+    output_dir: Path,
+    csv_path: Path,
+    extensions: list[str],
+):
+    """
+    Pairs label/macro images from an image-directory input tree and copies them to
+    the standard output layout.
+    """
+    label_dir = input_dir / "label"
+    macro_dir = input_dir / "macro"
+    if not label_dir.is_dir() or not macro_dir.is_dir():
+        logger.error(
+            "Image-directory mode requires both 'label/' and 'macro/' subdirectories."
         )
         return
 
-    # --- Write the results to a CSV file ---
-    logger.info(f"Writing mapping to {csv_path}...")
-    try:
-        # Open the CSV file for writing. `newline=''` prevents extra blank rows.
-        with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
-            # Define the header for the CSV file.
-            header = [f"{img_type}_path" for img_type in ASSOCIATED_IMAGE_TYPES] + [
-                "original_slide_path"
-            ]
-            writer = csv.DictWriter(csvfile, fieldnames=header)
-            writer.writeheader()
+    logger.info(f"Scanning image directories in {input_dir}...")
+    normalized_extensions = [ext.lower().lstrip(".") for ext in extensions]
+    label_images = scan_image_dir(label_dir, "label", normalized_extensions)
+    macro_images = scan_image_dir(macro_dir, "macro", normalized_extensions)
 
-            for result in results:
-                relative_paths = {}
-                # Calculate paths relative to the CSV file's location for portability.
-                for img_type in ASSOCIATED_IMAGE_TYPES:
-                    path_key = f"{img_type}_path"
-                    # Check if the image was successfully extracted (path is not None).
-                    if result.get(img_type):
-                        relative_paths[path_key] = result[img_type]
-                    else:
-                        relative_paths[path_key] = ""  # Use an empty string if not found.
+    if not label_images:
+        logger.warning("No label images found to process.")
+        return
 
-                relative_paths["original_slide_path"] = result["original"]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    results = []
+    for normalized_stem in sorted(label_images):
+        label_source = label_images[normalized_stem]
+        macro_source = macro_images.get(normalized_stem)
 
-                writer.writerow(relative_paths)
-
-        logger.info(
-            f"Successfully processed {len(results)} out of {len(slide_files)} files."
+        label_output = build_canonical_output_path(
+            output_dir, "label", normalized_stem, label_source
         )
-        logger.info(f"CSV mapping with relative paths saved to {csv_path}")
+        label_output.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(label_source, label_output)
 
-    except Exception as e:
-        logger.error(f"Failed to write CSV file: {e}")
+        macro_output = None
+        if macro_source:
+            macro_output = build_canonical_output_path(
+                output_dir, "macro", normalized_stem, macro_source
+            )
+            macro_output.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(macro_source, macro_output)
+        else:
+            logger.warning(f"No macro image found for '{normalized_stem}'")
+
+        results.append(
+            {
+                "label": label_output,
+                "macro": macro_output,
+                "thumbnail": None,
+                "original": Path(normalized_stem).with_suffix(".svs"),
+            }
+        )
+
+    write_mapping_csv(results, csv_path)
+    logger.info(f"Successfully processed {len(results)} label-driven image rows.")
 
 
-# --- Main execution block ---
-# This code runs only when the script is executed directly from the command line.
+def detect_input_mode(input_dir: Path, requested_mode: str) -> str:
+    """
+    Chooses the effective stage-1 input mode.
+    """
+    if requested_mode != "auto":
+        return requested_mode
+    if (input_dir / "label").is_dir() and (input_dir / "macro").is_dir():
+        return "images"
+    return "slides"
+
+
 if __name__ == "__main__":
-    # Set up the command-line argument parser.
     parser = argparse.ArgumentParser(
-        description="Extract associated images (macro, label, thumbnail) from whole-slide image files."
+        description="Extract associated images from whole-slide files or paired image directories."
     )
-    # Define the command-line arguments.
     parser.add_argument(
         "--input_dir",
         type=Path,
         required=True,
-        help="Input directory containing slide files.",
+        help="Input directory containing slide files or label/macro image subdirectories.",
     )
     parser.add_argument(
         "--output_dir",
         type=Path,
         required=True,
-        help="Output directory for extracted images.",
+        help="Output directory for extracted or copied images.",
     )
     parser.add_argument(
         "--csv-path",
@@ -278,33 +321,54 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--extensions",
-        nargs="+",  # `+` means one or more arguments.
+        nargs="+",
         default=["svs"],
-        help="List of file extensions to process (e.g., svs tif ndpi).",
+        help="List of slide-file extensions to process in slide mode.",
+    )
+    parser.add_argument(
+        "--input-mode",
+        choices=["auto", "slides", "images"],
+        default="auto",
+        help="Interpret the input as whole-slide files or label/macro image directories.",
+    )
+    parser.add_argument(
+        "--image-extensions",
+        nargs="+",
+        default=DEFAULT_IMAGE_EXTENSIONS,
+        help="List of raster image extensions to process in image-directory mode.",
     )
     parser.add_argument(
         "--thumbnail-size",
         type=int,
-        nargs=2,  # Expect exactly two integer values.
+        nargs=2,
         default=DEFAULT_THUMBNAIL_SIZE,
         metavar=("WIDTH", "HEIGHT"),
-        help=f"Size of thumbnails to generate if not present. Default: {DEFAULT_THUMBNAIL_SIZE[0]} {DEFAULT_THUMBNAIL_SIZE[1]}",
+        help=(
+            "Size of thumbnails to generate if not present. "
+            f"Default: {DEFAULT_THUMBNAIL_SIZE[0]} {DEFAULT_THUMBNAIL_SIZE[1]}"
+        ),
     )
 
-    # Parse the arguments provided by the user.
     args = parser.parse_args()
 
-    # Before starting, ensure the parent directory for the output CSV file exists.
     output_dir = Path(args.output_dir)
     csv_path = output_dir / args.csv_path
     csv_path.parent.mkdir(parents=True, exist_ok=True)
+    input_mode = detect_input_mode(args.input_dir, args.input_mode)
 
-    # Call the main processing function with the parsed arguments.
-    process_slide_files(
-        args.input_dir,
-        output_dir,
-        csv_path,
-        args.extensions,
-        args.workers,
-        tuple(args.thumbnail_size),  # Convert the list [w, h] to a tuple (w, h).
-    )
+    if input_mode == "slides":
+        process_slide_files(
+            args.input_dir,
+            output_dir,
+            csv_path,
+            args.extensions,
+            args.workers,
+            tuple(args.thumbnail_size),
+        )
+    else:
+        process_image_files(
+            args.input_dir,
+            output_dir,
+            csv_path,
+            args.image_extensions,
+        )

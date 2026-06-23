@@ -27,6 +27,8 @@ from io import StringIO
 from pathlib import Path
 from configparser import RawConfigParser
 
+import openslide
+
 PROG_DESCRIPTION = '''
 Delete the slide label from an MRXS, NDPI, or SVS whole-slide image.
 '''.strip()
@@ -910,7 +912,41 @@ def accept(filename, format):
         print(filename + ':', format)
 
 
-def do_aperio_svs(filename):
+def _export_removed_svs_images(filename, archive_root):
+    """
+    Save removable SVS associated images before anonymization.
+
+    Args:
+        filename (str): Path to the SVS file
+        archive_root (Path): Root directory for removed image archives
+
+    Raises:
+        IOError: If an output file already exists or an image cannot be saved
+    """
+    archive_root = Path(archive_root)
+    slide_name = Path(filename).stem
+    image_types = ('label', 'macro')
+
+    slide = openslide.OpenSlide(str(filename))
+    try:
+        for image_type in image_types:
+            if image_type not in slide.associated_images:
+                continue
+
+            output_dir = archive_root / image_type
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_path = output_dir / f'{slide_name}.png'
+            if output_path.exists():
+                raise IOError(
+                    f"Refusing to overwrite archived {image_type} image at {output_path}"
+                )
+
+            slide.associated_images[image_type].save(output_path)
+    finally:
+        slide.close()
+
+
+def do_aperio_svs(filename, archive_root=None):
     """
     Anonymize an Aperio SVS whole-slide image by removing the label and macro.
 
@@ -948,6 +984,9 @@ def do_aperio_svs(filename):
 
         if label_dir is None:
             raise IOError("No label in SVS file")
+
+        if archive_root is not None:
+            _export_removed_svs_images(filename, archive_root)
 
         label_dir.delete(expected_prefix=LZW_CLEARCODE)
         if macro_dir is not None:
@@ -1015,7 +1054,7 @@ format_handlers = [
 ]
 
 
-def anonymize_slide(filename):
+def anonymize_slide(filename, archive_root=None):
     """
     Anonymize a whole-slide image file by removing its label.
     
@@ -1034,7 +1073,10 @@ def anonymize_slide(filename):
         # Try each format handler until one recognizes the file
         for handler in format_handlers:
             try:
-                handler(filename)
+                if handler is do_aperio_svs:
+                    handler(filename, archive_root=archive_root)
+                else:
+                    handler(filename)
                 break  # Success, stop trying other handlers
             except UnrecognizedFile:
                 pass  # This handler didn't recognize it, try next
@@ -1137,10 +1179,15 @@ def main():
         help="Directory with slides to anonymize"
     )
     parser.add_argument(
-        "--output_log",
+        "--output-log",
         required=False,
         help="Path to CSV file for logging results",
         default="anonymization_results.csv"
+    )
+    parser.add_argument(
+        "--keep-removed-images",
+        action="store_true",
+        help="Save removed SVS label/macro images under removed_images/ beside the output log",
     )
 
     args = parser.parse_args()
@@ -1151,6 +1198,9 @@ def main():
     slide_folder = Path(args.input_dir)
     # Path to CSV file for logging results
     mapping_file = Path(args.output_log)
+    archive_root = None
+    if args.keep_removed_images:
+        archive_root = mapping_file.parent / 'removed_images'
 
     # Step 1: Recursively find all .svs files in slide_folder and subdirectories
     svs_files = []
@@ -1166,7 +1216,7 @@ def main():
 
         for file_path in svs_files:
             print('Processing', os.path.basename(file_path))
-            exit_code = anonymize_slide(file_path)
+            exit_code = anonymize_slide(file_path, archive_root=archive_root)
             status = 'SUCCESS' if exit_code == 0 else 'FAILURE'
             # Log the result (note: anonymized_path is same as original_path here
             # since we're modifying in-place, but folder was already renamed)
