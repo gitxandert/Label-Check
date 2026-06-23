@@ -28,8 +28,11 @@ import torch
 from PIL import Image, UnidentifiedImageError
 from tqdm import tqdm
 
-from surya.recognition import RecognitionPredictor
-from surya.detection import DetectionPredictor
+from surya.ocr import run_ocr
+from surya.model.detection.model import load_model as load_det_model, load_processor as load_det_processor
+from surya.model.recognition.model import load_model as load_rec_model
+from surya.model.recognition.processor import load_processor as load_rec_processor
+
 
 
 # ==============================================================================
@@ -62,12 +65,10 @@ def clean_and_resolve_path(path_str: str) -> Path | None:
         return None
 
     cleaned_str = path_str.replace("\\", "/")
+    if cleaned_str.startswith("./"):
+        cleaned_str = cleaned_str[2:]
 
-    # 2. Create a Path object
-    # WARNING: this assumes that cleaned_str is an absolute path, which should be the case
-    cleaned_path = Path(cleaned_str)
-    print(f"{cleaned_path}")
-    return Path(cleaned_str)
+    return Path(cleaned_str).resolve()
 
 
 def _extract_text_from_prediction(prediction_result, context: str) -> str:
@@ -120,9 +121,10 @@ def _extract_text_from_prediction(prediction_result, context: str) -> str:
 def perform_ocr_on_row(
     row: dict,
     csv_dir: Path,
-    det_predictor: DetectionPredictor,
-    rec_predictor: RecognitionPredictor,
-    langs: list[str] | None,
+    det_model,
+    det_processor,
+    rec_model,
+    rec_processor,
 ) -> dict:
     """
     Performs Surya OCR on the label and macro images for a single CSV row.
@@ -133,10 +135,10 @@ def perform_ocr_on_row(
     Args:
         row: A dictionary representing one row from the input CSV.
         csv_dir: The parent directory of the input CSV file.
-        det_predictor: The initialized Surya DetectionPredictor instance.
-        rec_predictor: The initialized Surya RecognitionPredictor instance.
-        langs: Language list for OCR (e.g. ["en"]), or None for auto-detection.
-
+        det_model: The initialized Surya detection model.
+        det_processor: The initialized Surya detection processor.
+        rec_model: The initialized Surya recognition model.
+        rec_processor: The initialized Surya recognition processor.
     Returns:
         The original row dictionary updated with 'label_text', 'macro_text',
         and 'ocr_qc_needed' fields.
@@ -145,9 +147,6 @@ def perform_ocr_on_row(
     label_text = ""
     macro_text = ""
     ocr_qc_needed = False
-
-    # Prepare the language argument once — Surya expects a list-of-lists or None.
-    lang_arg = [langs] if langs else None
 
     # --- Resolve and Validate Image Paths ---
     label_path_str = row.get("label_path")
@@ -158,8 +157,6 @@ def perform_ocr_on_row(
         label_path = clean_and_resolve_path(label_path_str)
         if label_path and label_path.exists():
             paths_to_process["label"] = label_path
-            # Strip csv_dir from label_path for the flask app
-            updated_row["label_path"] = label_path.relative_to(csv_dir)
         else:
             logger.warning(
                 f"Label image not found at resolved path '{label_path}' "
@@ -170,8 +167,6 @@ def perform_ocr_on_row(
         macro_path = clean_and_resolve_path(macro_path_str)
         if macro_path and macro_path.exists():
             paths_to_process["macro"] = macro_path
-            # Strip csv_dir from macro_path for the flask app
-            updated_row["macro_path"] = macro_path.relative_to(csv_dir)
         else:
             logger.warning(
                 f"Macro image not found at resolved path '{macro_path}' "
@@ -180,27 +175,16 @@ def perform_ocr_on_row(
 
     slide_id = row.get("original_slide_path", "unknown")
 
-    # Also strip csv_dir from thumbnail_path for the flask app
-    thumbnail_path = clean_and_resolve_path(row.get("thumbnail_path"))
-    if thumbnail_path and thumbnail_path.exists():
-        updated_row["thumbnail_path"] = thumbnail_path.relative_to(csv_dir)
-    else:
-        updated_row["thumbnail_path"] = ""
-
-    # Proceed only if at least one image file was found.
     if paths_to_process:
         try:
             # --- Process Label Image ---
             if "label" in paths_to_process:
                 try:
-                    image_label_pil = PIL.Image.open(paths_to_process["label"])
-                    image_label_np = np.array(image_label_pil)
-                    processed_label = preprocess_image_for_ocr(image_label_np)
-                    ocr_results = reader.readtext(
-                            processed_label, rotation_info=[0, 90, 270]
+                    img_label = Image.open(paths_to_process["label"]).convert("RGB")
+                    predictions = run_ocr([img_label], [["en"]], det_model, det_processor, rec_model, rec_processor)
+                    label_text = _extract_text_from_prediction(
+                        predictions, f"label for '{slide_id}'"
                     )
-                    # Concatenate all detected text fragments into a single string.
-                    label_text = " ".join([text for _, text, _ in ocr_results])
                 except UnidentifiedImageError:
                     logger.error(
                         f"Cannot identify/open label image (corrupted?): "
@@ -229,7 +213,7 @@ def perform_ocr_on_row(
                     )
                     img_macro = img_macro.crop(crop_box)
 
-                    predictions = rec_predictor([img_macro], lang_arg, det_predictor)
+                    predictions = run_ocr([img_macro], [["en"]], det_model, det_processor, rec_model, rec_processor)
                     macro_text = _extract_text_from_prediction(
                         predictions, f"macro for '{slide_id}'"
                     )
@@ -257,7 +241,7 @@ def perform_ocr_on_row(
     updated_row["label_text"] = label_text
     updated_row["macro_text"] = macro_text
     updated_row["ocr_qc_needed"] = ocr_qc_needed
-    
+
     return updated_row
 
 
@@ -269,7 +253,6 @@ def add_ocr_to_mapping(
     mapping_csv: Path,
     output_csv: Path,
     num_workers: int,
-    langs: list[str] | None,
 ):
     """
     Reads a mapping CSV, orchestrates Surya OCR for all rows using a thread pool,
@@ -279,21 +262,22 @@ def add_ocr_to_mapping(
         mapping_csv: Path to the input CSV file.
         output_csv: Path where the enriched output CSV will be saved.
         num_workers: The number of concurrent threads to use for OCR processing.
-        langs: Language list for OCR (e.g. ["en"]), or None for auto-detection.
     """
     if not mapping_csv.exists():
         logger.error(f"Input mapping CSV not found: {mapping_csv}")
         return
 
-    # --- Initialize Surya Predictors (once, shared across all workers) ---
+    # --- Initialize Surya models (once, shared across all workers) ---
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Torch device: {device}")
 
-    logger.info("Initializing Surya DetectionPredictor...")
-    det_predictor = DetectionPredictor()
-    logger.info("Initializing Surya RecognitionPredictor...")
-    rec_predictor = RecognitionPredictor()
-    logger.info("Surya predictors initialized successfully.")
+    logger.info("Loading Surya detection model...")
+    det_model = load_det_model()
+    det_processor = load_det_processor()
+    logger.info("Loading Surya recognition model...")
+    rec_model = load_rec_model()
+    rec_processor = load_rec_processor()
+    logger.info("Surya models loaded successfully.")
 
     # Read the entire CSV into a list of dictionaries.
     with open(mapping_csv, "r", encoding="utf-8") as f:
@@ -313,7 +297,7 @@ def add_ocr_to_mapping(
         future_to_row = {
             executor.submit(
                 perform_ocr_on_row, row, csv_dir,
-                det_predictor, rec_predictor, langs,
+                det_model, det_processor, rec_model, rec_processor,
             ): row
             for row in rows
         }
@@ -379,20 +363,9 @@ if __name__ == "__main__":
         help="Number of worker threads for parallel processing. "
              "Default is 1 to avoid GPU contention with Surya.",
     )
-    parser.add_argument(
-        "--langs",
-        nargs="*",
-        default=["en"],
-        help="Languages for OCR detection (e.g. 'en'). "
-             "Pass nothing to auto-detect.",
-    )
-
     args = parser.parse_args()
 
     # Ensure the directory for the output file exists.
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
 
-    # Resolve langs: if user passes --langs with no values, treat as None (auto-detect).
-    langs = args.langs if args.langs else None
-
-    add_ocr_to_mapping(args.mapping_csv, args.output_csv, args.workers, langs)
+    add_ocr_to_mapping(args.mapping_csv, args.output_csv, args.workers)

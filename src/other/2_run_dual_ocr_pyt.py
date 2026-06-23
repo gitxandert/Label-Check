@@ -5,7 +5,7 @@ extracted label and macro images) and enriches it by performing Optical Characte
 on these images.
 
 The script is designed to be robust and efficient:
-- It uses Surya OCR for text extraction, with GPU acceleration when available.
+- It uses Tesseract OCR for text extraction.
 - It handles file paths intelligently, resolving them relative to the input CSV's location.
 - Parallel processing is implemented using a thread pool to speed up the OCR task.
 - A progress bar provides real-time feedback on the processing status.
@@ -24,12 +24,11 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import torch
+import cv2
+import numpy as np
+import pytesseract
 from PIL import Image, UnidentifiedImageError
 from tqdm import tqdm
-
-from surya.recognition import RecognitionPredictor
-from surya.detection import DetectionPredictor
 
 
 # ==============================================================================
@@ -50,17 +49,20 @@ def clean_and_resolve_path(path_str: str) -> Path | None:
     """
     Cleans a potentially messy path string and resolves it to an absolute Path object.
 
-    Handles path inconsistencies such as different slash types or relative path prefixes.
+    This function is designed to handle path inconsistencies, such as different
+    slash types or relative path prefixes, making file access more reliable.
 
     Args:
-        path_str: The input path string, which might contain backslashes or './'.
+        path_str (str): The input path string, which might contain backslashes or './'.
 
     Returns:
-        A resolved, absolute Path object if the input string is not empty, otherwise None.
+        Path | None: A resolved, absolute Path object if the input string is not empty,
+                     otherwise None.
     """
     if not path_str:
         return None
 
+    # 1. Standardize path separators to forward slashes, which work across platforms.
     cleaned_str = path_str.replace("\\", "/")
 
     # 2. Create a Path object
@@ -70,62 +72,37 @@ def clean_and_resolve_path(path_str: str) -> Path | None:
     return Path(cleaned_str)
 
 
-def _extract_text_from_prediction(prediction_result, context: str) -> str:
+def preprocess_image_for_ocr(image_np: np.ndarray) -> np.ndarray:
+    """Convert to grayscale and apply Otsu's binarization to improve OCR accuracy."""
+    gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return binary
+
+
+def ocr_all_rotations(image_np: np.ndarray, lang: str) -> str:
     """
-    Safely extracts concatenated text from a Surya OCR prediction result.
-
-    This consolidates all the defensive checks needed when parsing Surya's output
-    into a single reusable function.
-
-    Args:
-        prediction_result: The raw return value from RecognitionPredictor.__call__.
-        context: A descriptive string (e.g. "label for patient X") used in log messages.
-
-    Returns:
-        The extracted text as a single string joined by spaces, or an error/status
-        sentinel string if extraction fails at any stage.
+    Run Tesseract OCR at 0°, 90°, 180°, and 270° rotations and return all
+    extracted text concatenated, mirroring EasyOCR's rotation_info behaviour.
     """
-    if prediction_result is None:
-        logger.warning(f"Predictor returned None for {context}.")
-        return ""
-
-    if not isinstance(prediction_result, list) or len(prediction_result) == 0:
-        logger.warning(
-            f"Predictor returned non-list or empty list for {context}. "
-            f"Value: {prediction_result}"
-        )
-        return ""
-
-    page_result = prediction_result[0]
-    if page_result is None:
-        logger.warning(f"Prediction result element [0] is None for {context}.")
-        return ""
-
-    if not hasattr(page_result, "text_lines"):
-        logger.warning(
-            f"Prediction object for {context} missing 'text_lines' attribute."
-        )
-        return ""
-
-    text_lines = page_result.text_lines
-    if not text_lines:  # Covers both None and empty list
-        logger.info(f"No text detected for {context}.")
-        return ""
-
-    # Extract text from each line object, guarding against malformed entries.
-    lines = [line.text for line in text_lines if hasattr(line, "text") and line.text]
-    return " ".join(lines)
+    rotations = [
+        cv2.ROTATE_90_CLOCKWISE,
+        cv2.ROTATE_180,
+        cv2.ROTATE_90_COUNTERCLOCKWISE,
+    ]
+    results = [pytesseract.image_to_string(image_np, lang=lang).strip()]
+    for rot in rotations:
+        rotated = cv2.rotate(image_np, rot)
+        results.append(pytesseract.image_to_string(rotated, lang=lang).strip())
+    return " ".join(r for r in results if r)
 
 
 def perform_ocr_on_row(
     row: dict,
     csv_dir: Path,
-    det_predictor: DetectionPredictor,
-    rec_predictor: RecognitionPredictor,
-    langs: list[str] | None,
+    langs: str = "eng",
 ) -> dict:
     """
-    Performs Surya OCR on the label and macro images for a single CSV row.
+    Performs Tesseract OCR on the label and macro images for a single CSV row.
 
     This function is designed to be executed in a separate thread. It handles path
     resolution, image loading, OCR execution, and error handling for one data entry.
@@ -133,9 +110,7 @@ def perform_ocr_on_row(
     Args:
         row: A dictionary representing one row from the input CSV.
         csv_dir: The parent directory of the input CSV file.
-        det_predictor: The initialized Surya DetectionPredictor instance.
-        rec_predictor: The initialized Surya RecognitionPredictor instance.
-        langs: Language list for OCR (e.g. ["en"]), or None for auto-detection.
+        langs: Language string for Tesseract OCR (e.g. 'eng').
 
     Returns:
         The original row dictionary updated with 'label_text', 'macro_text',
@@ -145,9 +120,6 @@ def perform_ocr_on_row(
     label_text = ""
     macro_text = ""
     ocr_qc_needed = False
-
-    # Prepare the language argument once — Surya expects a list-of-lists or None.
-    lang_arg = [langs] if langs else None
 
     # --- Resolve and Validate Image Paths ---
     label_path_str = row.get("label_path")
@@ -178,29 +150,21 @@ def perform_ocr_on_row(
                 f"for slide '{row.get('original_slide_path', 'unknown')}'"
             )
 
-    slide_id = row.get("original_slide_path", "unknown")
-
     # Also strip csv_dir from thumbnail_path for the flask app
     thumbnail_path = clean_and_resolve_path(row.get("thumbnail_path"))
-    if thumbnail_path and thumbnail_path.exists():
-        updated_row["thumbnail_path"] = thumbnail_path.relative_to(csv_dir)
-    else:
-        updated_row["thumbnail_path"] = ""
+    updated_row["thumbnail_path"] = thumbnail_path.relative_to(csv_dir)
 
-    # Proceed only if at least one image file was found.
+    slide_id = row.get("original_slide_path", "unknown")
+
     if paths_to_process:
         try:
             # --- Process Label Image ---
             if "label" in paths_to_process:
                 try:
-                    image_label_pil = PIL.Image.open(paths_to_process["label"])
-                    image_label_np = np.array(image_label_pil)
-                    processed_label = preprocess_image_for_ocr(image_label_np)
-                    ocr_results = reader.readtext(
-                            processed_label, rotation_info=[0, 90, 270]
-                    )
-                    # Concatenate all detected text fragments into a single string.
-                    label_text = " ".join([text for _, text, _ in ocr_results])
+                    img_label = Image.open(paths_to_process["label"]).convert("RGB")
+                    img_label_np = preprocess_image_for_ocr(np.array(img_label))
+                    label_text = pytesseract.image_to_string(img_label_np, lang=langs).strip()
+                    logger.info(f"Successfully ran OCR on label for '{slide_id}'")
                 except UnidentifiedImageError:
                     logger.error(
                         f"Cannot identify/open label image (corrupted?): "
@@ -229,10 +193,9 @@ def perform_ocr_on_row(
                     )
                     img_macro = img_macro.crop(crop_box)
 
-                    predictions = rec_predictor([img_macro], lang_arg, det_predictor)
-                    macro_text = _extract_text_from_prediction(
-                        predictions, f"macro for '{slide_id}'"
-                    )
+                    img_macro_np = preprocess_image_for_ocr(np.array(img_macro))
+                    macro_text = ocr_all_rotations(img_macro_np, lang=langs)
+                    logger.info(f"Successfully ran OCR on macro for '{slide_id}'")
                 except UnidentifiedImageError:
                     logger.error(
                         f"Cannot identify/open macro image (corrupted?): "
@@ -254,10 +217,11 @@ def perform_ocr_on_row(
             ocr_qc_needed = False
 
     # --- Update the row with OCR results ---
-    updated_row["label_text"] = label_text
-    updated_row["macro_text"] = macro_text
+    # To clean up newlines often introduced by Tesseract
+    updated_row["label_text"] = " ".join(label_text.splitlines()) if label_text else ""
+    updated_row["macro_text"] = " ".join(macro_text.splitlines()) if macro_text else ""
     updated_row["ocr_qc_needed"] = ocr_qc_needed
-    
+
     return updated_row
 
 
@@ -268,32 +232,22 @@ def perform_ocr_on_row(
 def add_ocr_to_mapping(
     mapping_csv: Path,
     output_csv: Path,
-    num_workers: int,
-    langs: list[str] | None,
+    num_workers: int = 4,
+    langs: str = "eng",
 ):
     """
-    Reads a mapping CSV, orchestrates Surya OCR for all rows using a thread pool,
+    Reads a mapping CSV, orchestrates Tesseract OCR for all rows using a thread pool,
     and writes the enriched data to a new CSV file.
 
     Args:
         mapping_csv: Path to the input CSV file.
         output_csv: Path where the enriched output CSV will be saved.
         num_workers: The number of concurrent threads to use for OCR processing.
-        langs: Language list for OCR (e.g. ["en"]), or None for auto-detection.
+        langs: Language string for OCR (e.g. 'eng').
     """
     if not mapping_csv.exists():
         logger.error(f"Input mapping CSV not found: {mapping_csv}")
         return
-
-    # --- Initialize Surya Predictors (once, shared across all workers) ---
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info(f"Torch device: {device}")
-
-    logger.info("Initializing Surya DetectionPredictor...")
-    det_predictor = DetectionPredictor()
-    logger.info("Initializing Surya RecognitionPredictor...")
-    rec_predictor = RecognitionPredictor()
-    logger.info("Surya predictors initialized successfully.")
 
     # Read the entire CSV into a list of dictionaries.
     with open(mapping_csv, "r", encoding="utf-8") as f:
@@ -312,14 +266,13 @@ def add_ocr_to_mapping(
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         future_to_row = {
             executor.submit(
-                perform_ocr_on_row, row, csv_dir,
-                det_predictor, rec_predictor, langs,
+                perform_ocr_on_row, row, csv_dir, langs
             ): row
             for row in rows
         }
 
         progress_bar = tqdm(
-            as_completed(future_to_row), total=len(rows), desc="Running Surya OCR"
+            as_completed(future_to_row), total=len(rows), desc="Running Tesseract OCR"
         )
         for future in progress_bar:
             try:
@@ -357,7 +310,7 @@ def add_ocr_to_mapping(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Enrich a slide mapping CSV with OCR text from label and macro "
-                    "images using Surya OCR."
+                    "images using Tesseract OCR."
     )
     parser.add_argument(
         "--mapping_csv",
@@ -375,16 +328,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--workers",
         type=int,
-        default=1,
+        default=4,
         help="Number of worker threads for parallel processing. "
-             "Default is 1 to avoid GPU contention with Surya.",
+             "Default is 4.",
     )
     parser.add_argument(
         "--langs",
-        nargs="*",
-        default=["en"],
-        help="Languages for OCR detection (e.g. 'en'). "
-             "Pass nothing to auto-detect.",
+        type=str,
+        default="eng",
+        help="Language for Tesseract OCR (e.g. 'eng').",
     )
 
     args = parser.parse_args()
@@ -392,7 +344,4 @@ if __name__ == "__main__":
     # Ensure the directory for the output file exists.
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
 
-    # Resolve langs: if user passes --langs with no values, treat as None (auto-detect).
-    langs = args.langs if args.langs else None
-
-    add_ocr_to_mapping(args.mapping_csv, args.output_csv, args.workers, langs)
+    add_ocr_to_mapping(args.mapping_csv, args.output_csv, args.workers, args.langs)

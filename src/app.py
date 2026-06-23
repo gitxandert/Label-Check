@@ -73,10 +73,10 @@ class Config:
 
     # The base directory where all data (images, CSV) is located.
     # Using absolute path ensures we can run the app from anywhere.
-    IMAGE_BASE_DIR = os.path.join(PROJECT_ROOT, "NP-22-data")
+    IMAGE_BASE_DIR = PROJECT_ROOT
 
     # The full path to the primary CSV file.
-    CSV_FILE_PATH = os.path.join(IMAGE_BASE_DIR, "ocr_processed_parsed.csv")
+    CSV_FILE_PATH = os.path.join(IMAGE_BASE_DIR, "enriched.csv")
     
     # Directory to store timestamped backups.
     BACKUP_DIR = os.path.join(BASE_DIR, "csv_backups")
@@ -387,7 +387,7 @@ class DataManager:
         self.data: List[Dict[str, Any]] = []
         self.headers: List[str] = []
         self._lock = threading.Lock() # Ensure thread safety for data access
-        self.critical_headers = ["AccessionID", "Stain", "ParsingQCPassed", "original_slide_location"]
+        self.critical_headers = ["AccessionID", "Stain", "ParsingQCPassed", "original_slide_path"]
 
     def load_data(self, file_path: str = Config.CSV_FILE_PATH) -> None:
         """Loads CSV data into memory safely."""
