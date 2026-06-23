@@ -7,4 +7,5 @@ opencv-python
 openslide-bin
 openslide-python
 pandas
+pytesseract
 tqdm
