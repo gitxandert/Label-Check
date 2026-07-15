@@ -5,9 +5,11 @@ extracted label and macro images) and enriches it by performing Optical Characte
 on these images.
 
 The script is designed to be robust and efficient:
-- It uses Surya OCR for text extraction, with GPU acceleration when available.
+- It uses EasyOCR for text extraction, with support for both GPU and CPU processing.
+- Image preprocessing techniques (grayscale, binarization) are applied to enhance OCR accuracy.
 - It handles file paths intelligently, resolving them relative to the input CSV's location.
-- Parallel processing is implemented using a thread pool to speed up the OCR task.
+- Parallel processing is implemented using a thread pool to significantly speed up the OCR
+  task on multiple files.
 - A progress bar provides real-time feedback on the processing status.
 
 The output is a new, enriched CSV file containing all the original data plus new columns for the
@@ -24,18 +26,20 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import torch
-from PIL import Image, UnidentifiedImageError
-from tqdm import tqdm
-
-from surya.recognition import RecognitionPredictor
-from surya.detection import DetectionPredictor
+# Third-party libraries for image processing and OCR
+import cv2  # OpenCV for image manipulation
+import easyocr  # The core OCR engine
+import numpy as np  # For numerical operations on images
+import PIL  # Python Imaging Library (Pillow) for opening images
+from tqdm import tqdm  # For displaying a progress bar
 
 
 # ==============================================================================
 # 2. CONFIGURATION
 # ==============================================================================
 
+# Set up a logger for informative console output.
+# The format includes timestamp, log level, and the message.
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
@@ -50,17 +54,20 @@ def clean_and_resolve_path(path_str: str) -> Path | None:
     """
     Cleans a potentially messy path string and resolves it to an absolute Path object.
 
-    Handles path inconsistencies such as different slash types or relative path prefixes.
+    This function is designed to handle path inconsistencies, such as different
+    slash types or relative path prefixes, making file access more reliable.
 
     Args:
-        path_str: The input path string, which might contain backslashes or './'.
+        path_str (str): The input path string, which might contain backslashes or './'.
 
     Returns:
-        A resolved, absolute Path object if the input string is not empty, otherwise None.
+        Path | None: A resolved, absolute Path object if the input string is not empty,
+                     otherwise None.
     """
     if not path_str:
         return None
 
+    # 1. Standardize path separators to forward slashes, which work across platforms.
     cleaned_str = path_str.replace("\\", "/")
 
     # 2. Create a Path object
@@ -70,90 +77,68 @@ def clean_and_resolve_path(path_str: str) -> Path | None:
     return Path(cleaned_str)
 
 
-def _extract_text_from_prediction(prediction_result, context: str) -> str:
+def preprocess_image_for_ocr(image_np: np.ndarray) -> np.ndarray:
     """
-    Safely extracts concatenated text from a Surya OCR prediction result.
+    Applies a series of image processing techniques to an image to improve OCR accuracy.
 
-    This consolidates all the defensive checks needed when parsing Surya's output
-    into a single reusable function.
+    The steps are:
+    1. Convert the image to grayscale.
+    2. Apply Otsu's binarization to create a high-contrast black and white image.
+    3. Convert the binarized image back to a 3-channel format required by EasyOCR.
 
     Args:
-        prediction_result: The raw return value from RecognitionPredictor.__call__.
-        context: A descriptive string (e.g. "label for patient X") used in log messages.
+        image_np (np.ndarray): The input image as a NumPy array in RGB format.
 
     Returns:
-        The extracted text as a single string joined by spaces, or an error/status
-        sentinel string if extraction fails at any stage.
+        np.ndarray: The preprocessed 3-channel image ready for OCR.
     """
-    if prediction_result is None:
-        logger.warning(f"Predictor returned None for {context}.")
-        return ""
+    # OpenCV works with BGR color order by default, while PIL (used for opening) uses RGB.
+    # We must convert from the RGB NumPy array to grayscale.
+    gray_image = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
 
-    if not isinstance(prediction_result, list) or len(prediction_result) == 0:
-        logger.warning(
-            f"Predictor returned non-list or empty list for {context}. "
-            f"Value: {prediction_result}"
-        )
-        return ""
+    # Apply binarization. Otsu's method is effective because it automatically calculates
+    # the optimal threshold value to separate text from the background, adapting to
+    # different lighting conditions in the images.
+    _, binary_image = cv2.threshold(
+        gray_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
 
-    page_result = prediction_result[0]
-    if page_result is None:
-        logger.warning(f"Prediction result element [0] is None for {context}.")
-        return ""
-
-    if not hasattr(page_result, "text_lines"):
-        logger.warning(
-            f"Prediction object for {context} missing 'text_lines' attribute."
-        )
-        return ""
-
-    text_lines = page_result.text_lines
-    if not text_lines:  # Covers both None and empty list
-        logger.info(f"No text detected for {context}.")
-        return ""
-
-    # Extract text from each line object, guarding against malformed entries.
-    lines = [line.text for line in text_lines if hasattr(line, "text") and line.text]
-    return " ".join(lines)
+    # EasyOCR expects a 3-channel (RGB-like) image, even if it's grayscale.
+    # We convert the single-channel binary image back to a 3-channel representation.
+    three_channel_image = cv2.cvtColor(binary_image, cv2.COLOR_GRAY2RGB)
+    return three_channel_image
 
 
-def perform_ocr_on_row(
-    row: dict,
-    csv_dir: Path,
-    det_predictor: DetectionPredictor,
-    rec_predictor: RecognitionPredictor,
-    langs: list[str] | None,
-) -> dict:
+def perform_ocr_on_row(row: dict, csv_dir: Path, reader: easyocr.Reader) -> dict:
     """
-    Performs Surya OCR on the label and macro images for a single CSV row.
+    A worker function that performs OCR on the label and macro images for a single CSV row.
 
-    This function is designed to be executed in a separate thread. It handles path
-    resolution, image loading, OCR execution, and error handling for one data entry.
+    This function is designed to be executed in a separate thread. It handles path resolution,
+    image loading, preprocessing, OCR execution, and error handling for one data entry.
 
     Args:
-        row: A dictionary representing one row from the input CSV.
-        csv_dir: The parent directory of the input CSV file.
-        det_predictor: The initialized Surya DetectionPredictor instance.
-        rec_predictor: The initialized Surya RecognitionPredictor instance.
-        langs: Language list for OCR (e.g. ["en"]), or None for auto-detection.
+        row (dict): A dictionary representing one row from the input CSV.
+        csv_dir (Path): The parent directory of the input CSV file. This is not used
+                      in the current implementation with `clean_and_resolve_path`
+                      but is kept for potential future use with purely relative paths.
+        reader (easyocr.Reader): The initialized EasyOCR reader instance, shared across threads.
 
     Returns:
-        The original row dictionary updated with 'label_text', 'macro_text',
-        and 'ocr_qc_needed' fields.
+        dict: The original row dictionary, updated with 'label_text', 'macro_text',
+              and 'ocr_qc_needed' fields.
     """
     updated_row = row.copy()
     label_text = ""
     macro_text = ""
+    # This flag indicates whether OCR was successfully performed. It's used later
+    # to know if a row's data might need manual verification.
     ocr_qc_needed = False
 
-    # Prepare the language argument once — Surya expects a list-of-lists or None.
-    lang_arg = [langs] if langs else None
-
-    # --- Resolve and Validate Image Paths ---
+    # --- Step 1: Resolve and Validate Image Paths ---
     label_path_str = row.get("label_path")
     macro_path_str = row.get("macro_path")
 
-    paths_to_process: dict[str, Path] = {}
+    paths_to_process = {}
     if label_path_str:
         label_path = clean_and_resolve_path(label_path_str)
         if label_path and label_path.exists():
@@ -161,10 +146,7 @@ def perform_ocr_on_row(
             # Strip csv_dir from label_path for the flask app
             updated_row["label_path"] = label_path.relative_to(csv_dir)
         else:
-            logger.warning(
-                f"Label image not found at resolved path '{label_path}' "
-                f"for slide '{row.get('original_slide_path', 'unknown')}'"
-            )
+            logger.warning(f"Label image not found at resolved path '{label_path}' for row: {row}")
 
     if macro_path_str:
         macro_path = clean_and_resolve_path(macro_path_str)
@@ -173,87 +155,61 @@ def perform_ocr_on_row(
             # Strip csv_dir from macro_path for the flask app
             updated_row["macro_path"] = macro_path.relative_to(csv_dir)
         else:
-            logger.warning(
-                f"Macro image not found at resolved path '{macro_path}' "
-                f"for slide '{row.get('original_slide_path', 'unknown')}'"
-            )
-
-    slide_id = row.get("original_slide_path", "unknown")
+            logger.warning(f"Macro image not found at resolved path '{macro_path}' for row: {row}")
 
     # Also strip csv_dir from thumbnail_path for the flask app
     thumbnail_path = clean_and_resolve_path(row.get("thumbnail_path"))
-    if thumbnail_path and thumbnail_path.exists():
-        updated_row["thumbnail_path"] = thumbnail_path.relative_to(csv_dir)
-    else:
-        updated_row["thumbnail_path"] = ""
+    updated_row["thumbnail_path"] = thumbnail_path.relative_to(csv_dir)
 
     # Proceed only if at least one image file was found.
     if paths_to_process:
         try:
-            # --- Process Label Image ---
+            # --- Step 2: Process Label Image (if it exists) ---
             if "label" in paths_to_process:
-                try:
-                    image_label_pil = PIL.Image.open(paths_to_process["label"])
-                    image_label_np = np.array(image_label_pil)
-                    processed_label = preprocess_image_for_ocr(image_label_np)
-                    ocr_results = reader.readtext(
-                            processed_label, rotation_info=[0, 90, 270]
-                    )
-                    # Concatenate all detected text fragments into a single string.
-                    label_text = " ".join([text for _, text, _ in ocr_results])
-                except UnidentifiedImageError:
-                    logger.error(
-                        f"Cannot identify/open label image (corrupted?): "
-                        f"{paths_to_process['label']}"
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Failed OCR on label for '{slide_id}': "
-                        f"{type(e).__name__}: {e}"
-                    )
+                image_label_pil = PIL.Image.open(paths_to_process["label"])
+                image_label_np = np.array(image_label_pil)
+                processed_label = preprocess_image_for_ocr(image_label_np)
+                ocr_results = reader.readtext(
+                        processed_label, rotation_info=[0, 90, 270]
+                )
+                # Concatenate all detected text fragments into a single string.
+                label_text = " ".join([text for _, text, _ in ocr_results])
 
-            # --- Process Macro Image ---
+            # --- Step 3: Process Macro Image (if it exists) ---
             if "macro" in paths_to_process:
-                try:
-                    img_macro = Image.open(paths_to_process["macro"]).convert("RGB")
+                image_macro_pil = PIL.Image.open(paths_to_process["macro"])
+                
+                # --- Apply specific transformations for macro images ---
+                # The text on macro images is often sideways. Rotating it helps the OCR engine.
+                img_macro_pil = image_macro_pil.rotate(-90, expand=True)
+                width, height = img_macro_pil.size
+                # Crop the image to focus on the area most likely to contain text,
+                # removing irrelevant parts of the slide.
+                crop_box = (
+                    (0, 0, width / 2, height)
+                    if width > height
+                    else (0, 0, width, height / 2)
+                )
+                img_macro_pil = img_macro_pil.crop(crop_box)
 
-                    # Rotate 90° clockwise — text on macro images is often sideways.
-                    img_macro = img_macro.rotate(-90, expand=True)
+                image_macro_np = np.array(img_macro_pil)
+                processed_macro = preprocess_image_for_ocr(image_macro_np)
+                # Inform EasyOCR to check for text at multiple rotations.
+                ocr_results = reader.readtext(
+                    processed_macro, rotation_info=[0, 90, 180, 270]
+                )
+                macro_text = " ".join([text for _, text, _ in ocr_results])
 
-                    # Crop to the half most likely to contain text.
-                    width, height = img_macro.size
-                    crop_box = (
-                        (0, 0, width // 2, height)
-                        if width > height
-                        else (0, 0, width, height // 2)
-                    )
-                    img_macro = img_macro.crop(crop_box)
-
-                    predictions = rec_predictor([img_macro], lang_arg, det_predictor)
-                    macro_text = _extract_text_from_prediction(
-                        predictions, f"macro for '{slide_id}'"
-                    )
-                except UnidentifiedImageError:
-                    logger.error(
-                        f"Cannot identify/open macro image (corrupted?): "
-                        f"{paths_to_process['macro']}"
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Failed OCR on macro for '{slide_id}': "
-                        f"{type(e).__name__}: {e}"
-                    )
-
-            # If we got here without a top-level crash, mark the row as processed.
+            # If the process completes without errors for at least one image, mark it.
             ocr_qc_needed = True
 
         except Exception as e:
-            logger.error(
-                f"Unexpected failure processing row for slide '{slide_id}': {e}"
-            )
+            # If any error occurs (e.g., corrupted image), log it but don't crash.
+            # The row will be written to the output CSV without OCR data.
+            logger.error(f"Failed OCR on row for slide '{row.get('original_slide_path')}': {e}")
             ocr_qc_needed = False
 
-    # --- Update the row with OCR results ---
+    # --- Step 4: Update the row with OCR results ---
     updated_row["label_text"] = label_text
     updated_row["macro_text"] = macro_text
     updated_row["ocr_qc_needed"] = ocr_qc_needed
@@ -266,34 +222,26 @@ def perform_ocr_on_row(
 # ==============================================================================
 
 def add_ocr_to_mapping(
-    mapping_csv: Path,
-    output_csv: Path,
-    num_workers: int,
-    langs: list[str] | None,
+    mapping_csv: Path, output_csv: Path, use_cpu: bool, num_workers: int
 ):
     """
-    Reads a mapping CSV, orchestrates Surya OCR for all rows using a thread pool,
+    Reads a mapping CSV, orchestrates the OCR process for all rows using a thread pool,
     and writes the enriched data to a new CSV file.
 
     Args:
-        mapping_csv: Path to the input CSV file.
-        output_csv: Path where the enriched output CSV will be saved.
-        num_workers: The number of concurrent threads to use for OCR processing.
-        langs: Language list for OCR (e.g. ["en"]), or None for auto-detection.
+        mapping_csv (Path): Path to the input CSV file.
+        output_csv (Path): Path where the enriched output CSV will be saved.
+        use_cpu (bool): If True, forces EasyOCR to use the CPU. Otherwise, it will try to use a GPU.
+        num_workers (int): The number of concurrent threads to use for OCR processing.
     """
     if not mapping_csv.exists():
         logger.error(f"Input mapping CSV not found: {mapping_csv}")
         return
 
-    # --- Initialize Surya Predictors (once, shared across all workers) ---
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info(f"Torch device: {device}")
-
-    logger.info("Initializing Surya DetectionPredictor...")
-    det_predictor = DetectionPredictor()
-    logger.info("Initializing Surya RecognitionPredictor...")
-    rec_predictor = RecognitionPredictor()
-    logger.info("Surya predictors initialized successfully.")
+    logger.info("Initializing EasyOCR reader... (This may take a moment)")
+    # Initialize the OCR reader once and share it among all threads.
+    # GPU is generally much faster if available.
+    reader = easyocr.Reader(["en"], gpu=not use_cpu)
 
     # Read the entire CSV into a list of dictionaries.
     with open(mapping_csv, "r", encoding="utf-8") as f:
@@ -304,39 +252,35 @@ def add_ocr_to_mapping(
         logger.warning("Input CSV is empty. Nothing to process.")
         return
 
-    logger.info(f"Loaded {len(rows)} rows from '{mapping_csv}'.")
-
-    updated_rows: list[dict] = []
+    updated_rows = []
+    # This is not strictly necessary with the current path resolution but is good practice.
     csv_dir = mapping_csv.parent
 
+    # Use a ThreadPoolExecutor to manage a pool of worker threads.
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        # Submit an OCR task for each row in the CSV. This returns a 'future' object
+        # for each task, which represents a pending result.
         future_to_row = {
-            executor.submit(
-                perform_ocr_on_row, row, csv_dir,
-                det_predictor, rec_predictor, langs,
-            ): row
+            executor.submit(perform_ocr_on_row, row, csv_dir, reader): row
             for row in rows
         }
 
+        # Use tqdm to create a progress bar. as_completed yields futures as they finish,
+        # which allows for real-time progress updates.
         progress_bar = tqdm(
-            as_completed(future_to_row), total=len(rows), desc="Running Surya OCR"
+            as_completed(future_to_row), total=len(rows), desc="Running OCR"
         )
         for future in progress_bar:
-            try:
-                updated_rows.append(future.result())
-            except Exception as e:
-                # Log but don't crash — the row will simply be missing from output.
-                original_row = future_to_row[future]
-                logger.error(
-                    f"Worker thread crashed for slide "
-                    f"'{original_row.get('original_slide_path', 'unknown')}': {e}"
-                )
+            # Retrieve the result (the updated row dictionary) from the completed future.
+            updated_rows.append(future.result())
 
     if not updated_rows:
         logger.error("Processing failed catastrophically. No rows were updated.")
         return
 
     # --- Write the updated data to the new CSV file ---
+    # Dynamically determine the headers from the first processed row. This ensures
+    # that the new OCR-related columns are included.
     headers = list(updated_rows[0].keys())
 
     logger.info(f"Writing {len(updated_rows)} enriched rows to {output_csv}...")
@@ -355,16 +299,15 @@ def add_ocr_to_mapping(
 # ==============================================================================
 
 if __name__ == "__main__":
+    # Set up the command-line argument parser to make the script configurable.
     parser = argparse.ArgumentParser(
-        description="Enrich a slide mapping CSV with OCR text from label and macro "
-                    "images using Surya OCR."
+        description="Enrich a slide mapping CSV with OCR text from label and macro images."
     )
     parser.add_argument(
         "--mapping_csv",
         type=Path,
         required=True,
-        help="Path to the input CSV file generated by the first script "
-             "(e.g., slide_mapping.csv).",
+        help="Path to the input CSV file generated by the first script (e.g., slide_mapping.csv).",
     )
     parser.add_argument(
         "--output_csv",
@@ -375,24 +318,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--workers",
         type=int,
-        default=1,
-        help="Number of worker threads for parallel processing. "
-             "Default is 1 to avoid GPU contention with Surya.",
+        default=4,
+        help="Number of worker threads for parallel processing.",
     )
     parser.add_argument(
-        "--langs",
-        nargs="*",
-        default=["en"],
-        help="Languages for OCR detection (e.g. 'en'). "
-             "Pass nothing to auto-detect.",
+        "--use-cpu",
+        action="store_true",
+        help="Force EasyOCR to use CPU instead of GPU. Use this if you don't have a compatible GPU.",
     )
 
     args = parser.parse_args()
 
-    # Ensure the directory for the output file exists.
+    # Ensure the directory for the output file exists before trying to write to it.
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
 
-    # Resolve langs: if user passes --langs with no values, treat as None (auto-detect).
-    langs = args.langs if args.langs else None
-
-    add_ocr_to_mapping(args.mapping_csv, args.output_csv, args.workers, langs)
+    # Call the main function with the parsed command-line arguments.
+    add_ocr_to_mapping(args.mapping_csv, args.output_csv, args.use_cpu, args.workers)
