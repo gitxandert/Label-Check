@@ -93,6 +93,10 @@ for scanner_dir in label_check_batches.iterdir():
         slide_count = sum(1 for item in label_dir.iterdir() if item.is_file())
         print(f"\x1b[32mSUCCESS\x1b[0m: Processed {slide_count} slides in {output_folder}\n")
         slides_checked += slide_count
+        if batches_created == "":
+            batches_created = dir_date
+        else:
+            batches_created += f";{dir_date}"
         
     new_log_row = pd.DataFrame({
         'datetime_of_run': [datetime_of_run],
