@@ -89,23 +89,26 @@ if __name__ == "__main__":
             description="Pipeline for the separate modules inside of Label-Check. Streamlines the process to QC and handles argument passing between modules."
     )
     parser.add_argument(
-            "--input_dir", required=True, help="Input directory of images to be processed"
+            "--input-dir", required=True, help="Input directory of images to be processed"
     )
     parser.add_argument(
-            "--output_dir", required=True, help="Output directory to place macros, labels, and thumbnails and wherein to conduct QC"
+            "--output-dir", required=True, help="Output directory to place macros, labels, and thumbnails and wherein to conduct QC"
     )
     parser.add_argument(
-            "--start_from", required=False, help="Stage of the pipeline to start from (1/macro, 2/ocr, 3/name, app)", choices=['1', 'macro', '2', 'ocr', '3', 'name', 'app']
+            "--start-from", required=False, help="Stage of the pipeline to start from (1/macro, 2/ocr, 3/name, app)", choices=['1', 'macro', '2', 'ocr', '3', 'name', 'app']
     )
     parser.add_argument(
-            "--input_mode", required=False, help="Stage 1 input mode (auto/slides/images)", choices=['auto', 'slides', 'images']
+            "--end-at", required=False, help="Stage of the pipeline to end at (1/macro, 2/ocr, 3/name, app)", choices=['1', 'macro', '2', 'ocr', '3', 'name', 'app']
     )
-    # create a config file for all of the other arguments, but these two must be provided at runtime
+    parser.add_argument(
+            "--input-mode", required=False, help="Stage 1 input mode (auto/slides/images)", choices=['auto', 'slides', 'images']
+    )
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
     start_from = args.start_from
+    end_at = args.end_at
     input_mode = args.input_mode
    
     if start_from in [None, '1', 'macro']:
@@ -130,6 +133,10 @@ if __name__ == "__main__":
             parse_except(e)
             sys.exit(1)
 
+    if end_at in ['1', 'macro']:
+        print("\n\x1b[1mEnding at 1_get_macro.py\x1b[0m")
+        sys.exit(0)
+
     mapping_csv = output_dir / "slide_mapping.csv"
     ocr_csv = output_dir / "ocr.csv"
 
@@ -152,6 +159,10 @@ if __name__ == "__main__":
             parse_except(e)
             sys.exit(1)
 
+    if end_at in ['2', 'ocr']:
+        print("\n\x1b[1mEnding at 2_run_dual_ocr.py\x1b[0m")
+        sys.exit(0)
+        
     enriched_csv = output_dir / "enriched.csv"
 
     if start_from != 'app':
@@ -171,6 +182,10 @@ if __name__ == "__main__":
             )
         except Exception as e:
             parse_except(e)
+            
+    if end_at in ['3', 'name']:
+        print("\n\x1b[1mEnding at 3_name-files.py\x1b[0m")
+        sys.exit(0)
 
     output_src = output_dir / "src"
     output_app = output_src / "app.py"
