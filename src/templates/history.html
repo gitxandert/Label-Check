@@ -172,7 +172,7 @@
                         <tr>
                             <td>{{ item.accession_id }}</td>
                             <td>{{ item.completed_at.strftime('%Y-%m-%d %H:%M:%S') }} UTC</td>
-                            <td><a href="{{ url_for('index', index=item.original_index) }}">View</a></td>
+                            <td><a href="{{ url_for('qc', index=item.original_index) }}">View</a></td>
                         </tr>
                     {% endfor %}
                 </tbody>
