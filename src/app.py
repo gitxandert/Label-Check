@@ -21,10 +21,14 @@ The application features:
 # ==============================================================================
 import csv
 import datetime
+import hashlib
 import logging
 import os
+import re
 import shutil
+import stat
 import sys
+import tempfile
 import threading
 from collections import Counter, defaultdict
 from logging.handlers import RotatingFileHandler
@@ -53,6 +57,8 @@ from flask_login import (
     logout_user,
 )
 from werkzeug.security import check_password_hash, generate_password_hash
+from openpyxl import load_workbook
+from openpyxl.worksheet.worksheet import Worksheet
 
 # ==============================================================================
 # 2. CONFIGURATION
@@ -87,6 +93,12 @@ class Config:
     # CSV persistence files
     USERS_CSV_PATH = os.path.join(INSTANCE_DIR, "users.csv")
     QUEUE_CSV_PATH = os.path.join(INSTANCE_DIR, "queue.csv")
+
+    # Slide Digitization Log workbook configuration.
+    SDL_FILE_PATH = os.path.join(BASE_DIR, "logs", "Slide_Digitization_Log.xlsx")
+    SDL_SHEET_NAME = "general"
+    SDL_ORGANS = ("BRAIN", "BREAST", "TESTES", "CYTO")
+    SDL_SCANNERS = ("RSCH1 (SS12797)", "CLIN1 (SS12602)")
 
     # Default password for the initial 'admin' user.
     ADMIN_DEFAULT_PASSWORD = os.environ.get(
@@ -157,6 +169,12 @@ class DataSaveError(Exception):
     pass
 
 class BackupError(Exception):
+    pass
+
+class SDLWorkbookError(Exception):
+    pass
+
+class SDLValidationError(Exception):
     pass
 
 
@@ -639,11 +657,331 @@ def flash_messages() -> List[Dict[str, str]]:
 
 
 # ==============================================================================
+# SLIDE DIGITIZATION LOG HELPERS
+# ==============================================================================
+SDL_HEADERS = (
+    "Accession ID",
+    "Organ",
+    "Type",
+    "Slides Count",
+    "Scanner",
+    "Carousel Rack",
+    "Date Loaded",
+    "Time Loaded",
+    "Date Unloaded",
+    "Time Unloaded",
+    "Pulled from Server",
+    "Ran Label-Check",
+    "Finished QC",
+    "Collected CoPath Data",
+    "Renamed",
+    "Pushed to SFTP Server",
+    "Notes",
+)
+
+SDL_STATUS_HEADERS = (
+    "Pulled from Server",
+    "Ran Label-Check",
+    "Finished QC",
+    "Collected CoPath Data",
+    "Renamed",
+    "Pushed to SFTP Server",
+)
+
+SDL_FORM_FIELDS = {
+    "Accession ID": "accession_id",
+    "Organ": "organ",
+    "Type": "type",
+    "Slides Count": "slides_count",
+    "Scanner": "scanner",
+    "Carousel Rack": "carousel_rack",
+    "Date Loaded": "date_loaded",
+    "Time Loaded": "time_loaded",
+    "Date Unloaded": "date_unloaded",
+    "Time Unloaded": "time_unloaded",
+    "Notes": "notes",
+}
+
+_sdl_workbook_lock = threading.Lock()
+_accession_pattern = re.compile(r"^[A-Z]{1,3}[0-9]{2}-[0-9]+$")
+_rack_pattern = re.compile(r"^[0-9]+(?:\s*,\s*[0-9]+)*$")
+_time_pattern = re.compile(r"^[0-9]{2}:[0-9]{2}$")
+
+
+def _save_sdl_workbook(workbook) -> None:
+    """Atomically replaces the SDL workbook with the supplied workbook."""
+    workbook_path = Config.SDL_FILE_PATH
+    workbook_dir = os.path.dirname(workbook_path)
+    file_mode = stat.S_IMODE(os.stat(workbook_path).st_mode)
+    file_descriptor, temporary_path = tempfile.mkstemp(
+        prefix=".Slide_Digitization_Log.", suffix=".xlsx", dir=workbook_dir
+    )
+    os.close(file_descriptor)
+    try:
+        workbook.save(temporary_path)
+        os.chmod(temporary_path, file_mode)
+        os.replace(temporary_path, workbook_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+
+
+def _load_sdl_workbook():
+    """Loads and validates the configured SDL workbook and worksheet."""
+    workbook_path = Config.SDL_FILE_PATH
+    if not os.path.isfile(workbook_path):
+        raise SDLWorkbookError(
+            f"Slide Digitization Log not found at {workbook_path}."
+        )
+
+    try:
+        workbook = load_workbook(workbook_path)
+    except Exception as exc:
+        raise SDLWorkbookError(f"The Slide Digitization Log could not be opened: {exc}") from exc
+
+    if Config.SDL_SHEET_NAME not in workbook.sheetnames:
+        workbook.close()
+        raise SDLWorkbookError(
+            f"The workbook must contain a worksheet named '{Config.SDL_SHEET_NAME}'."
+        )
+
+    worksheet = workbook[Config.SDL_SHEET_NAME]
+    has_any_value = any(
+        cell.value is not None
+        for row in worksheet.iter_rows()
+        for cell in row
+    )
+    initialized_headers = False
+    if not has_any_value:
+        worksheet.append(SDL_HEADERS)
+        initialized_headers = True
+    else:
+        actual_headers = tuple(
+            str(worksheet.cell(row=1, column=column).value).strip()
+            if worksheet.cell(row=1, column=column).value is not None
+            else ""
+            for column in range(1, len(SDL_HEADERS) + 1)
+        )
+        extra_headers = [
+            worksheet.cell(row=1, column=column).value
+            for column in range(len(SDL_HEADERS) + 1, worksheet.max_column + 1)
+            if worksheet.cell(row=1, column=column).value is not None
+        ]
+        if actual_headers != SDL_HEADERS or extra_headers:
+            workbook.close()
+            raise SDLWorkbookError(
+                "The SDL worksheet headers do not match the required schema."
+            )
+
+    return workbook, worksheet, initialized_headers
+
+
+def _coerce_sdl_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "yes", "y", "1"}
+    return False
+
+
+def _format_sdl_value(header: str, value: Any) -> str:
+    if value is None:
+        return ""
+    if header.startswith("Date ") and isinstance(value, (datetime.datetime, datetime.date)):
+        return value.strftime("%Y-%m-%d")
+    if header.startswith("Time ") and isinstance(value, (datetime.datetime, datetime.time)):
+        return value.strftime("%H:%M")
+    return str(value)
+
+
+def _sdl_row_signature(worksheet: Worksheet, row_number: int) -> str:
+    values = tuple(
+        worksheet.cell(row=row_number, column=column).value
+        for column in range(1, len(SDL_HEADERS) + 1)
+    )
+    return hashlib.sha256(repr(values).encode("utf-8")).hexdigest()
+
+
+def _read_sdl_rows(worksheet: Worksheet) -> List[Dict[str, Any]]:
+    rows = []
+    for row_number in range(2, worksheet.max_row + 1):
+        raw_values = {
+            header: worksheet.cell(row=row_number, column=column).value
+            for column, header in enumerate(SDL_HEADERS, start=1)
+        }
+        if all(value is None for value in raw_values.values()):
+            continue
+        rows.append(
+            {
+                "worksheet_row": row_number,
+                "values": {
+                    header: _format_sdl_value(header, value)
+                    for header, value in raw_values.items()
+                },
+                "statuses": {
+                    header: _coerce_sdl_bool(raw_values[header])
+                    for header in SDL_STATUS_HEADERS
+                },
+                "signature": _sdl_row_signature(worksheet, row_number),
+            }
+        )
+    return rows
+
+
+def _submitted_sdl_form() -> Dict[str, str]:
+    return {
+        header: request.form.get(field_name, "").strip()
+        for header, field_name in SDL_FORM_FIELDS.items()
+    }
+
+
+def _validate_sdl_form(values: Dict[str, str]) -> Dict[str, Any]:
+    accession_id = values["Accession ID"]
+    if not _accession_pattern.fullmatch(accession_id):
+        raise SDLValidationError(
+            "Accession ID must match the format A12-123 (1-3 uppercase letters, "
+            "2 digits, a hyphen, and one or more digits)."
+        )
+    if values["Organ"] not in Config.SDL_ORGANS:
+        raise SDLValidationError("Select a valid Organ.")
+    if not values["Type"]:
+        raise SDLValidationError("Type is required.")
+    try:
+        slides_count = int(values["Slides Count"])
+    except ValueError as exc:
+        raise SDLValidationError("Slides Count must be an integer.") from exc
+    if slides_count < 1:
+        raise SDLValidationError("Slides Count must be at least 1.")
+    if values["Scanner"] not in Config.SDL_SCANNERS:
+        raise SDLValidationError("Select a valid Scanner.")
+
+    carousel_rack = values["Carousel Rack"]
+    if not _rack_pattern.fullmatch(carousel_rack):
+        raise SDLValidationError(
+            "Carousel Rack must contain positive integers separated by commas."
+        )
+    rack_numbers = [int(value.strip()) for value in carousel_rack.split(",")]
+    if any(value < 1 for value in rack_numbers):
+        raise SDLValidationError("Carousel Rack numbers must be at least 1.")
+
+    try:
+        date_loaded = datetime.date.fromisoformat(values["Date Loaded"])
+    except ValueError as exc:
+        raise SDLValidationError("Date Loaded must use YYYY-MM-DD format.") from exc
+    if not _time_pattern.fullmatch(values["Time Loaded"]):
+        raise SDLValidationError("Time Loaded must use HH:MM 24-hour format.")
+    try:
+        time_loaded = datetime.time.fromisoformat(values["Time Loaded"])
+    except ValueError as exc:
+        raise SDLValidationError("Time Loaded must be a valid 24-hour time.") from exc
+
+    date_unloaded_value = values["Date Unloaded"]
+    time_unloaded_value = values["Time Unloaded"]
+    if bool(date_unloaded_value) != bool(time_unloaded_value):
+        raise SDLValidationError(
+            "Date Unloaded and Time Unloaded must either both be supplied or both be blank."
+        )
+    date_unloaded = None
+    time_unloaded = None
+    if date_unloaded_value:
+        try:
+            date_unloaded = datetime.date.fromisoformat(date_unloaded_value)
+        except ValueError as exc:
+            raise SDLValidationError("Date Unloaded must use YYYY-MM-DD format.") from exc
+        if not _time_pattern.fullmatch(time_unloaded_value):
+            raise SDLValidationError("Time Unloaded must use HH:MM 24-hour format.")
+        try:
+            time_unloaded = datetime.time.fromisoformat(time_unloaded_value)
+        except ValueError as exc:
+            raise SDLValidationError("Time Unloaded must be a valid 24-hour time.") from exc
+        if datetime.datetime.combine(date_unloaded, time_unloaded) < datetime.datetime.combine(
+            date_loaded, time_loaded
+        ):
+            raise SDLValidationError("The unloaded timestamp cannot precede the loaded timestamp.")
+
+    return {
+        "Accession ID": accession_id,
+        "Organ": values["Organ"],
+        "Type": values["Type"],
+        "Slides Count": slides_count,
+        "Scanner": values["Scanner"],
+        "Carousel Rack": ", ".join(str(value) for value in rack_numbers),
+        "Date Loaded": date_loaded,
+        "Time Loaded": time_loaded,
+        "Date Unloaded": date_unloaded,
+        "Time Unloaded": time_unloaded,
+        "Notes": values["Notes"],
+    }
+
+
+def _render_sdl_page(
+    form_values: Optional[Dict[str, str]] = None,
+    edit_row: Optional[int] = None,
+    edit_signature: str = "",
+):
+    workbook = None
+    try:
+        with _sdl_workbook_lock:
+            workbook, worksheet, initialized_headers = _load_sdl_workbook()
+            if initialized_headers:
+                _save_sdl_workbook(workbook)
+            rows = _read_sdl_rows(worksheet)
+    except SDLWorkbookError as exc:
+        return render_template(
+            "sdl.html",
+            workbook_available=False,
+            workbook_error=str(exc),
+            messages=flash_messages(),
+        )
+    except Exception as exc:
+        app.logger.exception("Unexpected error while reading the SDL workbook")
+        return render_template(
+            "sdl.html",
+            workbook_available=False,
+            workbook_error=f"The Slide Digitization Log could not be read: {exc}",
+            messages=flash_messages(),
+        )
+    finally:
+        if workbook is not None:
+            workbook.close()
+
+    if edit_row is not None and form_values is None:
+        selected_row = next(
+            (row for row in rows if row["worksheet_row"] == edit_row), None
+        )
+        if selected_row is None:
+            flash("The selected SDL row no longer exists.", "error")
+            return redirect(url_for("sdl"))
+        form_values = {
+            header: selected_row["values"][header]
+            for header in SDL_FORM_FIELDS
+        }
+        edit_signature = selected_row["signature"]
+
+    return render_template(
+        "sdl.html",
+        workbook_available=True,
+        rows=rows,
+        headers=SDL_HEADERS,
+        status_headers=SDL_STATUS_HEADERS,
+        form_fields=SDL_FORM_FIELDS,
+        form_values=form_values or {header: "" for header in SDL_FORM_FIELDS},
+        edit_row=edit_row,
+        edit_signature=edit_signature,
+        organ_options=Config.SDL_ORGANS,
+        scanner_options=Config.SDL_SCANNERS,
+        messages=flash_messages(),
+    )
+
+
+# ==============================================================================
 # 9. FLASK ROUTES
 # ==============================================================================
 @app.before_request
 def before_request_handler():
-    if request.endpoint in ["static", "serve_relative_image", "login", "logout"]:
+    if request.endpoint in ["static", "serve_relative_image", "login", "logout", "sdl"]:
         return
 
     session.setdefault("show_only_incomplete", False)
@@ -738,9 +1076,119 @@ def add_user():
 @app.route("/", methods=["GET"])
 @login_required
 def index():
+    requested_index = request.args.get("index")
+    if requested_index is not None:
+        return redirect(url_for("qc", index=requested_index))
+
+    return render_template("index.html", messages=flash_messages())
+
+
+@app.route("/sdl", methods=["GET", "POST"])
+@login_required
+def sdl():
+    if request.method == "GET":
+        requested_row = request.args.get("edit_row", "").strip()
+        if not requested_row:
+            return _render_sdl_page()
+        try:
+            edit_row = int(requested_row)
+        except ValueError:
+            flash("Invalid SDL row selected.", "error")
+            return redirect(url_for("sdl"))
+        return _render_sdl_page(edit_row=edit_row)
+
+    submitted_values = _submitted_sdl_form()
+    action = request.form.get("action", "add")
+    try:
+        normalized_values = _validate_sdl_form(submitted_values)
+    except SDLValidationError as exc:
+        flash(str(exc), "error")
+        edit_row = None
+        if action == "update":
+            try:
+                edit_row = int(request.form.get("worksheet_row", ""))
+            except ValueError:
+                pass
+        return _render_sdl_page(
+            form_values=submitted_values,
+            edit_row=edit_row,
+            edit_signature=request.form.get("row_signature", ""),
+        )
+
+    workbook = None
+    try:
+        with _sdl_workbook_lock:
+            workbook, worksheet, initialized_headers = _load_sdl_workbook()
+            if action == "update":
+                try:
+                    row_number = int(request.form.get("worksheet_row", ""))
+                except ValueError as exc:
+                    raise SDLValidationError("Invalid SDL row selected.") from exc
+                if row_number < 2 or row_number > worksheet.max_row:
+                    raise SDLValidationError("The selected SDL row no longer exists.")
+                if all(
+                    worksheet.cell(row=row_number, column=column).value is None
+                    for column in range(1, len(SDL_HEADERS) + 1)
+                ):
+                    raise SDLValidationError("The selected SDL row no longer exists.")
+                expected_signature = request.form.get("row_signature", "")
+                if not expected_signature or expected_signature != _sdl_row_signature(
+                    worksheet, row_number
+                ):
+                    raise SDLValidationError(
+                        "This SDL row changed after it was opened. Reload it before saving."
+                    )
+            elif action == "add":
+                row_number = worksheet.max_row + 1
+            else:
+                raise SDLValidationError("Invalid SDL action.")
+
+            for column, header in enumerate(SDL_HEADERS, start=1):
+                if header in normalized_values:
+                    worksheet.cell(row=row_number, column=column).value = normalized_values[header]
+                elif action == "add" and header in SDL_STATUS_HEADERS:
+                    worksheet.cell(row=row_number, column=column).value = False
+
+            for header in ("Date Loaded", "Date Unloaded"):
+                worksheet.cell(row=row_number, column=SDL_HEADERS.index(header) + 1).number_format = "yyyy-mm-dd"
+            for header in ("Time Loaded", "Time Unloaded"):
+                worksheet.cell(row=row_number, column=SDL_HEADERS.index(header) + 1).number_format = "hh:mm"
+
+            _save_sdl_workbook(workbook)
+    except (SDLWorkbookError, SDLValidationError) as exc:
+        flash(str(exc), "error")
+        app.logger.warning("SDL save rejected: %s", exc)
+        return _render_sdl_page(
+            form_values=submitted_values,
+            edit_row=(row_number if action == "update" and "row_number" in locals() else None),
+            edit_signature=request.form.get("row_signature", ""),
+        )
+    except Exception as exc:
+        app.logger.exception("Unexpected error while saving the SDL workbook")
+        flash(f"The Slide Digitization Log could not be saved: {exc}", "error")
+        return _render_sdl_page(
+            form_values=submitted_values,
+            edit_row=None,
+        )
+    finally:
+        if workbook is not None:
+            workbook.close()
+
+    flash(
+        "Slide Digitization Log row updated successfully."
+        if action == "update"
+        else "Slide Digitization Log row added successfully.",
+        "success",
+    )
+    return redirect(url_for("sdl"))
+
+
+@app.route("/qc", methods=["GET"])
+@login_required
+def qc():
     if not data_manager.data:
         return render_template(
-            "index.html",
+            "qc.html",
             error_message="CSV data could not be loaded. Please check the file path and logs.",
             data_loaded=False,
             messages=flash_messages(),
@@ -820,7 +1268,7 @@ def index():
                 total = len(queue_manager.items)
                 done = len([i for i in queue_manager.get_all() if i.status == "completed"])
                 return render_template(
-                    "index.html",
+                    "qc.html",
                     no_items_left=True,
                     completed_count=done,
                     total_count=total,
@@ -832,7 +1280,7 @@ def index():
     if not row_data:
         flash("Error: Database index mismatch with CSV. Reloading data...", "error")
         data_manager.load_data()
-        return redirect(url_for("index"))
+        return redirect(url_for("qc"))
 
     display_row_data = row_data.copy()
 
@@ -892,7 +1340,7 @@ def index():
         recently_completed.append(r_dict)
 
     return render_template(
-        "index.html",
+        "qc.html",
         row=display_row_data,
         original_index=current_index,
         total_original_rows=len(data_manager.data),
@@ -915,7 +1363,7 @@ def index():
 def update():
     """Handles the form submission for saving corrections."""
     if not data_manager.data:
-        return redirect(url_for("index"))
+        return redirect(url_for("qc"))
         
     try:
         idx = int(request.form.get("original_index", -1))
@@ -926,7 +1374,7 @@ def update():
 
         if not qi:
             flash("Error: Item not found in queue.", "error")
-            return redirect(url_for("index"))
+            return redirect(url_for("qc"))
 
         # --- SAFETY CHECK: LEASE VALIDATION ---
         is_forced_save = False
@@ -934,7 +1382,7 @@ def update():
         # Case A: Item is completed.
         if qi.status == "completed":
             flash("Cannot save changes: This item has already been completed.", "error")
-            return redirect(url_for("index"))
+            return redirect(url_for("qc"))
 
         # Case B: I hold the lease.
         if qi.leased_by_id == current_user.id:
@@ -948,7 +1396,7 @@ def update():
             qi = queue_manager.get(idx)
             if qi.status == "leased" and qi.leased_by_id != current_user.id:
                 flash("SAVE BLOCKED: This item is currently currently leased by another user.", "error")
-                return redirect(url_for("index"))
+                return redirect(url_for("qc"))
             # If after refresh it's effectively pending, we fall through to Case D.
             is_forced_save = True
 
@@ -1005,12 +1453,12 @@ def update():
                 app.logger.error(f"Save operation failed: {e}")
                 flash("CRITICAL: Error saving changes to the CSV file.", "error")
 
-        return redirect(url_for("index"))
+        return redirect(url_for("qc"))
 
     except Exception as e:
         app.logger.error(f"Update failed: {e}")
         flash("An error occurred during the update.", "error")
-        return redirect(url_for("index"))
+        return redirect(url_for("qc"))
 
 
 @app.route("/history")
@@ -1050,18 +1498,18 @@ def release_lease():
         queue_manager.save()
         flash(f"Successfully released {len(leases)} item(s) back to the queue.", "info")
         
-    return redirect(url_for("index"))
+    return redirect(url_for("qc"))
 
 
 @app.route("/search", methods=["POST"])
 @login_required
 def search():
     if not data_manager.data:
-        return redirect(url_for("index"))
+        return redirect(url_for("qc"))
         
     search_term = request.form.get("search_term", "").strip().lower()
     if not search_term:
-        return redirect(url_for("index"))
+        return redirect(url_for("qc"))
 
     for i, row in enumerate(data_manager.data):
         if (
@@ -1069,10 +1517,10 @@ def search():
             search_term in row.get("_identifier", "").lower() or
             search_term == row.get("BlockNumber", "").lower()
         ):
-            return redirect(url_for("index", index=i))
+            return redirect(url_for("qc", index=i))
 
     flash(f"No item found matching '{search_term}'.", "warning")
-    return redirect(url_for("index"))
+    return redirect(url_for("qc"))
 
 
 @app.route("/data_images/<path:filepath>")
