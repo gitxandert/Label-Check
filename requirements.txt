@@ -4,6 +4,7 @@ flask-login
 flask-sqlalchemy
 numpy
 opencv-python
+openpyxl
 openslide-bin
 openslide-python
 pandas
