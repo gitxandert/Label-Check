@@ -455,7 +455,9 @@ class DataManager:
                         row["BlockNumber"] = row.get("BlockNumber", "").strip()
                         
                         qc_passed_str = row.get("ParsingQCPassed", "").strip()
-                        row["_is_complete"] = bool(qc_passed_str)
+                        row["_is_complete"] = bool(
+                            qc_passed_str and qc_passed_str.lower() != "false"
+                        )
                         _data.append(row)
 
                 # Post-processing: Calculate per-patient file statistics
@@ -609,6 +611,7 @@ class BatchContext:
         self.id = batch_id
         self.root = root
         self.name = root.name
+        self.display_name = f"{root.parent.name}/{root.name}"
         self.csv_path = root / "enriched.csv"
         queue_dir = Path(Config.INSTANCE_DIR) / "batch_queues"
         queue_dir.mkdir(parents=True, exist_ok=True)
@@ -634,7 +637,16 @@ class BatchContext:
                 self.queue_manager.add(QueueItem(original_index=index, status=status))
                 changed = True
             elif row["_is_complete"] and self.queue_manager.items[index].status != "completed":
-                self.queue_manager.items[index].status = "completed"
+                item = self.queue_manager.items[index]
+                item.status = "completed"
+                item.leased_by_id = None
+                item.leased_at = None
+                changed = True
+            elif not row["_is_complete"] and self.queue_manager.items[index].status == "completed":
+                item = self.queue_manager.items[index]
+                item.status = "pending"
+                item.completed_by_id = None
+                item.completed_at = None
                 changed = True
         if changed:
             self.queue_manager.save()
@@ -654,17 +666,34 @@ def _batch_id(root: Path) -> str:
 
 
 def discover_batches() -> Tuple[List[BatchContext], List[str]]:
-    """Discover immediate batch children without allowing path errors to escape."""
+    """Discover slide batches beneath immediate SS* directories."""
     base = Path(Config.LABEL_CHECK_BATCHES)
     warnings: List[str] = []
     discovered: List[BatchContext] = []
     try:
-        candidates = sorted((path for path in base.iterdir() if path.is_dir()), key=lambda p: p.name.lower())
+        scanner_dirs = sorted(
+            (path for path in base.iterdir() if path.is_dir() and path.name.startswith("SS")),
+            key=lambda path: path.name.lower(),
+        )
     except OSError as exc:
         app.logger.warning("Label-check batch directory unavailable: %s", exc)
         return [], [f"Batch directory is unavailable: {base}"]
 
+    candidates: List[Path] = []
+    for scanner_dir in scanner_dirs:
+        try:
+            candidates.extend(
+                sorted(
+                    (path for path in scanner_dir.iterdir() if path.is_dir()),
+                    key=lambda path: path.name.lower(),
+                )
+            )
+        except OSError as exc:
+            app.logger.warning("Scanner directory unavailable: %s", exc)
+            warnings.append(f"Skipped {scanner_dir.name}: directory is unavailable.")
+
     for root in candidates:
+        display_name = f"{root.parent.name}/{root.name}"
         missing = [
             name for name in ("label", "macro")
             if not (root / name).is_dir() or not os.access(root / name, os.R_OK | os.X_OK)
@@ -673,7 +702,7 @@ def discover_batches() -> Tuple[List[BatchContext], List[str]]:
         if not csv_path.is_file() or not os.access(csv_path, os.R_OK):
             missing.append("enriched.csv")
         if missing:
-            warnings.append(f"Skipped {root.name}: missing {', '.join(missing)}.")
+            warnings.append(f"Skipped {display_name}: missing {', '.join(missing)}.")
             continue
         try:
             batch_id = _batch_id(root)
@@ -686,10 +715,17 @@ def discover_batches() -> Tuple[List[BatchContext], List[str]]:
             context.refresh()
             if not context.data_manager.data:
                 raise DataLoadError("enriched.csv has no slide rows")
+            if "ParsingQCPassed" not in context.data_manager.headers:
+                warnings.append(
+                    f"Skipped {display_name}: enriched.csv is missing ParsingQCPassed."
+                )
+                continue
+            if all(row["_is_complete"] for row in context.data_manager.data):
+                continue
             discovered.append(context)
         except (DataLoadError, OSError, ValueError) as exc:
             app.logger.warning("Skipping invalid batch %s: %s", root, exc)
-            warnings.append(f"Skipped {root.name}: enriched.csv could not be loaded.")
+            warnings.append(f"Skipped {display_name}: enriched.csv could not be loaded.")
 
     return discovered, warnings
 
@@ -1501,7 +1537,7 @@ def qc():
                     total_count=total,
                     messages=flash_messages(),
                     batch_id=context.id,
-                    batch_name=context.name,
+                    batch_name=context.display_name,
                     discovery_warnings=discovery_warnings,
                 )
 
@@ -1581,7 +1617,7 @@ def qc():
         timedelta=datetime.timedelta,
         recently_completed=recently_completed,
         batch_id=context.id,
-        batch_name=context.name,
+        batch_name=context.display_name,
         discovery_warnings=discovery_warnings,
     )
 
@@ -1722,7 +1758,7 @@ def history():
 
     return render_template(
         "history.html", completed_items=display_history, messages=flash_messages(),
-        batch_id=context.id, batch_name=context.name,
+        batch_id=context.id, batch_name=context.display_name,
     )
 
 
