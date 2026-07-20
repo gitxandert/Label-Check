@@ -353,8 +353,8 @@ class UserManager(CSVManager):
 
 
 class QueueManager(CSVManager):
-    def __init__(self):
-        super().__init__(Config.QUEUE_CSV_PATH, ["original_index", "status", "leased_by_id", "leased_at", "completed_by_id", "completed_at"])
+    def __init__(self, filepath: str = Config.QUEUE_CSV_PATH):
+        super().__init__(filepath, ["original_index", "status", "leased_by_id", "leased_at", "completed_by_id", "completed_at"])
         self.items: Dict[int, QueueItem] = {}
         self.load()
 
@@ -398,7 +398,6 @@ class QueueManager(CSVManager):
 
 # Initialize Managers
 user_manager = UserManager()
-queue_manager = QueueManager()
 
 
 @login_manager.user_loader
@@ -411,14 +410,17 @@ def load_user(user_id: str) -> Optional[User]:
 # ==============================================================================
 class DataManager:
     """Manages the in-memory CSV data state, loading, and saving."""
-    def __init__(self):
+    def __init__(self, batch_root: Optional[Path] = None, csv_path: Optional[Path] = None):
         self.data: List[Dict[str, Any]] = []
         self.headers: List[str] = []
+        self.batch_root = batch_root
+        self.csv_path = csv_path
         self._lock = threading.Lock() # Ensure thread safety for data access
         self.critical_headers = ["AccessionID", "Stain", "ParsingQCPassed", "original_slide_path"]
 
-    def load_data(self, file_path: str = Config.CSV_FILE_PATH) -> None:
+    def load_data(self, file_path: Optional[Union[str, Path]] = None) -> None:
         """Loads CSV data into memory safely."""
+        file_path = str(file_path or self.csv_path or Config.CSV_FILE_PATH)
         with self._lock:
             app.logger.info(f"Loading CSV data from: {file_path}")
             if not os.path.exists(file_path):
@@ -476,8 +478,9 @@ class DataManager:
                 self.data, self.headers = [], []
                 raise DataLoadError(f"Error reading CSV: {e}")
 
-    def save_data(self, target_path: str = Config.CSV_FILE_PATH) -> None:
+    def save_data(self, target_path: Optional[Union[str, Path]] = None) -> None:
         """Saves current data to CSV atomically."""
+        target_path = str(target_path or self.csv_path or Config.CSV_FILE_PATH)
         with self._lock:
             if not self.data or not self.headers:
                 app.logger.warning("Save aborted: No data in memory.")
@@ -566,19 +569,22 @@ class DataManager:
             self.headers = []
 
     def get_absolute_path(self, relative_path: str) -> Optional[str]:
-        """Resolves a relative path from the CSV to an absolute system path."""
+        """Resolve a CSV image path, constrained to the active batch directory."""
         if not relative_path:
             return None
-            
-        # Handle the specific NP-22-data prefix issue if present
-        cleaned_path = relative_path
-        if 'NP-22-data' in cleaned_path:
-            path_parts = cleaned_path.split('NP-22-data', 1)
-            if len(path_parts) > 1:
-                cleaned_path = path_parts[1].lstrip('.\\/')
-        
-        full_path = os.path.join(Config.IMAGE_BASE_DIR, cleaned_path)
-        return os.path.abspath(full_path)
+
+        root = (self.batch_root or Path(Config.IMAGE_BASE_DIR)).resolve()
+        cleaned_path = str(relative_path).replace("\\", os.sep)
+        candidate = Path(cleaned_path)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        try:
+            resolved = candidate.resolve()
+            if os.path.commonpath([str(root), str(resolved)]) != str(root):
+                return None
+        except (OSError, ValueError):
+            return None
+        return str(resolved)
 
     def check_paths(self) -> List[str]:
         """Checks if all image paths in the loaded data exist and are readable."""
@@ -596,14 +602,120 @@ class DataManager:
                              missing_or_unreadable.append(f"Row {i+1} ({key}): Path not readable -> {abs_path}")
         return missing_or_unreadable
 
-# Initialize Global DataManager
-data_manager = DataManager()
+class BatchContext:
+    """Loaded data and persistent queue belonging to one discovered batch."""
+
+    def __init__(self, batch_id: str, root: Path):
+        self.id = batch_id
+        self.root = root
+        self.name = root.name
+        self.csv_path = root / "enriched.csv"
+        queue_dir = Path(Config.INSTANCE_DIR) / "batch_queues"
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        self.data_manager = DataManager(root, self.csv_path)
+        self.queue_manager = QueueManager(str(queue_dir / f"{batch_id}.csv"))
+        self.csv_mod_time: Optional[float] = None
+
+    def refresh(self) -> None:
+        mod_time = self.csv_path.stat().st_mtime
+        if not self.data_manager.data or mod_time != self.csv_mod_time:
+            self.data_manager.load_data(self.csv_path)
+            self.csv_mod_time = mod_time
+        valid_indices = set(range(len(self.data_manager.data)))
+        changed = False
+        for index in list(self.queue_manager.items):
+            if index not in valid_indices:
+                del self.queue_manager.items[index]
+                changed = True
+        for row in self.data_manager.data:
+            index = row["_original_index"]
+            if index not in self.queue_manager.items:
+                status = "completed" if row["_is_complete"] else "pending"
+                self.queue_manager.add(QueueItem(original_index=index, status=status))
+                changed = True
+            elif row["_is_complete"] and self.queue_manager.items[index].status != "completed":
+                self.queue_manager.items[index].status = "completed"
+                changed = True
+        if changed:
+            self.queue_manager.save()
+
+    @property
+    def is_complete(self) -> bool:
+        items = self.queue_manager.get_all()
+        return bool(items) and all(item.status == "completed" for item in items)
+
+
+batch_contexts: Dict[str, BatchContext] = {}
+batch_contexts_lock = threading.Lock()
+
+
+def _batch_id(root: Path) -> str:
+    return hashlib.sha256(str(root.resolve()).encode("utf-8")).hexdigest()[:16]
+
+
+def discover_batches() -> Tuple[List[BatchContext], List[str]]:
+    """Discover immediate batch children without allowing path errors to escape."""
+    base = Path(Config.LABEL_CHECK_BATCHES)
+    warnings: List[str] = []
+    discovered: List[BatchContext] = []
+    try:
+        candidates = sorted((path for path in base.iterdir() if path.is_dir()), key=lambda p: p.name.lower())
+    except OSError as exc:
+        app.logger.warning("Label-check batch directory unavailable: %s", exc)
+        return [], [f"Batch directory is unavailable: {base}"]
+
+    for root in candidates:
+        missing = [
+            name for name in ("label", "macro")
+            if not (root / name).is_dir() or not os.access(root / name, os.R_OK | os.X_OK)
+        ]
+        csv_path = root / "enriched.csv"
+        if not csv_path.is_file() or not os.access(csv_path, os.R_OK):
+            missing.append("enriched.csv")
+        if missing:
+            warnings.append(f"Skipped {root.name}: missing {', '.join(missing)}.")
+            continue
+        try:
+            batch_id = _batch_id(root)
+            with batch_contexts_lock:
+                context = batch_contexts.get(batch_id)
+                if context is None or context.root.resolve() != root.resolve():
+                    context = BatchContext(batch_id, root.resolve())
+                    batch_contexts[batch_id] = context
+            context.queue_manager.load()
+            context.refresh()
+            if not context.data_manager.data:
+                raise DataLoadError("enriched.csv has no slide rows")
+            discovered.append(context)
+        except (DataLoadError, OSError, ValueError) as exc:
+            app.logger.warning("Skipping invalid batch %s: %s", root, exc)
+            warnings.append(f"Skipped {root.name}: enriched.csv could not be loaded.")
+
+    return discovered, warnings
+
+
+def _selected_batch(allow_completed: bool = False) -> Tuple[Optional[BatchContext], List[BatchContext], List[str]]:
+    batches, warnings = discover_batches()
+    available = [batch for batch in batches if not batch.is_complete]
+    if request.args.get("choose") == "1":
+        session.pop("qc_batch_id", None)
+        return None, available, warnings
+    requested_id = request.values.get("batch") or session.get("qc_batch_id")
+    selected = next((batch for batch in batches if batch.id == requested_id), None)
+    if selected and (allow_completed or not selected.is_complete):
+        session["qc_batch_id"] = selected.id
+        return selected, available, warnings
+    if requested_id:
+        session.pop("qc_batch_id", None)
+    return None, available, warnings
 
 # ==============================================================================
 # 8. HELPER FUNCTIONS
 # ==============================================================================
-def _release_expired_leases():
+def _release_expired_leases(context: BatchContext):
     """Scans for and releases any item leases that have expired."""
+    data_manager = context.data_manager
+    queue_manager = context.queue_manager
     lease_duration = datetime.timedelta(seconds=app.config["LEASE_DURATION_SECONDS"])
     expired_time = datetime.datetime.utcnow() - lease_duration
 
@@ -638,19 +750,19 @@ def _release_expired_leases():
             )
 
 
-def _create_backup(suffix: str = "") -> None:
+def _create_backup(context: BatchContext, suffix: str = "") -> None:
     """Creates a timestamped backup of the current CSV file."""
-    if not os.path.exists(Config.CSV_FILE_PATH):
+    source_path = str(context.csv_path)
+    if not os.path.exists(source_path):
         return
     try:
         os.makedirs(Config.BACKUP_DIR, exist_ok=True)
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = os.path.basename(Config.CSV_FILE_PATH)
-        name_part = f"{filename}_{timestamp}"
+        name_part = f"{context.name}_{context.id}_enriched.csv_{timestamp}"
         if suffix:
             name_part += f"_{suffix}"
         backup_path = os.path.join(Config.BACKUP_DIR, f"{name_part}.bak")
-        shutil.copy2(Config.CSV_FILE_PATH, backup_path)
+        shutil.copy2(source_path, backup_path)
     except Exception as e:
         raise BackupError(f"Backup failed: {e}")
 
@@ -1044,24 +1156,6 @@ def before_request_handler():
         return
 
     session.setdefault("show_only_incomplete", False)
-    path = Config.CSV_FILE_PATH
-    
-    if not os.path.exists(path):
-        if data_manager.data:
-            app.logger.critical(f"FATAL: CSV file disappeared from {path}. Clearing data.")
-            data_manager.clear()
-        return
-
-    try:
-        mod_time = os.path.getmtime(path)
-        if not data_manager.data or mod_time != session.get("last_loaded_csv_mod_time"):
-            app.logger.info("CSV file change detected or not loaded. Loading...")
-            data_manager.load_data()
-            session["last_loaded_csv_mod_time"] = mod_time
-            flash("Data loaded/refreshed from disk.", "info")
-    except DataLoadError as e:
-        app.logger.error(f"Auto-reload failed: {e}")
-        flash("Error: Could not auto-reload data from disk.", "error")
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -1318,19 +1412,20 @@ def sdl():
 @app.route("/qc", methods=["GET"])
 @login_required
 def qc():
-    if not data_manager.data:
+    context, available_batches, discovery_warnings = _selected_batch()
+    if context is None:
         return render_template(
-            "qc.html",
-            error_message="CSV data could not be loaded. Please check the file path and logs.",
-            data_loaded=False,
+            "batches.html",
+            batches=available_batches,
+            discovery_warnings=discovery_warnings,
             messages=flash_messages(),
         )
 
-    _release_expired_leases()
-    queue_manager.load() # Refresh queue from disk in case other processes updated it? Or just rely on in-memory for this single-process app?
-    # Since this is likely a single-worker Flask app (debug mode), in-memory shared state is OK, but for robustness with file changes:
-    # We will trust the queue_manager state which is in-memory and persisted only on save. 
-    # NOTE: If multiple workers, we should reload. Assuming single process for simplicity of CSV backend.
+    data_manager = context.data_manager
+    queue_manager = context.queue_manager
+
+    _release_expired_leases(context)
+    queue_manager.load()
 
     item_to_display = None
     requested_index_str = request.args.get("index")
@@ -1396,23 +1491,26 @@ def qc():
                 queue_manager.save()
                 item_to_display = next_pending_item
             else:
-                # 4. No items left
+                # 4. Every unfinished item is currently leased by another user.
                 total = len(queue_manager.items)
                 done = len([i for i in queue_manager.get_all() if i.status == "completed"])
                 return render_template(
                     "qc.html",
-                    no_items_left=True,
+                    no_items_available=True,
                     completed_count=done,
                     total_count=total,
                     messages=flash_messages(),
+                    batch_id=context.id,
+                    batch_name=context.name,
+                    discovery_warnings=discovery_warnings,
                 )
 
     current_index = item_to_display.original_index
     row_data = data_manager.get_row(current_index)
     if not row_data:
         flash("Error: Database index mismatch with CSV. Reloading data...", "error")
-        data_manager.load_data()
-        return redirect(url_for("qc"))
+        context.refresh()
+        return redirect(url_for("qc", batch=context.id))
 
     display_row_data = row_data.copy()
 
@@ -1436,13 +1534,8 @@ def qc():
         if csv_path:
             full_path = data_manager.get_absolute_path(csv_path)
             if full_path and os.path.exists(full_path):
-                cleaned_path = csv_path
-                if 'NP-22-data' in cleaned_path:
-                     parts = cleaned_path.split('NP-22-data', 1)
-                     if len(parts) > 1:
-                         cleaned_path = parts[1].lstrip('.\\/')
-                
-                return url_for("serve_relative_image", filepath=cleaned_path), True
+                relative_path = os.path.relpath(full_path, context.root).replace(os.sep, "/")
+                return url_for("serve_relative_image", batch=context.id, filepath=relative_path), True
         return None, False
 
     label_image_url, label_image_exists = resolve_image_path("_label_path")
@@ -1487,6 +1580,9 @@ def qc():
         datetime=datetime.datetime,
         timedelta=datetime.timedelta,
         recently_completed=recently_completed,
+        batch_id=context.id,
+        batch_name=context.name,
+        discovery_warnings=discovery_warnings,
     )
 
 
@@ -1494,6 +1590,12 @@ def qc():
 @login_required
 def update():
     """Handles the form submission for saving corrections."""
+    context, _, _ = _selected_batch(allow_completed=True)
+    if context is None:
+        flash("The selected batch is no longer available.", "warning")
+        return redirect(url_for("qc"))
+    data_manager = context.data_manager
+    queue_manager = context.queue_manager
     if not data_manager.data:
         return redirect(url_for("qc"))
         
@@ -1523,7 +1625,7 @@ def update():
         # Case C: Leased by SOMEONE ELSE.
         elif qi.status == "leased" and qi.leased_by_id != current_user.id:
             # Check for lease expiry just in case
-            _release_expired_leases()
+            _release_expired_leases(context)
             # Reload queue just to be sure
             qi = queue_manager.get(idx)
             if qi.status == "leased" and qi.leased_by_id != current_user.id:
@@ -1569,8 +1671,9 @@ def update():
             queue_manager.save()
 
             try:
-                _create_backup()
-                data_manager.save_data()
+                _create_backup(context)
+                data_manager.save_data(context.csv_path)
+                context.csv_mod_time = context.csv_path.stat().st_mtime
                 flash("Changes saved successfully.", "success")
                 
                 # --- CHECK IF LIST IS DONE ---
@@ -1579,13 +1682,13 @@ def update():
                 if remaining == 0:
                     flash("🎉 ALL ITEMS COMPLETED! A final comprehensive backup has been created.", "success")
                     app.logger.info("All items completed. Creating final backup.")
-                    _create_backup(suffix="FINAL_COMPLETED")
+                    _create_backup(context, suffix="FINAL_COMPLETED")
 
             except Exception as e:
                 app.logger.error(f"Save operation failed: {e}")
                 flash("CRITICAL: Error saving changes to the CSV file.", "error")
 
-        return redirect(url_for("qc"))
+        return redirect(url_for("qc", batch=context.id))
 
     except Exception as e:
         app.logger.error(f"Update failed: {e}")
@@ -1596,6 +1699,12 @@ def update():
 @app.route("/history")
 @login_required
 def history():
+    context, _, _ = _selected_batch(allow_completed=True)
+    if context is None:
+        flash("Choose a batch to view its history.", "warning")
+        return redirect(url_for("qc"))
+    data_manager = context.data_manager
+    queue_manager = context.queue_manager
     history_items = sorted(
         [i for i in queue_manager.get_all() if i.completed_by_id == current_user.id],
         key=lambda x: x.completed_at if x.completed_at else datetime.datetime.min,
@@ -1611,12 +1720,20 @@ def history():
         d['completed_at'] = item.completed_at
         display_history.append(d)
 
-    return render_template("history.html", completed_items=display_history, messages=flash_messages())
+    return render_template(
+        "history.html", completed_items=display_history, messages=flash_messages(),
+        batch_id=context.id, batch_name=context.name,
+    )
 
 
 @app.route("/release", methods=["POST"])
 @login_required
 def release_lease():
+    context, _, _ = _selected_batch(allow_completed=True)
+    if context is None:
+        flash("The selected batch is no longer available.", "warning")
+        return redirect(url_for("qc"))
+    queue_manager = context.queue_manager
     leases = [
         l for l in queue_manager.get_all() 
         if l.leased_by_id == current_user.id and l.status == "leased"
@@ -1630,12 +1747,16 @@ def release_lease():
         queue_manager.save()
         flash(f"Successfully released {len(leases)} item(s) back to the queue.", "info")
         
-    return redirect(url_for("qc"))
+    return redirect(url_for("qc", batch=context.id))
 
 
 @app.route("/search", methods=["POST"])
 @login_required
 def search():
+    context, _, _ = _selected_batch()
+    if context is None:
+        return redirect(url_for("qc"))
+    data_manager = context.data_manager
     if not data_manager.data:
         return redirect(url_for("qc"))
         
@@ -1649,23 +1770,24 @@ def search():
             search_term in row.get("_identifier", "").lower() or
             search_term == row.get("BlockNumber", "").lower()
         ):
-            return redirect(url_for("qc", index=i))
+            return redirect(url_for("qc", batch=context.id, index=i))
 
     flash(f"No item found matching '{search_term}'.", "warning")
-    return redirect(url_for("qc"))
+    return redirect(url_for("qc", batch=context.id))
 
 
-@app.route("/data_images/<path:filepath>")
+@app.route("/data_images/<batch>/<path:filepath>")
 @login_required
-def serve_relative_image(filepath: str):
-    abs_image_dir = os.path.abspath(Config.IMAGE_BASE_DIR)
-    abs_file_path = os.path.abspath(os.path.join(abs_image_dir, filepath))
-
-    if os.path.commonpath([abs_image_dir, abs_file_path]) != abs_image_dir:
-        app.logger.warning(f"Path traversal attempt blocked for filepath: {filepath}")
+def serve_relative_image(batch: str, filepath: str):
+    batches, _ = discover_batches()
+    context = next((item for item in batches if item.id == batch), None)
+    if context is None:
+        return "Batch not found.", 404
+    abs_file_path = context.data_manager.get_absolute_path(filepath)
+    if not abs_file_path:
+        app.logger.warning("Blocked invalid image path for batch %s: %s", batch, filepath)
         return "Access denied: Invalid file path.", 403
-
-    if not os.path.exists(abs_file_path):
+    if not os.path.isfile(abs_file_path):
         return "Image not found on server.", 404
 
     directory, filename = os.path.split(abs_file_path)
@@ -1689,64 +1811,13 @@ def init_db_command():
     else:
         print("'admin' user already exists.")
 
-    # Init Queue from Data CSV
-    if os.path.exists(Config.CSV_FILE_PATH):
-        try:
-            data_manager.load_data()
-            print("Verifying data integrity (checking file paths)...")
-            errors = data_manager.check_paths()
-            if errors:
-                print("CRITICAL ERROR: Found missing or unreadable files.")
-                for e in errors[:10]:
-                    print(f"  - {e}")
-                if len(errors) > 10:
-                    print(f"  ... and {len(errors) - 10} more issues.")
-                print("Aborting initialization due to data integrity/safety check.")
-                return
-
-            existing_indices = {item.original_index for item in queue_manager.get_all()}
-            
-            new_items_count = 0
-            for row in data_manager.data:
-                idx = row["_original_index"]
-                if idx not in existing_indices:
-                    status = "completed" if row["_is_complete"] else "pending"
-                    qi = QueueItem(original_index=idx, status=status)
-                    queue_manager.add(qi)
-                    new_items_count += 1
-            
-            queue_manager.save()
-            print(f"Successfully added/synced {new_items_count} items to the processing queue.")
-            
-        except Exception as e:
-            print(f"ERROR: Could not populate queue from CSV. Reason: {e}")
-    else:
-        print(f"WARNING: CSV file not found at {Config.CSV_FILE_PATH}. Queue was not populated.")
+    batches, warnings = discover_batches()
+    print(f"Discovered and initialized {len(batches)} valid batch(es).")
+    for warning in warnings:
+        print(f"WARNING: {warning}")
 
     print("--- Initialization complete. ---")
 
 
 if __name__ == "__main__":
-    if os.path.exists(Config.CSV_FILE_PATH):
-        try:
-            with app.app_context():
-                data_manager.load_data()
-                print("Verifying data integrity (checking file paths)...")
-                errors = data_manager.check_paths()
-                if errors:
-                    print("\n" + "="*60)
-                    print("CRITICAL ERROR: Found missing or unreadable files.")
-                    print("The application cannot start until these are resolved.")
-                    print("="*60)
-                    for e in errors[:20]:
-                        print(f"  - {e}")
-                    if len(errors) > 20:
-                        print(f"  ... and {len(errors) - 20} more issues.")
-                    print("="*60 + "\n")
-                    sys.exit(1)
-                print("Data integrity check passed.")
-        except Exception as e:
-            print(f"FATAL: Failed during startup checks: {e}")
-            sys.exit(1)
-
     app.run(debug=True, host="0.0.0.0")

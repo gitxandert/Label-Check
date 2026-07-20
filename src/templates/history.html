@@ -142,9 +142,11 @@
 </head>
 <body>
     <div class="header">
-        <h1>My Annotation History</h1>
+        <h1>My Annotation History — {{ batch_name }}</h1>
         <div class="header-links">
             <a href="{{ url_for('index') }}">Home</a>
+            <a href="{{ url_for('qc', batch=batch_id) }}">Quality Control</a>
+            <a href="{{ url_for('qc', choose=1) }}">Change Batch</a>
             {% if current_user.is_authenticated %}
                 <span>Logged in as <b>{{ current_user.id }}</b></span>
                 <a href="{{ url_for('logout') }}">Logout</a>
@@ -172,7 +174,7 @@
                         <tr>
                             <td>{{ item.accession_id }}</td>
                             <td>{{ item.completed_at.strftime('%Y-%m-%d %H:%M:%S') }} UTC</td>
-                            <td><a href="{{ url_for('qc', index=item.original_index) }}">View</a></td>
+                            <td><a href="{{ url_for('qc', batch=batch_id, index=item.original_index) }}">View</a></td>
                         </tr>
                     {% endfor %}
                 </tbody>

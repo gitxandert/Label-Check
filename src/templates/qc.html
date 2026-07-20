@@ -511,11 +511,12 @@
 </head>
 <body>
     <div class="header">
-        <h1>SVS Slide Quality Control</h1>
+        <h1>SVS Slide Quality Control — {{ batch_name }}</h1>
         <div class="header-links">
             {% if current_user.is_authenticated %}
                 <a href="{{ url_for('index') }}">Menu</a>
-                <a href="{{ url_for('history') }}">My History</a>
+                <a href="{{ url_for('qc', choose=1) }}">Change Batch</a>
+                <a href="{{ url_for('history', batch=batch_id) }}">My History</a>
                 {% if current_user.is_admin %}
                     <a href="{{ url_for('users_management') }}">User Management</a>
                 {% endif %}
@@ -530,15 +531,19 @@
                 {% for message in messages %}
                     <li class="{{ message.category }}">{{ message.message }}</li>
                 {% endfor %}
+                {% for warning in discovery_warnings %}
+                    <li class="warning">{{ warning }}</li>
+                {% endfor %}
             </ul>
 
-            {% if no_items_left %}
+            {% if no_items_available %}
                 <div class="no-data-message">
-                    <h2>Queue Complete!</h2>
-                    <p>All items have been processed.</p>
+                    <h2>No items are currently available</h2>
+                    <p>The remaining items are leased by other users. Try again shortly or choose another batch.</p>
                     <p>
                         <b>{{ completed_count }}</b> of <b>{{ total_count }}</b> items are complete.
                     </p>
+                    <p><a href="{{ url_for('qc', batch=batch_id) }}">Refresh this batch</a></p>
                 </div>
             {% elif data_loaded %}
                 <div class="queue-info">
@@ -570,6 +575,7 @@
 
 
                 <form action="{{ url_for('update') }}" method="POST" class="form-section">
+                    <input type="hidden" name="batch" value="{{ batch_id }}">
                     <input type="hidden" name="original_index" value="{{ original_index }}">
 
                     <div class="form-group">
@@ -614,11 +620,9 @@
                     <div class="form-actions">
                         {% if lease_info.leased_by_id == current_user.id %}
                             <button type="submit" name="action" value="next" class="nav-btn">Save and Next</button>
-                            <form action="{{ url_for('release_lease') }}" method="POST" style="display: inline;">
-                                <button type="submit" class="nav-btn" style="background-color: var(--warning-color);">Release Lease</button>
-                            </form>
+                            <button type="submit" formaction="{{ url_for('release_lease') }}" formmethod="POST" class="nav-btn" style="background-color: var(--warning-color);">Release Lease</button>
                         {% else %}
-                             <a href="{{ url_for('qc') }}" class="nav-btn">Get Next Available Item</a>
+                             <a href="{{ url_for('qc', batch=batch_id) }}" class="nav-btn">Get Next Available Item</a>
                         {% endif %}
                     </div>
                 </form>
@@ -629,7 +633,7 @@
                         <ul>
                             {% for item in recently_completed %}
                                 <li>
-                                    <a href="{{ url_for('qc', index=item.original_index) }}">{{ item.accession_id }}</a>
+                                    <a href="{{ url_for('qc', batch=batch_id, index=item.original_index) }}">{{ item.accession_id }}</a>
                                     <span class="completed-time">{{ item.completed_at.strftime('%Y-%m-%d %H:%M:%S') }} UTC</span>
                                 </li>
                             {% endfor %}
