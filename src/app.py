@@ -100,6 +100,12 @@ class Config:
     SDL_ORGANS = ("BRAIN", "BREAST", "TESTES", "CYTO")
     SDL_SCANNERS = ("RSCH1 (SS12797)", "CLIN1 (SS12602)")
 
+
+    # Path to scanner inventories
+    SCANNER_INVENTORIES = "D:\\scanner_inventories"
+    # Path to batches of new slides to label-check
+    LABEL_CHECK_BATCHES = "D:\\label_check_batches"
+
     # Default password for the initial 'admin' user.
     ADMIN_DEFAULT_PASSWORD = os.environ.get(
         "ADMIN_DEFAULT_PASSWORD", "change_this_password"
@@ -175,6 +181,10 @@ class SDLWorkbookError(Exception):
     pass
 
 class SDLValidationError(Exception):
+    pass
+
+
+class InventoryReadError(Exception):
     pass
 
 
@@ -976,12 +986,61 @@ def _render_sdl_page(
     )
 
 
+def _read_inventory_page(
+    inventory_path: Path, requested_page: int, rows_per_page: int = 100
+) -> Tuple[List[str], List[List[str]], int, int, int]:
+    """Read one page of a headered inventory CSV without retaining the whole file."""
+    headers: List[str] = []
+    page_rows: List[List[str]] = []
+    total_rows = 0
+
+    try:
+        with inventory_path.open("r", encoding="utf-8-sig", newline="") as inventory_file:
+            reader = csv.reader(inventory_file, strict=True)
+            try:
+                headers = next(reader)
+            except StopIteration:
+                raise InventoryReadError("This inventory is empty and has no header row.")
+            if not headers:
+                raise InventoryReadError("This inventory does not contain a usable header row.")
+
+            page_start = (requested_page - 1) * rows_per_page
+            page_end = page_start + rows_per_page
+            for row_number, row in enumerate(reader):
+                if page_start <= row_number < page_end:
+                    page_rows.append(row)
+                total_rows += 1
+    except InventoryReadError:
+        raise
+    except UnicodeDecodeError as exc:
+        raise InventoryReadError("This inventory is not valid UTF-8 text.") from exc
+    except csv.Error as exc:
+        raise InventoryReadError(f"This inventory contains invalid CSV data: {exc}") from exc
+    except OSError as exc:
+        raise InventoryReadError(f"This inventory could not be read: {exc}") from exc
+
+    total_pages = max(1, (total_rows + rows_per_page - 1) // rows_per_page)
+    current_page = min(requested_page, total_pages)
+
+    if current_page != requested_page:
+        return _read_inventory_page(inventory_path, current_page, rows_per_page)
+
+    return headers, page_rows, total_rows, current_page, total_pages
+
+
 # ==============================================================================
 # 9. FLASK ROUTES
 # ==============================================================================
 @app.before_request
 def before_request_handler():
-    if request.endpoint in ["static", "serve_relative_image", "login", "logout", "sdl"]:
+    if request.endpoint in [
+        "static",
+        "serve_relative_image",
+        "login",
+        "logout",
+        "sdl",
+        "inventories",
+    ]:
         return
 
     session.setdefault("show_only_incomplete", False)
@@ -1081,6 +1140,79 @@ def index():
         return redirect(url_for("qc", index=requested_index))
 
     return render_template("index.html", messages=flash_messages())
+
+
+@app.route("/inventories", methods=["GET"])
+@login_required
+def inventories():
+    inventory_directory = Path(Config.SCANNER_INVENTORIES)
+    inventory_files: List[Path] = []
+    directory_error = None
+
+    try:
+        if not inventory_directory.is_dir():
+            directory_error = (
+                f"The scanner inventory directory is unavailable: {inventory_directory}"
+            )
+        else:
+            inventory_files = sorted(
+                (
+                    path
+                    for path in inventory_directory.iterdir()
+                    if path.is_file()
+                    and not path.is_symlink()
+                    and path.suffix.lower() == ".csv"
+                ),
+                key=lambda path: path.name.casefold(),
+            )
+    except OSError as exc:
+        directory_error = f"The scanner inventory directory could not be read: {exc}"
+
+    selected_name = request.args.get("file", "").strip()
+    selected_path = None
+    headers: List[str] = []
+    rows: List[List[str]] = []
+    total_rows = 0
+    current_page = 1
+    total_pages = 1
+    inventory_error = None
+
+    if selected_name:
+        files_by_name = {path.name: path for path in inventory_files}
+        selected_path = files_by_name.get(selected_name)
+        if selected_path is None:
+            flash("The selected scanner inventory is unavailable.", "warning")
+            return redirect(url_for("inventories"))
+
+        try:
+            requested_page = max(1, int(request.args.get("page", "1")))
+        except (TypeError, ValueError):
+            requested_page = 1
+
+        try:
+            (
+                headers,
+                rows,
+                total_rows,
+                current_page,
+                total_pages,
+            ) = _read_inventory_page(selected_path, requested_page)
+        except InventoryReadError as exc:
+            inventory_error = str(exc)
+
+    return render_template(
+        "inventories.html",
+        inventory_files=inventory_files,
+        selected_name=selected_path.name if selected_path else None,
+        headers=headers,
+        rows=rows,
+        total_rows=total_rows,
+        current_page=current_page,
+        total_pages=total_pages,
+        directory_error=directory_error,
+        inventory_error=inventory_error,
+        messages=flash_messages(),
+    )
 
 
 @app.route("/sdl", methods=["GET", "POST"])
