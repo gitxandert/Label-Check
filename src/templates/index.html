@@ -199,6 +199,10 @@
             <p>Select an option below to get started.</p>
         </div>
         <nav class="menu-grid" aria-label="Application tools">
+            <a class="menu-card" href="{{ url_for('pipeline_launcher') }}">
+                <h3>Run Label-Check</h3>
+                <p>Configure and run the image-processing pipeline, with live output from every stage.</p>
+            </a>
             <a class="menu-card" href="{{ url_for('qc') }}">
                 <h3>Quality Control</h3>
                 <p>Review slide labels and macro images, correct extracted data, and complete queued items.</p>

@@ -20,6 +20,7 @@ The application features:
 # 1. IMPORTS
 # ==============================================================================
 import csv
+import codecs
 import datetime
 import hashlib
 import logging
@@ -27,9 +28,11 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
+import uuid
 from collections import Counter, defaultdict
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -40,6 +43,7 @@ from flask import (
     Flask,
     flash,
     get_flashed_messages,
+    jsonify,
     redirect,
     render_template,
     request,
@@ -1177,7 +1181,264 @@ def _read_inventory_page(
 
 
 # ==============================================================================
-# 9. FLASK ROUTES
+# 9. PIPELINE LAUNCHER
+# ==============================================================================
+PIPELINE_FORM_DEFAULTS = {
+    "input_dir": "",
+    "output_dir": "",
+    "start_from": "1",
+    "end_at": "3",
+    "input_mode": "auto",
+    "macro_workers": "4",
+    "macro_extensions": "svs",
+    "macro_image_extensions": "png, jpg, jpeg, tif, tiff, bmp",
+    "thumbnail_width": "300",
+    "thumbnail_height": "300",
+    "ocr_workers": "4",
+    "ocr_use_cpu": "",
+    "naming_accession_pattern": r"\b([A-Za-z]+\d+[ -/]\d+)\b",
+    "naming_workers": "4",
+}
+
+
+class PipelineJob:
+    """In-memory state for one pipeline child process."""
+
+    def __init__(self, job_id: str, owner_id: str, process: subprocess.Popen):
+        self.id = job_id
+        self.owner_id = owner_id
+        self.process = process
+        self.status = "running"
+        self.return_code: Optional[int] = None
+        self.output = ""
+
+
+_pipeline_jobs: Dict[str, PipelineJob] = {}
+_pipeline_jobs_lock = threading.Lock()
+_pipeline_active_job_id: Optional[str] = None
+
+
+def _pipeline_form_values(source=None) -> Dict[str, str]:
+    values = dict(PIPELINE_FORM_DEFAULTS)
+    if source is not None:
+        for key in values:
+            submitted = source.get(key)
+            if submitted is not None:
+                values[key] = submitted
+    return values
+
+
+def _positive_pipeline_integer(
+    values: Dict[str, str], field: str, label: str, errors: List[str]
+) -> Optional[int]:
+    try:
+        value = int(values[field])
+        if value <= 0:
+            raise ValueError
+        return value
+    except (TypeError, ValueError):
+        errors.append(f"{label} must be a positive whole number.")
+        return None
+
+
+def _pipeline_extensions(value: str, label: str, errors: List[str]) -> List[str]:
+    extensions = [item.lstrip(".") for item in re.split(r"[\s,]+", value.strip()) if item]
+    if not extensions:
+        errors.append(f"{label} must contain at least one extension.")
+    elif any(not re.fullmatch(r"[A-Za-z0-9.]+", item) for item in extensions):
+        errors.append(f"{label} may contain only letters, numbers, and periods.")
+    return extensions
+
+
+def _pipeline_command(values: Dict[str, str]) -> Tuple[Optional[List[str]], List[str]]:
+    errors: List[str] = []
+    input_text = values["input_dir"].strip()
+    output_text = values["output_dir"].strip()
+    if not input_text:
+        errors.append("Input directory is required.")
+    if not output_text:
+        errors.append("Output directory is required.")
+
+    input_dir = Path(input_text).expanduser().resolve() if input_text else None
+    output_dir = Path(output_text).expanduser().resolve() if output_text else None
+    if input_dir is not None and not input_dir.is_dir():
+        errors.append("Input directory must be an existing directory on the server.")
+    if output_dir is not None and output_dir.exists() and not output_dir.is_dir():
+        errors.append("Output directory points to a file, not a directory.")
+
+    try:
+        start_stage = int(values["start_from"])
+        end_stage = int(values["end_at"])
+        if start_stage not in (1, 2, 3) or end_stage not in (1, 2, 3):
+            raise ValueError
+        if end_stage < start_stage:
+            errors.append("End at cannot be earlier than Start from.")
+    except (TypeError, ValueError):
+        start_stage = end_stage = 0
+        errors.append("Choose valid starting and ending stages.")
+
+    macro_workers = _positive_pipeline_integer(
+        values, "macro_workers", "Get macro workers", errors
+    )
+    thumbnail_width = _positive_pipeline_integer(
+        values, "thumbnail_width", "Thumbnail width", errors
+    )
+    thumbnail_height = _positive_pipeline_integer(
+        values, "thumbnail_height", "Thumbnail height", errors
+    )
+    ocr_workers = _positive_pipeline_integer(
+        values, "ocr_workers", "Dual OCR workers", errors
+    )
+    naming_workers = _positive_pipeline_integer(
+        values, "naming_workers", "Name files workers", errors
+    )
+    macro_extensions = _pipeline_extensions(
+        values["macro_extensions"], "Slide extensions", errors
+    )
+    image_extensions = _pipeline_extensions(
+        values["macro_image_extensions"], "Image extensions", errors
+    )
+
+    if values["input_mode"] not in ("auto", "slides", "images"):
+        errors.append("Choose a valid input mode.")
+    try:
+        re.compile(values["naming_accession_pattern"])
+    except re.error as exc:
+        errors.append(f"Accession pattern is not a valid regular expression: {exc}")
+
+    if output_dir is not None and start_stage == 2:
+        if not (output_dir / "slide_mapping.csv").is_file():
+            errors.append(
+                "Starting from Dual OCR requires slide_mapping.csv in the output directory."
+            )
+    if output_dir is not None and start_stage == 3:
+        if not (output_dir / "ocr.csv").is_file():
+            errors.append(
+                "Starting from Name files requires ocr.csv in the output directory."
+            )
+
+    pipeline_script = Path(__file__).resolve().with_name("pipeline.py")
+    if not pipeline_script.is_file():
+        errors.append(f"Pipeline script is unavailable: {pipeline_script}")
+    if errors:
+        return None, errors
+
+    command = [
+        sys.executable,
+        "-u",
+        str(pipeline_script),
+        "--input-dir",
+        str(input_dir),
+        "--output-dir",
+        str(output_dir),
+        "--start-from",
+        str(start_stage),
+        "--end-at",
+        str(end_stage),
+        "--input-mode",
+        values["input_mode"],
+        "--macro-workers",
+        str(macro_workers),
+        "--macro-extensions",
+        *macro_extensions,
+        "--macro-image-extensions",
+        *image_extensions,
+        "--macro-thumbnail-size",
+        str(thumbnail_width),
+        str(thumbnail_height),
+        "--ocr-workers",
+        str(ocr_workers),
+        "--naming-accession-pattern",
+        values["naming_accession_pattern"],
+        "--naming-workers",
+        str(naming_workers),
+    ]
+    if values["ocr_use_cpu"] == "on":
+        command.append("--ocr-use-cpu")
+    return command, []
+
+
+def _read_pipeline_output(job: PipelineJob) -> None:
+    """Drain merged child output and finalize job state."""
+    global _pipeline_active_job_id
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    try:
+        if job.process.stdout is not None:
+            while True:
+                chunk = job.process.stdout.read(4096)
+                if not chunk:
+                    break
+                text = decoder.decode(chunk)
+                if text:
+                    with _pipeline_jobs_lock:
+                        job.output += text
+            trailing_text = decoder.decode(b"", final=True)
+            if trailing_text:
+                with _pipeline_jobs_lock:
+                    job.output += trailing_text
+        return_code = job.process.wait()
+        with _pipeline_jobs_lock:
+            job.return_code = return_code
+            job.status = "succeeded" if return_code == 0 else "failed"
+    except Exception as exc:
+        app.logger.exception("Failed while reading pipeline output")
+        with _pipeline_jobs_lock:
+            job.output += f"\nLauncher error while reading output: {exc}\n"
+            job.return_code = job.process.poll()
+            job.status = "failed"
+    finally:
+        with _pipeline_jobs_lock:
+            if _pipeline_active_job_id == job.id:
+                _pipeline_active_job_id = None
+
+
+def _start_pipeline_job(command: List[str], owner_id: str) -> PipelineJob:
+    global _pipeline_active_job_id
+    with _pipeline_jobs_lock:
+        if _pipeline_active_job_id is not None:
+            active_job = _pipeline_jobs.get(_pipeline_active_job_id)
+            if active_job is not None and active_job.status == "running":
+                raise RuntimeError("Another Label-Check pipeline is already running.")
+            _pipeline_active_job_id = None
+
+        process = subprocess.Popen(
+            command,
+            cwd=Path(__file__).resolve().parent.parent,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        job = PipelineJob(uuid.uuid4().hex, owner_id, process)
+        _pipeline_jobs[job.id] = job
+        _pipeline_active_job_id = job.id
+
+    reader = threading.Thread(target=_read_pipeline_output, args=(job,), daemon=True)
+    reader.start()
+    return job
+
+
+def _pipeline_job_for_user(job_id: str) -> Optional[PipelineJob]:
+    with _pipeline_jobs_lock:
+        job = _pipeline_jobs.get(job_id)
+        if job is None:
+            return None
+        if job.owner_id != str(current_user.id) and not current_user.is_admin:
+            return None
+        return job
+
+
+def _pipeline_is_busy() -> bool:
+    with _pipeline_jobs_lock:
+        if _pipeline_active_job_id is None:
+            return False
+        job = _pipeline_jobs.get(_pipeline_active_job_id)
+        return job is not None and job.status == "running"
+
+
+# ==============================================================================
+# 10. FLASK ROUTES
 # ==============================================================================
 @app.before_request
 def before_request_handler():
@@ -1270,6 +1531,100 @@ def index():
         return redirect(url_for("qc", index=requested_index))
 
     return render_template("index.html", messages=flash_messages())
+
+
+@app.route("/pipeline", methods=["GET"])
+@login_required
+def pipeline_launcher():
+    job = None
+    job_id = session.get("pipeline_job_id")
+    if job_id:
+        job = _pipeline_job_for_user(job_id)
+    return render_template(
+        "pipeline.html",
+        form_values=_pipeline_form_values(),
+        job=job,
+        pipeline_busy=_pipeline_is_busy(),
+        messages=flash_messages(),
+    )
+
+
+@app.route("/pipeline/run", methods=["POST"])
+@login_required
+def run_pipeline():
+    values = _pipeline_form_values(request.form)
+    command, errors = _pipeline_command(values)
+    if errors:
+        for error in errors:
+            flash(error, "error")
+        return (
+            render_template(
+                "pipeline.html",
+                form_values=values,
+                job=None,
+                pipeline_busy=_pipeline_is_busy(),
+                messages=flash_messages(),
+            ),
+            400,
+        )
+
+    try:
+        job = _start_pipeline_job(command, str(current_user.id))
+    except RuntimeError as exc:
+        flash(str(exc), "warning")
+        return (
+            render_template(
+                "pipeline.html",
+                form_values=values,
+                job=None,
+                pipeline_busy=True,
+                messages=flash_messages(),
+            ),
+            409,
+        )
+    except OSError as exc:
+        app.logger.exception("Could not start the Label-Check pipeline")
+        flash(f"The pipeline process could not be started: {exc}", "error")
+        return (
+            render_template(
+                "pipeline.html",
+                form_values=values,
+                job=None,
+                pipeline_busy=False,
+                messages=flash_messages(),
+            ),
+            500,
+        )
+
+    session["pipeline_job_id"] = job.id
+    return redirect(url_for("pipeline_launcher"))
+
+
+@app.route("/pipeline/jobs/<job_id>/output", methods=["GET"])
+@login_required
+def pipeline_job_output(job_id: str):
+    job = _pipeline_job_for_user(job_id)
+    if job is None:
+        return jsonify({"error": "Pipeline job not found."}), 404
+    try:
+        offset = max(0, int(request.args.get("offset", "0")))
+    except ValueError:
+        return jsonify({"error": "Output offset must be a whole number."}), 400
+
+    with _pipeline_jobs_lock:
+        offset = min(offset, len(job.output))
+        output = job.output[offset:]
+        next_offset = len(job.output)
+        status = job.status
+        return_code = job.return_code
+    return jsonify(
+        {
+            "output": output,
+            "next_offset": next_offset,
+            "status": status,
+            "return_code": return_code,
+        }
+    )
 
 
 @app.route("/inventories", methods=["GET"])
@@ -1831,7 +2186,7 @@ def serve_relative_image(batch: str, filepath: str):
 
 
 # ==============================================================================
-# 10. CLI COMMANDS
+# 11. CLI COMMANDS
 # ==============================================================================
 @app.cli.command("init-db")
 @with_appcontext
