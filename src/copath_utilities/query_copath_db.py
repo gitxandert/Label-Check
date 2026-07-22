@@ -513,7 +513,7 @@ def process_input_file(file_path, target_column):
             raise KeyError(f"Error: Column '{target_column}' not found. "
                            f"Columns detected: {fieldnames}")
 
-        return [row[target_column] for row in reader]
+        return list({row[target_column] for row in reader})
 
 
 def escape_sql_literal(value):
