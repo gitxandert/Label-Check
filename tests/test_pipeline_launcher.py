@@ -65,6 +65,15 @@ class PipelineCommandTests(unittest.TestCase):
 
 class PipelineLauncherTests(unittest.TestCase):
     def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.original_store = (
+            app_module.api_store.db_path,
+            app_module.api_store.output_dir,
+        )
+        root = Path(self.temporary_directory.name)
+        app_module.api_store.configure(
+            str(root / "api.sqlite3"), str(root / "pipeline-output")
+        )
         app_module.app.config.update(TESTING=True, SECRET_KEY="test-secret")
         with app_module._pipeline_jobs_lock:
             app_module._pipeline_jobs.clear()
@@ -74,6 +83,8 @@ class PipelineLauncherTests(unittest.TestCase):
         with app_module._pipeline_jobs_lock:
             app_module._pipeline_jobs.clear()
             app_module._pipeline_active_job_id = None
+        app_module.api_store.configure(*self.original_store)
+        self.temporary_directory.cleanup()
 
     def test_form_defaults_and_command(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

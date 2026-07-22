@@ -21,28 +21,38 @@ The application features:
 # ==============================================================================
 import csv
 import codecs
+import contextlib
 import datetime
+import functools
+import hmac
 import hashlib
+import json
 import logging
 import os
 import re
+import secrets
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from collections import Counter, defaultdict
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import click
+
 # Flask and its extensions for web framework, user management
 from flask import (
     Flask,
     flash,
     get_flashed_messages,
+    g,
     jsonify,
     redirect,
     render_template,
@@ -61,6 +71,7 @@ from flask_login import (
     logout_user,
 )
 from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.middleware.proxy_fix import ProxyFix
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
@@ -97,6 +108,17 @@ class Config:
     # CSV persistence files
     USERS_CSV_PATH = os.path.join(INSTANCE_DIR, "users.csv")
     QUEUE_CSV_PATH = os.path.join(INSTANCE_DIR, "queue.csv")
+    API_DB_PATH = os.path.join(INSTANCE_DIR, "api.sqlite3")
+    API_JOB_OUTPUT_DIR = os.path.join(INSTANCE_DIR, "pipeline_job_output")
+    API_REQUIRE_HTTPS = os.environ.get("API_REQUIRE_HTTPS", "true").lower() == "true"
+    API_TRUST_PROXY_HEADERS = os.environ.get("API_TRUST_PROXY_HEADERS", "false").lower() == "true"
+    API_SUBMIT_RATE_LIMIT = int(os.environ.get("API_SUBMIT_RATE_LIMIT", "5"))
+    API_READ_RATE_LIMIT = int(os.environ.get("API_READ_RATE_LIMIT", "60"))
+    API_RATE_WINDOW_SECONDS = 60
+    API_DEFAULT_TOKEN_DAYS = 90
+    API_OUTPUT_DEFAULT_LIMIT = 16 * 1024
+    API_OUTPUT_MAX_LIMIT = 64 * 1024
+    CSRF_ENABLED = os.environ.get("CSRF_ENABLED", "true").lower() == "true"
 
     # Slide Digitization Log workbook configuration.
     SDL_FILE_PATH = os.path.join(BASE_DIR, "logs", "Slide_Digitization_Log.xlsx")
@@ -158,6 +180,8 @@ template_dir = os.path.join(base_dir, "templates")
 
 app = Flask(__name__, template_folder=template_dir, instance_path=instance_path)
 app.config.from_object(Config)
+if app.config["API_TRUST_PROXY_HEADERS"]:
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1)
 os.makedirs(app.instance_path, exist_ok=True)
 
 setup_logging(app)
@@ -190,6 +214,293 @@ class SDLValidationError(Exception):
 
 class InventoryReadError(Exception):
     pass
+
+
+def _utcnow() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _iso_utc(value: Optional[datetime.datetime] = None) -> str:
+    return (value or _utcnow()).isoformat().replace("+00:00", "Z")
+
+
+class APIStore:
+    """SQLite-backed API credentials, durable job metadata, and rate counters."""
+
+    def __init__(self, db_path: str, output_dir: str):
+        self.db_path = db_path
+        self.output_dir = output_dir
+        self._initialized_path: Optional[str] = None
+        self._init_lock = threading.Lock()
+
+    def configure(self, db_path: str, output_dir: str) -> None:
+        self.db_path = db_path
+        self.output_dir = output_dir
+        self._initialized_path = None
+
+    def _connect(self) -> sqlite3.Connection:
+        self._ensure_schema()
+        connection = sqlite3.connect(self.db_path, timeout=30)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    @contextlib.contextmanager
+    def connection(self):
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
+    def _ensure_schema(self) -> None:
+        if self._initialized_path == self.db_path:
+            return
+        with self._init_lock:
+            if self._initialized_path == self.db_path:
+                return
+            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+            connection = sqlite3.connect(self.db_path, timeout=30)
+            try:
+                connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS api_tokens (
+                        token_id TEXT PRIMARY KEY,
+                        user_id TEXT NOT NULL,
+                        label TEXT NOT NULL,
+                        secret_hash TEXT NOT NULL,
+                        scopes TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        expires_at TEXT NOT NULL,
+                        revoked_at TEXT,
+                        last_used_at TEXT
+                    );
+                    CREATE TABLE IF NOT EXISTS pipeline_jobs (
+                        job_id TEXT PRIMARY KEY,
+                        owner_id TEXT NOT NULL,
+                        token_id TEXT,
+                        idempotency_key TEXT,
+                        payload_hash TEXT,
+                        request_json TEXT NOT NULL,
+                        command_json TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        started_at TEXT,
+                        completed_at TEXT,
+                        return_code INTEGER,
+                        output_path TEXT NOT NULL,
+                        launcher_pid INTEGER,
+                        UNIQUE(token_id, idempotency_key)
+                    );
+                    CREATE UNIQUE INDEX IF NOT EXISTS one_active_pipeline_job
+                    ON pipeline_jobs((1)) WHERE status IN ('starting', 'running');
+                    CREATE TABLE IF NOT EXISTS api_rate_limits (
+                        token_id TEXT NOT NULL,
+                        bucket TEXT NOT NULL,
+                        window_start INTEGER NOT NULL,
+                        request_count INTEGER NOT NULL,
+                        PRIMARY KEY(token_id, bucket)
+                    );
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            self._initialized_path = self.db_path
+
+    def create_token(
+        self, user_id: str, label: str, scopes: List[str], expires_days: int
+    ) -> Tuple[str, Dict[str, Any]]:
+        token_id = uuid.uuid4().hex[:16]
+        raw_token = f"lc_pat_{token_id}.{secrets.token_urlsafe(32)}"
+        created = _utcnow()
+        expires = created + datetime.timedelta(days=expires_days)
+        record = {
+            "token_id": token_id,
+            "user_id": user_id,
+            "label": label,
+            "scopes": sorted(set(scopes)),
+            "created_at": _iso_utc(created),
+            "expires_at": _iso_utc(expires),
+            "revoked_at": None,
+            "last_used_at": None,
+        }
+        with self.connection() as connection:
+            connection.execute(
+                """INSERT INTO api_tokens
+                   (token_id, user_id, label, secret_hash, scopes, created_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    token_id,
+                    user_id,
+                    label,
+                    hashlib.sha256(raw_token.encode("utf-8")).hexdigest(),
+                    " ".join(record["scopes"]),
+                    record["created_at"],
+                    record["expires_at"],
+                ),
+            )
+        return raw_token, record
+
+    def list_tokens(self, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        query = "SELECT * FROM api_tokens"
+        params: Tuple[Any, ...] = ()
+        if user_id:
+            query += " WHERE user_id = ?"
+            params = (user_id,)
+        query += " ORDER BY created_at DESC"
+        with self.connection() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [self._token_record(row) for row in rows]
+
+    @staticmethod
+    def _token_record(row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "token_id": row["token_id"],
+            "user_id": row["user_id"],
+            "label": row["label"],
+            "scopes": row["scopes"].split(),
+            "created_at": row["created_at"],
+            "expires_at": row["expires_at"],
+            "revoked_at": row["revoked_at"],
+            "last_used_at": row["last_used_at"],
+        }
+
+    def authenticate_token(self, raw_token: str) -> Optional[Dict[str, Any]]:
+        match = re.fullmatch(r"lc_pat_([0-9a-f]{16})\.[A-Za-z0-9_-]+", raw_token)
+        if not match:
+            return None
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM api_tokens WHERE token_id = ?", (match.group(1),)
+            ).fetchone()
+            if row is None or row["revoked_at"]:
+                return None
+            expected = row["secret_hash"]
+            actual = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+            if not hmac.compare_digest(expected, actual):
+                return None
+            expires = datetime.datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
+            if expires <= _utcnow():
+                return None
+            used_at = _iso_utc()
+            connection.execute(
+                "UPDATE api_tokens SET last_used_at = ? WHERE token_id = ?",
+                (used_at, row["token_id"]),
+            )
+            record = self._token_record(row)
+            record["last_used_at"] = used_at
+            return record
+
+    def revoke_token(self, token_id: str) -> bool:
+        with self.connection() as connection:
+            cursor = connection.execute(
+                "UPDATE api_tokens SET revoked_at = ? WHERE token_id = ? AND revoked_at IS NULL",
+                (_iso_utc(), token_id),
+            )
+            return cursor.rowcount == 1
+
+    def rate_limit(self, token_id: str, bucket: str, limit: int, window: int) -> Tuple[bool, int, int]:
+        now = int(time.time())
+        window_start = now - (now % window)
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT window_start, request_count FROM api_rate_limits WHERE token_id=? AND bucket=?",
+                (token_id, bucket),
+            ).fetchone()
+            count = 0 if row is None or row["window_start"] != window_start else row["request_count"]
+            allowed = count < limit
+            if allowed:
+                count += 1
+                connection.execute(
+                    """INSERT INTO api_rate_limits(token_id, bucket, window_start, request_count)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(token_id, bucket) DO UPDATE SET
+                       window_start=excluded.window_start, request_count=excluded.request_count""",
+                    (token_id, bucket, window_start, count),
+                )
+        return allowed, max(0, limit - count), window_start + window - now
+
+    def find_idempotent(self, token_id: str, key: str) -> Optional[sqlite3.Row]:
+        with self.connection() as connection:
+            return connection.execute(
+                "SELECT * FROM pipeline_jobs WHERE token_id=? AND idempotency_key=?",
+                (token_id, key),
+            ).fetchone()
+
+    def reserve_job(
+        self,
+        job_id: str,
+        owner_id: str,
+        values: Dict[str, Any],
+        command: List[str],
+        token_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        payload_hash: Optional[str] = None,
+    ) -> str:
+        self._ensure_schema()
+        output_path = str(Path(self.output_dir) / f"{job_id}.log")
+        Path(output_path).touch(exist_ok=False)
+        try:
+            with self.connection() as connection:
+                connection.execute(
+                    """INSERT INTO pipeline_jobs
+                       (job_id, owner_id, token_id, idempotency_key, payload_hash,
+                        request_json, command_json, status, created_at, output_path)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 'starting', ?, ?)""",
+                    (
+                        job_id, owner_id, token_id, idempotency_key, payload_hash,
+                        json.dumps(values, sort_keys=True), json.dumps(command), _iso_utc(), output_path,
+                    ),
+                )
+        except Exception:
+            os.remove(output_path)
+            raise
+        return output_path
+
+    def update_job(self, job_id: str, **fields: Any) -> None:
+        allowed = {"status", "started_at", "completed_at", "return_code", "launcher_pid"}
+        selected = {key: value for key, value in fields.items() if key in allowed}
+        if not selected:
+            return
+        assignments = ", ".join(f"{key}=?" for key in selected)
+        with self.connection() as connection:
+            connection.execute(
+                f"UPDATE pipeline_jobs SET {assignments} WHERE job_id=?",
+                (*selected.values(), job_id),
+            )
+
+    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM pipeline_jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def mark_stale_jobs_interrupted(self) -> None:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT job_id, launcher_pid FROM pipeline_jobs WHERE status IN ('starting', 'running')"
+            ).fetchall()
+            for row in rows:
+                launcher_pid = row["launcher_pid"]
+                if launcher_pid:
+                    try:
+                        os.kill(launcher_pid, 0)
+                        continue
+                    except (OSError, ProcessLookupError):
+                        pass
+                connection.execute(
+                    """UPDATE pipeline_jobs SET status='interrupted', completed_at=?
+                       WHERE job_id=? AND status IN ('starting', 'running')""",
+                    (_iso_utc(), row["job_id"]),
+                )
+
+
+api_store = APIStore(Config.API_DB_PATH, Config.API_JOB_OUTPUT_DIR)
+api_store.mark_stale_jobs_interrupted()
 
 
 # ==============================================================================
@@ -1204,13 +1515,20 @@ PIPELINE_FORM_DEFAULTS = {
 class PipelineJob:
     """In-memory state for one pipeline child process."""
 
-    def __init__(self, job_id: str, owner_id: str, process: subprocess.Popen):
+    def __init__(
+        self,
+        job_id: str,
+        owner_id: str,
+        process: subprocess.Popen,
+        output_path: Optional[str] = None,
+    ):
         self.id = job_id
         self.owner_id = owner_id
         self.process = process
         self.status = "running"
         self.return_code: Optional[int] = None
         self.output = ""
+        self.output_path = output_path
 
 
 _pipeline_jobs: Dict[str, PipelineJob] = {}
@@ -1372,27 +1690,58 @@ def _read_pipeline_output(job: PipelineJob) -> None:
                 if text:
                     with _pipeline_jobs_lock:
                         job.output += text
+                    if job.output_path:
+                        with open(job.output_path, "a", encoding="utf-8") as output_file:
+                            output_file.write(text)
             trailing_text = decoder.decode(b"", final=True)
             if trailing_text:
                 with _pipeline_jobs_lock:
                     job.output += trailing_text
+                if job.output_path:
+                    with open(job.output_path, "a", encoding="utf-8") as output_file:
+                        output_file.write(trailing_text)
         return_code = job.process.wait()
         with _pipeline_jobs_lock:
             job.return_code = return_code
             job.status = "succeeded" if return_code == 0 else "failed"
+        if job.output_path:
+            api_store.update_job(
+                job.id,
+                status=job.status,
+                return_code=return_code,
+                completed_at=_iso_utc(),
+            )
     except Exception as exc:
         app.logger.exception("Failed while reading pipeline output")
         with _pipeline_jobs_lock:
             job.output += f"\nLauncher error while reading output: {exc}\n"
             job.return_code = job.process.poll()
             job.status = "failed"
+        if job.output_path:
+            with open(job.output_path, "a", encoding="utf-8") as output_file:
+                output_file.write(f"\nLauncher error while reading output: {exc}\n")
+            api_store.update_job(
+                job.id,
+                status="failed",
+                return_code=job.return_code,
+                completed_at=_iso_utc(),
+            )
     finally:
         with _pipeline_jobs_lock:
             if _pipeline_active_job_id == job.id:
                 _pipeline_active_job_id = None
 
 
-def _start_pipeline_job(command: List[str], owner_id: str) -> PipelineJob:
+def _start_pipeline_job(
+    command: List[str],
+    owner_id: str,
+    *,
+    job_id: Optional[str] = None,
+    request_values: Optional[Dict[str, Any]] = None,
+    token_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    payload_hash: Optional[str] = None,
+) -> PipelineJob:
     global _pipeline_active_job_id
     with _pipeline_jobs_lock:
         if _pipeline_active_job_id is not None:
@@ -1401,18 +1750,44 @@ def _start_pipeline_job(command: List[str], owner_id: str) -> PipelineJob:
                 raise RuntimeError("Another Label-Check pipeline is already running.")
             _pipeline_active_job_id = None
 
-        process = subprocess.Popen(
-            command,
-            cwd=Path(__file__).resolve().parent.parent,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=0,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
-        )
-        job = PipelineJob(uuid.uuid4().hex, owner_id, process)
+        resolved_job_id = job_id or str(uuid.uuid4())
+        try:
+            output_path = api_store.reserve_job(
+                resolved_job_id,
+                owner_id,
+                request_values or {},
+                command,
+                token_id,
+                idempotency_key,
+                payload_hash,
+            )
+        except sqlite3.IntegrityError as exc:
+            raise RuntimeError("Another Label-Check pipeline is already running.") from exc
+
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=Path(__file__).resolve().parent.parent,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=0,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            )
+        except OSError:
+            api_store.update_job(
+                resolved_job_id, status="failed", completed_at=_iso_utc()
+            )
+            raise
+        job = PipelineJob(resolved_job_id, owner_id, process, output_path)
         _pipeline_jobs[job.id] = job
         _pipeline_active_job_id = job.id
+        api_store.update_job(
+            job.id,
+            status="running",
+            started_at=_iso_utc(),
+            launcher_pid=os.getpid(),
+        )
 
     reader = threading.Thread(target=_read_pipeline_output, args=(job,), daemon=True)
     reader.start()
@@ -1437,11 +1812,161 @@ def _pipeline_is_busy() -> bool:
         return job is not None and job.status == "running"
 
 
+def csrf_token() -> str:
+    token = session.get("_csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["_csrf_token"] = token
+    return token
+
+
+app.jinja_env.globals["csrf_token"] = csrf_token
+
+
+def _api_problem(status: int, code: str, title: str, detail: str):
+    response = jsonify(
+        {
+            "type": f"https://label-check.invalid/problems/{code}",
+            "status": status,
+            "code": code,
+            "title": title,
+            "detail": detail,
+            "request_id": getattr(g, "request_id", uuid.uuid4().hex),
+        }
+    )
+    response.status_code = status
+    response.content_type = "application/problem+json"
+    if status == 401:
+        response.headers["WWW-Authenticate"] = 'Bearer realm="label-check-api"'
+    return response
+
+
+def _require_api_scope(scope: str, bucket: str = "read"):
+    def decorator(view):
+        @functools.wraps(view)
+        def wrapped(*args, **kwargs):
+            if app.config.get("API_REQUIRE_HTTPS", True) and not app.testing and not request.is_secure:
+                return _api_problem(400, "https_required", "HTTPS required", "The API is available only over HTTPS.")
+            header = request.headers.get("Authorization", "")
+            if not header.startswith("Bearer ") or header.count(" ") != 1:
+                return _api_problem(401, "invalid_token", "Authentication required", "Provide a valid bearer token.")
+            token = api_store.authenticate_token(header[7:])
+            user = user_manager.get(token["user_id"]) if token else None
+            if token is None or user is None:
+                return _api_problem(401, "invalid_token", "Authentication required", "The bearer token is invalid, expired, or revoked.")
+            g.api_token = token
+            g.api_user = user
+            if scope not in token["scopes"]:
+                return _api_problem(403, "insufficient_scope", "Insufficient scope", f"This endpoint requires the {scope} scope.")
+            limit = (
+                app.config["API_SUBMIT_RATE_LIMIT"]
+                if bucket == "submit"
+                else app.config["API_READ_RATE_LIMIT"]
+            )
+            allowed, remaining, retry_after = api_store.rate_limit(
+                token["token_id"], bucket, limit, app.config["API_RATE_WINDOW_SECONDS"]
+            )
+            g.rate_limit = limit
+            g.rate_remaining = remaining
+            g.rate_retry_after = retry_after
+            if not allowed:
+                response = _api_problem(429, "rate_limit_exceeded", "Rate limit exceeded", "Retry after the current rate-limit window.")
+                response.headers["Retry-After"] = str(retry_after)
+                return response
+            return view(*args, **kwargs)
+        return wrapped
+    return decorator
+
+
+def _api_job_document(record: Dict[str, Any]) -> Dict[str, Any]:
+    job_id = record["job_id"]
+    return {
+        "id": job_id,
+        "status": record["status"],
+        "created_at": record["created_at"],
+        "started_at": record.get("started_at"),
+        "completed_at": record.get("completed_at"),
+        "return_code": record.get("return_code"),
+        "links": {
+            "self": url_for("api_pipeline_job", job_id=job_id, _external=True),
+            "output": url_for("api_pipeline_job_output", job_id=job_id, _external=True),
+        },
+    }
+
+
+@app.after_request
+def api_response_metadata(response):
+    if request.path.startswith("/api/v1/"):
+        request_id = getattr(g, "request_id", uuid.uuid4().hex)
+        response.headers["X-Request-ID"] = request_id
+        if hasattr(g, "rate_limit"):
+            response.headers["X-RateLimit-Limit"] = str(g.rate_limit)
+            response.headers["X-RateLimit-Remaining"] = str(g.rate_remaining)
+        token = getattr(g, "api_token", None)
+        app.logger.info(
+            "API_AUDIT %s",
+            json.dumps(
+                {
+                    "request_id": request_id,
+                    "token_id": token.get("token_id") if token else None,
+                    "user_id": token.get("user_id") if token else None,
+                    "method": request.method,
+                    "path": request.path,
+                    "status": response.status_code,
+                    "remote_addr": request.remote_addr,
+                    "idempotency_key": request.headers.get("Idempotency-Key"),
+                },
+                sort_keys=True,
+            ),
+        )
+    return response
+
+
+@app.errorhandler(404)
+def api_not_found(error):
+    if request.path.startswith("/api/v1/"):
+        return _api_problem(404, "not_found", "Not found", "The requested API resource does not exist.")
+    return error
+
+
+@app.errorhandler(405)
+def api_method_not_allowed(error):
+    if request.path.startswith("/api/v1/"):
+        return _api_problem(405, "method_not_allowed", "Method not allowed", "This API resource does not support the requested method.")
+    return error
+
+
+@app.errorhandler(500)
+def api_internal_error(error):
+    if request.path.startswith("/api/v1/"):
+        return _api_problem(500, "internal_error", "Internal server error", "The request could not be completed.")
+    return error
+
+
 # ==============================================================================
 # 10. FLASK ROUTES
 # ==============================================================================
 @app.before_request
 def before_request_handler():
+    if request.path.startswith("/api/v1/"):
+        supplied_request_id = request.headers.get("X-Request-ID", "")
+        g.request_id = (
+            supplied_request_id
+            if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", supplied_request_id)
+            else uuid.uuid4().hex
+        )
+        return None
+
+    if (
+        request.method in {"POST", "PUT", "PATCH", "DELETE"}
+        and app.config.get("CSRF_ENABLED", True)
+        and not app.testing
+    ):
+        expected = session.get("_csrf_token", "")
+        supplied = request.form.get("csrf_token", "") or request.headers.get("X-CSRF-Token", "")
+        if not expected or not supplied or not hmac.compare_digest(expected, supplied):
+            return "Invalid or missing CSRF token.", 400
+
     if request.endpoint in [
         "static",
         "serve_relative_image",
@@ -2186,8 +2711,271 @@ def serve_relative_image(batch: str, filepath: str):
 
 
 # ==============================================================================
-# 11. CLI COMMANDS
+# 11. VERSIONED PIPELINE API
 # ==============================================================================
+API_PIPELINE_FIELDS = {
+    "input_dir", "output_dir", "start_from", "end_at", "input_mode",
+    "macro_workers", "macro_extensions", "macro_image_extensions",
+    "thumbnail_width", "thumbnail_height", "ocr_workers", "ocr_use_cpu",
+    "naming_accession_pattern", "naming_workers",
+}
+
+
+def _api_pipeline_values(payload: Any) -> Tuple[Optional[Dict[str, str]], List[str]]:
+    if not isinstance(payload, dict):
+        return None, ["The request body must be a JSON object."]
+    errors = []
+    unknown = sorted(set(payload) - API_PIPELINE_FIELDS)
+    if unknown:
+        errors.append(f"Unknown fields: {', '.join(unknown)}.")
+    for required in ("input_dir", "output_dir"):
+        if required not in payload:
+            errors.append(f"{required} is required.")
+
+    integer_fields = {
+        "start_from", "end_at", "macro_workers", "thumbnail_width",
+        "thumbnail_height", "ocr_workers", "naming_workers",
+    }
+    string_fields = {"input_dir", "output_dir", "input_mode", "naming_accession_pattern"}
+    extension_fields = {"macro_extensions", "macro_image_extensions"}
+    for field in integer_fields & payload.keys():
+        if isinstance(payload[field], bool) or not isinstance(payload[field], int):
+            errors.append(f"{field} must be an integer.")
+    for field in string_fields & payload.keys():
+        if not isinstance(payload[field], str):
+            errors.append(f"{field} must be a string.")
+    for field in extension_fields & payload.keys():
+        value = payload[field]
+        if not isinstance(value, list) or not value or any(not isinstance(item, str) for item in value):
+            errors.append(f"{field} must be a non-empty array of strings.")
+    if "ocr_use_cpu" in payload and not isinstance(payload["ocr_use_cpu"], bool):
+        errors.append("ocr_use_cpu must be a boolean.")
+    if errors:
+        return None, errors
+
+    values = dict(PIPELINE_FORM_DEFAULTS)
+    for key, value in payload.items():
+        if key in integer_fields:
+            values[key] = str(value)
+        elif key in extension_fields:
+            values[key] = ", ".join(value)
+        elif key == "ocr_use_cpu":
+            values[key] = "on" if value else ""
+        else:
+            values[key] = value
+    return values, []
+
+
+@app.route("/api/v1/pipeline/jobs", methods=["POST"])
+@_require_api_scope("pipeline:run", "submit")
+def api_create_pipeline_job():
+    if not request.is_json:
+        return _api_problem(415, "unsupported_media_type", "JSON required", "Use Content-Type: application/json.")
+    idempotency_key = request.headers.get("Idempotency-Key", "")
+    if not re.fullmatch(r"[\x21-\x7E]{1,128}", idempotency_key):
+        return _api_problem(422, "invalid_idempotency_key", "Invalid idempotency key", "Idempotency-Key must contain 1–128 printable non-space ASCII characters.")
+    payload = request.get_json(silent=True)
+    values, shape_errors = _api_pipeline_values(payload)
+    if shape_errors:
+        return _api_problem(422, "validation_error", "Invalid pipeline request", " ".join(shape_errors))
+    assert values is not None
+    payload_hash = hashlib.sha256(
+        json.dumps(values, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    existing = api_store.find_idempotent(g.api_token["token_id"], idempotency_key)
+    if existing is not None:
+        if existing["payload_hash"] != payload_hash:
+            return _api_problem(409, "idempotency_conflict", "Idempotency conflict", "This key was already used with a different request.")
+        response = jsonify({"data": _api_job_document(dict(existing))})
+        response.status_code = 202
+        response.headers["Location"] = url_for("api_pipeline_job", job_id=existing["job_id"], _external=True)
+        response.headers["Idempotency-Replayed"] = "true"
+        return response
+
+    command, validation_errors = _pipeline_command(values)
+    if validation_errors:
+        return _api_problem(422, "validation_error", "Invalid pipeline request", " ".join(validation_errors))
+    assert command is not None
+    job_id = str(uuid.uuid4())
+    try:
+        job = _start_pipeline_job(
+            command,
+            str(g.api_user.id),
+            job_id=job_id,
+            request_values=values,
+            token_id=g.api_token["token_id"],
+            idempotency_key=idempotency_key,
+            payload_hash=payload_hash,
+        )
+    except RuntimeError as exc:
+        raced_job = api_store.find_idempotent(g.api_token["token_id"], idempotency_key)
+        if raced_job is not None and raced_job["payload_hash"] == payload_hash:
+            response = jsonify({"data": _api_job_document(dict(raced_job))})
+            response.status_code = 202
+            response.headers["Location"] = url_for(
+                "api_pipeline_job", job_id=raced_job["job_id"], _external=True
+            )
+            response.headers["Idempotency-Replayed"] = "true"
+            return response
+        return _api_problem(409, "pipeline_busy", "Pipeline busy", str(exc))
+    except OSError:
+        app.logger.exception("API could not start the Label-Check pipeline")
+        return _api_problem(500, "pipeline_launch_failed", "Pipeline launch failed", "The pipeline process could not be started.")
+    record = api_store.get_job(job.id)
+    response = jsonify({"data": _api_job_document(record)})
+    response.status_code = 202
+    response.headers["Location"] = url_for("api_pipeline_job", job_id=job.id, _external=True)
+    return response
+
+
+def _authorized_api_job(job_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[Any]]:
+    record = api_store.get_job(job_id)
+    if record is None or (
+        record["owner_id"] != str(g.api_user.id) and not g.api_user.is_admin
+    ):
+        return None, _api_problem(404, "job_not_found", "Job not found", "The requested pipeline job was not found.")
+    return record, None
+
+
+@app.route("/api/v1/pipeline/jobs/<job_id>", methods=["GET"])
+@_require_api_scope("pipeline:read")
+def api_pipeline_job(job_id: str):
+    record, error = _authorized_api_job(job_id)
+    if error is not None:
+        return error
+    return jsonify({"data": _api_job_document(record)})
+
+
+@app.route("/api/v1/pipeline/jobs/<job_id>/output", methods=["GET"])
+@_require_api_scope("pipeline:read")
+def api_pipeline_job_output(job_id: str):
+    record, error = _authorized_api_job(job_id)
+    if error is not None:
+        return error
+    try:
+        offset = int(request.args.get("offset", "0"))
+        limit = int(request.args.get("limit", str(app.config["API_OUTPUT_DEFAULT_LIMIT"])))
+    except ValueError:
+        return _api_problem(422, "invalid_pagination", "Invalid pagination", "offset and limit must be integers.")
+    if offset < 0 or limit < 1 or limit > app.config["API_OUTPUT_MAX_LIMIT"]:
+        return _api_problem(422, "invalid_pagination", "Invalid pagination", f"offset must be non-negative and limit must be 1–{app.config['API_OUTPUT_MAX_LIMIT']}.")
+    output_path = record["output_path"]
+    try:
+        size = os.path.getsize(output_path)
+        offset = min(offset, size)
+        with open(output_path, "rb") as output_file:
+            output_file.seek(offset)
+            raw = output_file.read(limit)
+    except OSError:
+        return _api_problem(500, "output_unavailable", "Output unavailable", "The pipeline output could not be read.")
+    while raw:
+        try:
+            output = raw.decode("utf-8")
+            break
+        except UnicodeDecodeError as exc:
+            if exc.reason == "unexpected end of data":
+                raw = raw[:exc.start]
+            else:
+                output = raw.decode("utf-8", errors="replace")
+                break
+    else:
+        output = ""
+    next_offset = offset + len(raw)
+    return jsonify(
+        {
+            "data": {
+                "job_id": job_id,
+                "output": output,
+                "offset": offset,
+                "next_offset": next_offset,
+                "eof": next_offset >= size,
+                "status": record["status"],
+            }
+        }
+    )
+
+
+@app.route("/api/v1/openapi.json", methods=["GET"])
+@_require_api_scope("pipeline:read")
+def api_openapi_document():
+    contract_path = Path(__file__).resolve().with_name("openapi.json")
+    try:
+        with contract_path.open("r", encoding="utf-8") as contract_file:
+            return jsonify(json.load(contract_file))
+    except (OSError, json.JSONDecodeError):
+        app.logger.exception("OpenAPI contract is unavailable")
+        return _api_problem(500, "contract_unavailable", "Contract unavailable", "The OpenAPI contract could not be loaded.")
+
+
+# ==============================================================================
+# 12. CLI COMMANDS
+# ==============================================================================
+@app.cli.group("api-token")
+def api_token_cli():
+    """Manage scoped personal access tokens for the pipeline API."""
+
+
+@api_token_cli.command("create")
+@click.argument("user_id")
+@click.option("--label", required=True, help="Human-readable credential label.")
+@click.option(
+    "--scope",
+    "scopes",
+    multiple=True,
+    type=click.Choice(["pipeline:read", "pipeline:run"]),
+    default=("pipeline:read", "pipeline:run"),
+    show_default=True,
+)
+@click.option("--expires-days", type=click.IntRange(min=1), default=90, show_default=True)
+def create_api_token(user_id: str, label: str, scopes: Tuple[str, ...], expires_days: int):
+    if user_manager.get(user_id) is None:
+        raise click.ClickException(f"Unknown user: {user_id}")
+    raw_token, record = api_store.create_token(user_id, label, list(scopes), expires_days)
+    click.echo(f"Token ID: {record['token_id']}")
+    click.echo(f"Expires: {record['expires_at']}")
+    click.echo("Token (shown once):")
+    click.echo(raw_token)
+
+
+@api_token_cli.command("list")
+@click.option("--user", "user_id")
+def list_api_tokens(user_id: Optional[str]):
+    records = api_store.list_tokens(user_id)
+    if not records:
+        click.echo("No API tokens found.")
+        return
+    for record in records:
+        state = "revoked" if record["revoked_at"] else "active"
+        click.echo(
+            f"{record['token_id']}\t{record['user_id']}\t{record['label']}\t"
+            f"{','.join(record['scopes'])}\t{record['expires_at']}\t{state}"
+        )
+
+
+@api_token_cli.command("revoke")
+@click.argument("token_id")
+def revoke_api_token(token_id: str):
+    if not api_store.revoke_token(token_id):
+        raise click.ClickException("Active token not found.")
+    click.echo(f"Revoked token {token_id}.")
+
+
+@api_token_cli.command("rotate")
+@click.argument("token_id")
+@click.option("--expires-days", type=click.IntRange(min=1), default=90, show_default=True)
+def rotate_api_token(token_id: str, expires_days: int):
+    record = next((item for item in api_store.list_tokens() if item["token_id"] == token_id), None)
+    if record is None or record["revoked_at"]:
+        raise click.ClickException("Active token not found.")
+    raw_token, replacement = api_store.create_token(
+        record["user_id"], record["label"], record["scopes"], expires_days
+    )
+    api_store.revoke_token(token_id)
+    click.echo(f"Revoked token {token_id}; replacement ID: {replacement['token_id']}")
+    click.echo("Token (shown once):")
+    click.echo(raw_token)
+
+
 @app.cli.command("init-db")
 @with_appcontext
 def init_db_command():

@@ -575,6 +575,7 @@
 
 
                 <form action="{{ url_for('update') }}" method="POST" class="form-section">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <input type="hidden" name="batch" value="{{ batch_id }}">
                     <input type="hidden" name="original_index" value="{{ original_index }}">
 

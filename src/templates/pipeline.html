@@ -82,6 +82,7 @@
             <h2>Pipeline settings</h2>
             <p class="lead">Enter directories on the server, choose the stages to run, and adjust advanced script arguments if needed.</p>
             <form method="POST" action="{{ url_for('run_pipeline') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <div class="grid">
                     <div class="field full">
                         <label for="input_dir">Input directory</label>

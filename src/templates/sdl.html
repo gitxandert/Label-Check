@@ -183,6 +183,7 @@
             <section class="card" id="entry-form">
                 <h3>{{ 'Edit row ' ~ edit_row if edit_row else 'Add a log entry' }}</h3>
                 <form method="POST" action="{{ url_for('sdl') }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <input type="hidden" name="action" value="{{ 'update' if edit_row else 'add' }}">
                     {% if edit_row %}
                         <input type="hidden" name="worksheet_row" value="{{ edit_row }}">
