@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import click
+import renaming
 
 # Flask and its extensions for web framework, user management
 from flask import (
@@ -131,6 +132,7 @@ class Config:
     SCANNER_INVENTORIES = "D:\\scanner_inventories"
     # Path to batches of new slides to label-check
     LABEL_CHECK_BATCHES = "D:\\label_check_batches"
+    COPATH_CLONE = os.environ.get("COPATH_CLONE", "D:\\copath_clone")
 
     # Default password for the initial 'admin' user.
     ADMIN_DEFAULT_PASSWORD = os.environ.get(
@@ -1040,6 +1042,25 @@ class BatchContext:
                     f"could not update completed_stages.csv: {exc}"
                 ) from exc
 
+    def mark_renamed_complete(self) -> None:
+        """Atomically mark renaming complete while preserving QC."""
+        with self._completed_stages_lock:
+            temp_path = self.completed_stages_path.with_name(
+                f".{self.completed_stages_path.name}.{uuid.uuid4().hex}.tmp"
+            )
+            try:
+                with open(temp_path, "x", newline="", encoding="utf-8") as csvfile:
+                    writer = csv.DictWriter(csvfile, fieldnames=self.COMPLETED_STAGES_FIELDS)
+                    writer.writeheader()
+                    writer.writerow({"QC": "True", "Renamed": "True"})
+                    csvfile.flush()
+                    os.fsync(csvfile.fileno())
+                os.replace(temp_path, self.completed_stages_path)
+                self.completed_stages = {"QC": True, "Renamed": True}
+            except OSError as exc:
+                temp_path.unlink(missing_ok=True)
+                raise DataSaveError(f"could not update completed_stages.csv: {exc}") from exc
+
     @property
     def qc_complete(self) -> bool:
         return self.completed_stages["QC"]
@@ -1090,6 +1111,9 @@ class BatchContext:
 
 batch_contexts: Dict[str, BatchContext] = {}
 batch_contexts_lock = threading.Lock()
+_renaming_jobs: Dict[str, Dict[str, Any]] = {}
+_renaming_jobs_lock = threading.Lock()
+_renaming_clone_lock = threading.Lock()
 
 
 def _batch_id(root: Path) -> str:
@@ -1174,6 +1198,84 @@ def _selected_batch(allow_completed: bool = False) -> Tuple[Optional[BatchContex
     if requested_id:
         session.pop("qc_batch_id", None)
     return None, available, warnings
+
+
+def _renaming_batches() -> Tuple[List[BatchContext], List[str]]:
+    batches, warnings = discover_batches()
+    return [
+        batch for batch in batches
+        if batch.completed_stages["QC"] and not batch.completed_stages["Renamed"]
+    ], warnings
+
+
+def _renaming_context(batch_id: str) -> Optional[BatchContext]:
+    batches, _ = discover_batches()
+    return next(
+        (
+            batch for batch in batches
+            if batch.id == batch_id
+            and batch.completed_stages["QC"]
+            and not batch.completed_stages["Renamed"]
+        ),
+        None,
+    )
+
+
+def _renaming_job_state(batch_id: str) -> Dict[str, Any]:
+    with _renaming_jobs_lock:
+        return dict(_renaming_jobs.get(batch_id, {"status": "idle", "error": ""}))
+
+
+def _start_renaming_job(
+    context: BatchContext,
+    *,
+    old_accession: Optional[str] = None,
+    new_accession: Optional[str] = None,
+    force: bool = False,
+) -> bool:
+    """Start one background preparation or accession retry for a batch."""
+    with _renaming_jobs_lock:
+        existing = _renaming_jobs.get(context.id, {})
+        if existing.get("status") in {"preparing", "retrying"}:
+            return False
+        if (
+            not force
+            and old_accession is None
+            and (context.root / "name_mapping.csv").exists()
+        ):
+            _renaming_jobs[context.id] = {"status": "ready", "error": ""}
+            return False
+        _renaming_jobs[context.id] = {
+            "status": "retrying" if old_accession else "preparing",
+            "error": "",
+        }
+
+    def worker() -> None:
+        try:
+            with _renaming_clone_lock:
+                if old_accession is not None and new_accession is not None:
+                    renaming.retry_group(
+                        context.root,
+                        Path(Config.COPATH_CLONE),
+                        Path(Config.LABEL_CHECK_BATCHES),
+                        old_accession,
+                        new_accession,
+                    )
+                else:
+                    renaming.prepare_batch(
+                        context.root,
+                        Path(Config.COPATH_CLONE),
+                        Path(Config.LABEL_CHECK_BATCHES),
+                    )
+            state = {"status": "ready", "error": ""}
+        except Exception as exc:
+            app.logger.exception("Renaming preparation failed for batch %s", context.id)
+            state = {"status": "failed", "error": str(exc)}
+        with _renaming_jobs_lock:
+            _renaming_jobs[context.id] = state
+
+    threading.Thread(target=worker, daemon=True).start()
+    return True
 
 # ==============================================================================
 # 8. HELPER FUNCTIONS
@@ -2215,6 +2317,172 @@ def index():
     return render_template("index.html", messages=flash_messages())
 
 
+@app.route("/renaming", methods=["GET"])
+@login_required
+def renaming_page():
+    batches, discovery_warnings = _renaming_batches()
+    if request.args.get("choose") == "1":
+        session.pop("renaming_batch_id", None)
+    requested = request.args.get("batch") or session.get("renaming_batch_id")
+    context = next((batch for batch in batches if batch.id == requested), None)
+    if context is None:
+        if requested:
+            session.pop("renaming_batch_id", None)
+        for batch in batches:
+            if not (batch.root / "name_mapping.csv").exists():
+                _start_renaming_job(batch)
+        return render_template(
+            "renaming.html",
+            batches=batches,
+            context=None,
+            discovery_warnings=discovery_warnings,
+            messages=flash_messages(),
+            job_states={batch.id: _renaming_job_state(batch.id) for batch in batches},
+        )
+
+    session["renaming_batch_id"] = context.id
+    mapping_path = context.root / "name_mapping.csv"
+    if not mapping_path.exists():
+        _start_renaming_job(context)
+        return render_template(
+            "renaming.html", batches=batches, context=context, groups=[], signature="",
+            discovery_warnings=discovery_warnings, messages=flash_messages(),
+            job_state=_renaming_job_state(context.id),
+        )
+    try:
+        _, rows = renaming.read_csv(mapping_path)
+        reports = renaming.report_rows(context.root, Path(Config.COPATH_CLONE))
+        groups = renaming.group_mapping(rows, reports)
+        signature = renaming.mapping_signature(rows)
+    except renaming.RenamingError as exc:
+        flash(str(exc), "error")
+        groups, signature = [], ""
+    return render_template(
+        "renaming.html", batches=batches, context=context, groups=groups,
+        signature=signature, discovery_warnings=discovery_warnings,
+        messages=flash_messages(), job_state=_renaming_job_state(context.id),
+    )
+
+
+@app.route("/renaming/status/<batch_id>", methods=["GET"])
+@login_required
+def renaming_status(batch_id: str):
+    context = _renaming_context(batch_id)
+    if context is None:
+        return jsonify({"status": "unavailable", "error": "Batch not found."}), 404
+    state = _renaming_job_state(batch_id)
+    state["ready"] = (context.root / "name_mapping.csv").exists()
+    return jsonify(state)
+
+
+@app.route("/renaming/prepare/<batch_id>", methods=["POST"])
+@login_required
+def renaming_prepare(batch_id: str):
+    context = _renaming_context(batch_id)
+    if context is None:
+        flash("The batch is no longer available for renaming.", "warning")
+        return redirect(url_for("renaming_page"))
+    _start_renaming_job(context, force=True)
+    flash("CoPath preparation started.", "info")
+    return redirect(url_for("renaming_page", batch=batch_id))
+
+
+@app.route("/renaming/retry/<batch_id>", methods=["POST"])
+@login_required
+def renaming_retry(batch_id: str):
+    context = _renaming_context(batch_id)
+    if context is None:
+        flash("The batch is no longer available for renaming.", "warning")
+        return redirect(url_for("renaming_page"))
+    old_accession = request.form.get("old_accession", "").strip().upper()
+    new_accession = request.form.get("accession_id", "").strip().upper()
+    if not renaming.ACCESSION_RE.fullmatch(new_accession):
+        flash("AccessionID must match A12-123.", "error")
+    elif _start_renaming_job(
+        context, old_accession=old_accession, new_accession=new_accession, force=True
+    ):
+        flash(f"CoPath retry started for {new_accession}.", "info")
+    else:
+        flash("A CoPath job is already running for this batch.", "warning")
+    return redirect(url_for("renaming_page", batch=batch_id))
+
+
+@app.route("/renaming/approve/<batch_id>", methods=["POST"])
+@login_required
+def renaming_approve(batch_id: str):
+    context = _renaming_context(batch_id)
+    if context is None:
+        flash("The batch is no longer available for renaming.", "warning")
+        return redirect(url_for("renaming_page"))
+    mapping_path = context.root / "name_mapping.csv"
+    old_accession = request.form.get("old_accession", "").strip().upper()
+    values = {
+        "AccessionID": request.form.get("accession_id", "").strip().upper(),
+        "Organ": request.form.get("organ", "").strip().upper(),
+        "PID": request.form.get("pid", "").strip().upper(),
+        "AccessionDate": request.form.get("accession_date", "").strip().upper(),
+        "Timepoint": request.form.get("timepoint", "").strip().upper(),
+        "ImageType": request.form.get("image_type", "").strip().upper(),
+        "SampAcqType": request.form.get("samp_acq_type", "").strip().upper(),
+    }
+    try:
+        if _renaming_job_state(batch_id).get("status") in {"preparing", "retrying"}:
+            raise renaming.RenamingError(
+                "Wait for the active CoPath job to finish before approving names"
+            )
+        _, current_rows = renaming.read_csv(mapping_path)
+        target_exists = any(
+            row["AccessionID"] == values["AccessionID"]
+            for row in current_rows
+            if row["AccessionID"] != old_accession
+        )
+        if values["AccessionID"] != old_accession and not target_exists:
+            raise renaming.RenamingError(
+                "Retry CoPath after changing an accession ID before approving it"
+            )
+        if not target_exists:
+            reports = renaming.report_rows(context.root, Path(Config.COPATH_CLONE))
+            mrn = reports.get(old_accession, {}).get("mrn", "").strip()
+            pid_error = renaming.validate_pid_assignment(
+                Path(Config.COPATH_CLONE), values["Organ"], values["PID"], mrn
+            )
+            if pid_error:
+                raise renaming.RenamingError(pid_error)
+        slide_values: Dict[str, Dict[str, str]] = {}
+        try:
+            slide_count = int(request.form.get("slide_count", "0"))
+        except ValueError as exc:
+            raise renaming.RenamingError("Invalid slide submission") from exc
+        for index in range(slide_count):
+            path = request.form.get(f"original_path_{index}", "")
+            slide_values[path] = {
+                "Stain": request.form.get(f"stain_{index}", "").strip(),
+                "BlockNumber": request.form.get(f"block_number_{index}", "").strip(),
+                "SectionCount": request.form.get(f"section_count_{index}", "").strip(),
+            }
+        updated, merged = renaming.update_group(
+            mapping_path, old_accession, values, slide_values,
+            request.form.get("mapping_signature", ""),
+        )
+        if merged:
+            flash("Accessions were merged. Review and approve the combined group.", "info")
+        else:
+            flash(f"Approved names for {values['AccessionID']}.", "success")
+        if updated and all(renaming.parse_bool(row["Approved"]) for row in updated):
+            with _renaming_clone_lock:
+                renaming.finalize_batch(context.root, Path(Config.COPATH_CLONE))
+                context.mark_renamed_complete()
+            flash("All names are approved and the batch has been finalized.", "success")
+            return redirect(url_for("renaming_page"))
+    except (renaming.RenamingError, DataSaveError) as exc:
+        app.logger.warning("Renaming approval failed for %s: %s", batch_id, exc)
+        flash(str(exc), "error")
+    except Exception as exc:
+        app.logger.exception("Renaming finalization failed for %s", batch_id)
+        flash(f"Renaming finalization failed: {exc}", "error")
+    return redirect(url_for("renaming_page", batch=batch_id))
+
+
 @app.route("/pipeline", methods=["GET"])
 @login_required
 def pipeline_launcher():
@@ -2782,6 +3050,7 @@ def update():
                                 "error",
                             )
                             return redirect(url_for("qc", batch=context.id))
+                        _start_renaming_job(context)
                         flash("🎉 ALL ITEMS COMPLETED! A final comprehensive backup has been created.", "success")
                 else:
                     flash("Changes saved successfully.", "success")

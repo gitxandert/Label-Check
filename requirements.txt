@@ -8,5 +8,6 @@ openpyxl
 openslide-bin
 openslide-python
 pandas
+pyodbc
 striprtf
 tqdm
