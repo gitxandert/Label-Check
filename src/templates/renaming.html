@@ -34,17 +34,17 @@
         .cell { min-height:58px; display:flex; align-items:center; padding:8px; border-bottom:1px solid var(--border); }
         .cell input,.cell select { width:100%; min-width:0; padding:7px; border:1px solid #b8c0cc; border-radius:5px; background:white; }
         .approved .cell { background:#f0faf2; }
-        .toggle { width:30px; height:30px; padding:0; font-size:1rem; transition:transform .15s ease; }
-        .toggle[aria-expanded="true"] { transform:rotate(90deg); }
+        .slide-toggle { width:30px; height:30px; padding:0; font-size:1rem; transition:transform .15s ease; }
+        .slide-toggle[aria-expanded="true"] { transform:rotate(90deg); }
         .expanded { grid-column:1/-1; padding:10px 18px 16px 46px; border-bottom:1px solid var(--border); background:#fafbfc; }
         .expanded[hidden] { display:none; }
         .slide { display:grid; grid-template-columns:minmax(320px,2fr) minmax(140px,1fr) 130px 110px minmax(330px,2fr); gap:10px; align-items:center; margin:7px 0; }
         .slide input { width:100%; padding:7px; border:1px solid #b8c0cc; border-radius:5px; }
         .path,.new-name { overflow-wrap:anywhere; font-family:monospace; font-size:.83rem; }
-        .report { display:block; margin-top:10px; padding:10px 14px; border:1px solid var(--border); border-radius:6px; background:white; }
-        .report summary { cursor:pointer; font-weight:700; }
-        .report dt { margin-top:10px; font-weight:700; }
-        .report dd { margin:4px 0 0; white-space:pre-wrap; }
+        .report-content { padding:4px 14px 12px; border:1px solid var(--border); border-radius:6px; background:white; }
+        .report-content dl { margin:0; }
+        .report-content dt { margin-top:12px; font-weight:700; }
+        .report-content dd { margin:4px 0 0; white-space:pre-wrap; }
         .actions { gap:6px; flex-wrap:wrap; }
         .empty { color:var(--muted); }
         @media(max-width:800px){ header{align-items:flex-start;flex-direction:column} .review{height:auto} }
@@ -99,7 +99,7 @@
                     <input type="hidden" name="old_accession" value="{{ group.accession }}">
                     <input type="hidden" name="mapping_signature" value="{{ signature }}">
                     <input type="hidden" name="slide_count" value="{{ group.slides|length }}">
-                        <div class="cell"><button class="toggle secondary" type="button" aria-expanded="false" aria-controls="slides-{{ loop.index0 }}" title="Show slides">▶</button></div>
+                        <div class="cell"><button class="slide-toggle secondary" type="button" aria-expanded="false" aria-controls="slides-{{ loop.index0 }}" title="Show slides">▶</button></div>
                         <div class="cell"><input name="accession_id" value="{{ group.shared.AccessionID }}" required></div>
                         <div class="cell"><select name="organ">{% for value in ['BRAIN','BREAST','TESTIS','OTHER','UNKNOWN'] %}<option {% if group.shared.Organ==value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
                         <div class="cell"><input name="pid" value="{{ group.shared.PID }}" maxlength="6" required></div>
@@ -107,7 +107,7 @@
                         <div class="cell"><input name="timepoint" value="{{ group.shared.Timepoint }}" maxlength="4" required></div>
                         <div class="cell"><select name="image_type">{% for value in ['WSI','FNA','XXX'] %}<option {% if group.shared.ImageType==value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
                         <div class="cell"><select name="samp_acq_type">{% for value in ['RE','BP','XX'] %}<option {% if group.shared.SampAcqType==value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
-                        <div class="cell">{% if group.report %}<span>{{ group.report|length }} field(s)</span>{% else %}<span class="state">No report</span>{% endif %}</div>
+                        <div class="cell">{% if group.report %}<button class="report-toggle secondary" type="button" aria-expanded="false" aria-controls="reports-{{ loop.index0 }}">View</button>{% else %}<button class="secondary" type="button" disabled>No report</button>{% endif %}</div>
                         <div class="cell">{% if group.approved %}<strong style="color:var(--success)">Approved</strong>{% else %}<span>Pending</span>{% endif %}</div>
                         <div class="cell actions">
                             <button class="success" type="submit" {% if job_state.status in ('preparing','retrying') %}disabled{% endif %}>Approve</button>
@@ -125,8 +125,12 @@
                                 <span class="new-name">{{ slide.NewName }}</span>
                             </div>
                             {% endfor %}
-                            {% if group.report %}<details class="report"><summary>View Reports</summary><dl>{% for label,value in group.report %}<dt>{{ label }}</dt><dd>{{ value }}</dd>{% endfor %}</dl></details>{% endif %}
                         </div>
+                        {% if group.report %}
+                        <div class="expanded report-expanded" id="reports-{{ loop.index0 }}" hidden>
+                            <div class="report-content"><dl>{% for label,value in group.report %}<dt>{{ label }}</dt><dd>{{ value }}</dd>{% endfor %}</dl></div>
+                        </div>
+                        {% endif %}
                 </form>
             {% endfor %}
         </div>
@@ -136,13 +140,30 @@
 {% if context %}
 <script>
 document.querySelectorAll('.accession-form').forEach((form) => {
-  const toggle = form.querySelector('.toggle');
-  const expanded = form.querySelector('.expanded');
-  toggle.addEventListener('click', () => {
-    const opening = toggle.getAttribute('aria-expanded') !== 'true';
-    toggle.setAttribute('aria-expanded', String(opening));
-    toggle.title = opening ? 'Hide slides' : 'Show slides';
-    expanded.hidden = !opening;
+  const slideToggle = form.querySelector('.slide-toggle');
+  const reportToggle = form.querySelector('.report-toggle');
+  const slides = form.querySelector(`#${slideToggle.getAttribute('aria-controls')}`);
+  const reports = reportToggle ? form.querySelector(`#${reportToggle.getAttribute('aria-controls')}`) : null;
+  const close = (toggle, panel) => {
+    if (!toggle || !panel) return;
+    toggle.setAttribute('aria-expanded', 'false');
+    panel.hidden = true;
+  };
+  slideToggle.addEventListener('click', () => {
+    const opening = slideToggle.getAttribute('aria-expanded') !== 'true';
+    close(reportToggle, reports);
+    if (reportToggle) reportToggle.textContent = 'View';
+    slideToggle.setAttribute('aria-expanded', String(opening));
+    slideToggle.title = opening ? 'Hide slides' : 'Show slides';
+    slides.hidden = !opening;
+  });
+  if (reportToggle) reportToggle.addEventListener('click', () => {
+    const opening = reportToggle.getAttribute('aria-expanded') !== 'true';
+    close(slideToggle, slides);
+    slideToggle.title = 'Show slides';
+    reportToggle.setAttribute('aria-expanded', String(opening));
+    reportToggle.textContent = opening ? 'Hide' : 'View';
+    reports.hidden = !opening;
   });
   const updateNames = () => {
     form.querySelectorAll('.new-name').forEach((output) => {

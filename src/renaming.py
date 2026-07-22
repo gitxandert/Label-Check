@@ -371,12 +371,12 @@ def prepare_batch(
         stain = (slide.get("Stain") or "XX").strip()
         block = (slide.get("BlockNumber") or "XX").strip()
         key = (accession, *shared.values(), stain, block)
-        counters[key] += 1
         row = {
             "AccessionID": accession, **shared, "Stain": stain, "BlockNumber": block,
             "SectionCount": f"{counters[key]:03d}",
             "OriginalPath": slide.get("original_slide_path", ""), "Approved": "False",
         }
+        counters[key] += 1
         row["NewName"] = build_new_name(row)
         mapping_rows.append(row)
     errors = validate_mapping_rows(mapping_rows)
@@ -460,8 +460,8 @@ def update_group(
                 row["Organ"], row["PID"], row["AccessionDate"], row["Timepoint"],
                 row["Stain"], row["ImageType"], row["SampAcqType"], row["BlockNumber"],
             )
-            counters[key] += 1
             row["SectionCount"] = f"{counters[key]:03d}"
+            counters[key] += 1
             row["NewName"] = build_new_name(row)
     errors = validate_mapping_rows(rows)
     if errors:

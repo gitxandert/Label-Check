@@ -63,9 +63,9 @@ class RenamingDataTests(unittest.TestCase):
 
         fields, rows = renaming.read_csv(self.batch / "name_mapping.csv")
         self.assertEqual(list(renaming.MAPPING_FIELDS), fields)
-        self.assertEqual(["001", "002"], [row["SectionCount"] for row in rows])
+        self.assertEqual(["000", "001"], [row["SectionCount"] for row in rows])
         self.assertTrue(all(row["PID"] == "AAAAAZ" for row in rows))
-        self.assertEqual("BRAIN_AAAAAZ_20250304_XXXX_HE_WSI_REB4001.svs", rows[0]["NewName"])
+        self.assertEqual("BRAIN_AAAAAZ_20250304_XXXX_HE_WSI_REB4000.svs", rows[0]["NewName"])
         self.assertTrue(all(row["Approved"] == "False" for row in rows))
 
     def test_prepare_missing_report_uses_unknown_and_index_only_on_finalize(self):
@@ -216,9 +216,21 @@ class RenamingPageTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         self.assertEqual(2, response.data.count(b'class="accession-form'))
         self.assertEqual(2, response.data.count(b'name="accession_id"'))
-        self.assertEqual(2, response.data.count(b'class="toggle secondary"'))
+        self.assertEqual(2, response.data.count(b'class="slide-toggle secondary"'))
         self.assertEqual(2, response.data.count(b'class="expanded"'))
         self.assertNotIn(b'<details>\n                        <summary class="cell"', response.data)
+
+    def test_report_view_is_a_row_button_with_its_own_full_width_panel(self):
+        batches, _ = app_module._renaming_batches()
+
+        response = self.client.get(f"/renaming?batch={batches[0].id}")
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn(b'class="report-toggle secondary"', response.data)
+        self.assertIn(b'>View</button>', response.data)
+        self.assertIn(b'class="expanded report-expanded"', response.data)
+        self.assertIn(b'id="reports-0" hidden', response.data)
+        self.assertNotIn(b'<details class="report">', response.data)
 
     def test_approval_finalizes_clone_and_completed_stage(self):
         batches, _ = app_module._renaming_batches()
