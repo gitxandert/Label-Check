@@ -922,17 +922,127 @@ class DataManager:
 class BatchContext:
     """Loaded data and persistent queue belonging to one discovered batch."""
 
+    COMPLETED_STAGES_FIELDS = ["QC", "Renamed"]
+
     def __init__(self, batch_id: str, root: Path):
         self.id = batch_id
         self.root = root
         self.name = root.name
         self.display_name = f"{root.parent.name}/{root.name}"
         self.csv_path = root / "enriched.csv"
+        self.completed_stages_path = root / "completed_stages.csv"
         queue_dir = Path(Config.INSTANCE_DIR) / "batch_queues"
         queue_dir.mkdir(parents=True, exist_ok=True)
         self.data_manager = DataManager(root, self.csv_path)
         self.queue_manager = QueueManager(str(queue_dir / f"{batch_id}.csv"))
         self.csv_mod_time: Optional[float] = None
+        self.completed_stages = {"QC": False, "Renamed": False}
+        self._completed_stages_lock = threading.Lock()
+
+    @staticmethod
+    def _parse_stage_value(value: Optional[str], column: str) -> bool:
+        normalized = (value or "").strip().lower()
+        if normalized not in {"true", "false"}:
+            raise DataLoadError(
+                f"completed_stages.csv has an invalid {column} value"
+            )
+        return normalized == "true"
+
+    def _write_new_completed_stages(self) -> None:
+        """Atomically create the default stage file without replacing an existing one."""
+        temp_path = self.completed_stages_path.with_name(
+            f".{self.completed_stages_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            with open(temp_path, "x", newline="", encoding="utf-8") as csvfile:
+                writer = csv.DictWriter(
+                    csvfile, fieldnames=self.COMPLETED_STAGES_FIELDS
+                )
+                writer.writeheader()
+                writer.writerow({"QC": "False", "Renamed": "False"})
+                csvfile.flush()
+                os.fsync(csvfile.fileno())
+            try:
+                os.link(temp_path, self.completed_stages_path)
+            except FileExistsError:
+                # Another discovery request initialized the batch first.
+                pass
+        finally:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def load_completed_stages(self, create_if_missing: bool = False) -> None:
+        """Load the single-row batch stage file, optionally initializing it."""
+        with self._completed_stages_lock:
+            if create_if_missing and not self.completed_stages_path.exists():
+                self._write_new_completed_stages()
+            try:
+                with open(
+                    self.completed_stages_path,
+                    "r",
+                    newline="",
+                    encoding="utf-8",
+                ) as csvfile:
+                    reader = csv.DictReader(csvfile)
+                    if reader.fieldnames != self.COMPLETED_STAGES_FIELDS:
+                        raise DataLoadError(
+                            "completed_stages.csv must have QC and Renamed columns"
+                        )
+                    rows = list(reader)
+            except DataLoadError:
+                raise
+            except (OSError, UnicodeError, csv.Error) as exc:
+                raise DataLoadError(
+                    f"could not read completed_stages.csv: {exc}"
+                ) from exc
+
+            if len(rows) != 1:
+                raise DataLoadError(
+                    "completed_stages.csv must contain exactly one data row"
+                )
+            row = rows[0]
+            self.completed_stages = {
+                column: self._parse_stage_value(row.get(column), column)
+                for column in self.COMPLETED_STAGES_FIELDS
+            }
+
+    def mark_qc_complete(self) -> None:
+        """Atomically mark the batch QC stage complete and preserve Renamed."""
+        with self._completed_stages_lock:
+            renamed = self.completed_stages["Renamed"]
+            temp_path = self.completed_stages_path.with_name(
+                f".{self.completed_stages_path.name}.{uuid.uuid4().hex}.tmp"
+            )
+            try:
+                with open(temp_path, "x", newline="", encoding="utf-8") as csvfile:
+                    writer = csv.DictWriter(
+                        csvfile, fieldnames=self.COMPLETED_STAGES_FIELDS
+                    )
+                    writer.writeheader()
+                    writer.writerow(
+                        {
+                            "QC": "True",
+                            "Renamed": "True" if renamed else "False",
+                        }
+                    )
+                    csvfile.flush()
+                    os.fsync(csvfile.fileno())
+                os.replace(temp_path, self.completed_stages_path)
+                self.completed_stages["QC"] = True
+            except OSError as exc:
+                try:
+                    temp_path.unlink()
+                except FileNotFoundError:
+                    pass
+                raise DataSaveError(
+                    f"could not update completed_stages.csv: {exc}"
+                ) from exc
+
+    @property
+    def qc_complete(self) -> bool:
+        return self.completed_stages["QC"]
 
     def refresh(self) -> None:
         mod_time = self.csv_path.stat().st_mtime
@@ -1034,6 +1144,7 @@ def discover_batches() -> Tuple[List[BatchContext], List[str]]:
                     batch_contexts[batch_id] = context
             context.queue_manager.load()
             context.refresh()
+            context.load_completed_stages(create_if_missing=True)
             if not context.data_manager.data:
                 raise DataLoadError("enriched.csv has no slide rows")
             if "ParsingQCPassed" not in context.data_manager.headers:
@@ -1041,25 +1152,23 @@ def discover_batches() -> Tuple[List[BatchContext], List[str]]:
                     f"Skipped {display_name}: enriched.csv is missing ParsingQCPassed."
                 )
                 continue
-            if all(row["_is_complete"] for row in context.data_manager.data):
-                continue
             discovered.append(context)
         except (DataLoadError, OSError, ValueError) as exc:
             app.logger.warning("Skipping invalid batch %s: %s", root, exc)
-            warnings.append(f"Skipped {display_name}: enriched.csv could not be loaded.")
+            warnings.append(f"Skipped {display_name}: {exc}")
 
     return discovered, warnings
 
 
 def _selected_batch(allow_completed: bool = False) -> Tuple[Optional[BatchContext], List[BatchContext], List[str]]:
     batches, warnings = discover_batches()
-    available = [batch for batch in batches if not batch.is_complete]
+    available = [batch for batch in batches if not batch.qc_complete]
     if request.args.get("choose") == "1":
         session.pop("qc_batch_id", None)
         return None, available, warnings
     requested_id = request.values.get("batch") or session.get("qc_batch_id")
     selected = next((batch for batch in batches if batch.id == requested_id), None)
-    if selected and (allow_completed or not selected.is_complete):
+    if selected and (allow_completed or not selected.qc_complete):
         session["qc_batch_id"] = selected.id
         return selected, available, warnings
     if requested_id:
@@ -2596,15 +2705,25 @@ def update():
                 _create_backup(context)
                 data_manager.save_data(context.csv_path)
                 context.csv_mod_time = context.csv_path.stat().st_mtime
-                flash("Changes saved successfully.", "success")
-                
+
                 # --- CHECK IF LIST IS DONE ---
                 remaining = len([i for i in queue_manager.get_all() if i.status != "completed"])
-                
+
                 if remaining == 0:
-                    flash("🎉 ALL ITEMS COMPLETED! A final comprehensive backup has been created.", "success")
                     app.logger.info("All items completed. Creating final backup.")
                     _create_backup(context, suffix="FINAL_COMPLETED")
+                    try:
+                        context.mark_qc_complete()
+                    except DataSaveError as exc:
+                        app.logger.error("QC status update failed: %s", exc)
+                        flash(
+                            "Slide changes were saved, but the batch could not be marked as QC complete.",
+                            "error",
+                        )
+                        return redirect(url_for("qc", batch=context.id))
+                    flash("🎉 ALL ITEMS COMPLETED! A final comprehensive backup has been created.", "success")
+                else:
+                    flash("Changes saved successfully.", "success")
 
             except Exception as e:
                 app.logger.error(f"Save operation failed: {e}")
