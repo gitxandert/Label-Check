@@ -219,6 +219,7 @@ backend/node_modules/
 NP-*
 *csv8
 */*csv*
+*.csv
 NP-*.*
 .gitignore
 src/audit_logs/*
