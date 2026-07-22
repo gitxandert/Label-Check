@@ -3,10 +3,15 @@ import re
 import sys
 from pathlib import Path
 
+import pyodbc
+import pandas as pd
+from striprtf.striprtf import rtf_to_text
+
 from copath_texttypes import (
     format_text_agg_columns,
     format_text_select_columns,
     format_texttype_id_list,
+    TEXT_TYPES
 )
 
 DEFAULT_INSERT_BATCH_SIZE = 900
@@ -445,6 +450,51 @@ mrn_query = """
   ORDER BY mr.medrec_num, ms.accession_date, ms.specnum_formatted;
 """
 
+# string to connect to CoPath
+CONN_STR = (
+    "DRIVER={ODBC Driver 17 for SQL Server};"
+    "SERVER=IUHWCPTHDB3980"
+    "DATABASE=COPLIVE"
+    "Trusted_Connection=yes;"
+)
+
+REPORT_FIELDS = [ tt[1] for tt in TEXT_TYPES ]
+
+def parse_field(field):
+    if not isinstance(field, str):
+        return field # Returns original value if it's NaN or Not a String
+    
+    # Optional: Only convert if the RTF header is present
+    if field.startswith('{\\rtf1'):
+        try:
+            return rtf_to_text(field)
+        except:
+            return field
+    
+    return field # Return as-is if it's just plain text
+
+
+def normalize_report_field(field):
+    parsed = parse_field(field)
+    if parsed is None:
+        return ""
+
+    return str(parsed).replace('\r', '\n').replace('\x00', '')
+
+
+def clean_column(results, column):
+    for i in range(len(results[column])):
+       field = results.loc[i, column]
+       results.loc[i, column] = normalize_report_field(field)
+
+
+def clean_results(results):
+    for column in results.columns.to_list():
+        if column in REPORT_FIELDS:
+            clean_column(results, column)
+    return results
+
+
 def process_input_file(file_path, target_column):
     with open(file_path, 'r', newline='', encoding='utf-8') as f:
         if target_column is None:
@@ -658,7 +708,7 @@ def build_accession_query_output(accessions, batch_size, separate_queries):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-            description="Script to create a SQL query for CoPath to get reports for provided patient identifiers (accession IDs or MRNs)"
+            description="Script to query CoPath to get reports for provided patient identifiers (accession IDs or MRNs)"
     )
     parser.add_argument(
             "input_file",
@@ -677,7 +727,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
             "-o", "--output_file",
-            help="Optional name of output_file (defaults to {input_file name}.sql",
+            help="Optional name of output_file (defaults to copath_SQL_results.csv)",
+            default="copath_SQL_results.csv",
             required=False
     )
     parser.add_argument(
@@ -728,15 +779,22 @@ if __name__ == "__main__":
             print(f"Wrote invalid accession IDs to {invalid_accessions_csv}")
         sys.exit(1)
 
+    # connect to database and run query
     output_file = args.output_file
-    if output_file is None:
-        input_path = Path(args.input_file)
-        input_name = input_path.stem
-        output_file = f"{input_name}_CoPath_SQL_query.sql"
+    try:
+        conn = pyodbc.connect(conn_str)
+        
+        results = pd.read_sql(formatted_query, conn)
 
-    with open(output_file, 'w') as f:
-        f.write(formatted_query)
-        print(f"Wrote SQL query to {output_file}")
+        _ = clean_results(results)
 
-    if invalid_accessions_csv is not None:
-        print(f"Wrote invalid accession IDs to {invalid_accessions_csv}")
+        results.to_csv(output_file, index=False)
+        print(f"CoPath data exported to {output_file}")
+
+    except Exception as e:
+        print(e)
+        sys.exit(1)
+
+    finally:
+        if 'conn' in locals():
+            conn.close()
