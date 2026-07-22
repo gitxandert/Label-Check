@@ -21,6 +21,7 @@ class CompletedStagesTests(unittest.TestCase):
                 csvfile,
                 fieldnames=[
                     "AccessionID",
+                    "BlockNumber",
                     "Stain",
                     "ParsingQCPassed",
                     "original_slide_path",
@@ -29,7 +30,8 @@ class CompletedStagesTests(unittest.TestCase):
             writer.writeheader()
             writer.writerow(
                 {
-                    "AccessionID": "A1",
+                    "AccessionID": "A12-123",
+                    "BlockNumber": "A1",
                     "Stain": "H&E",
                     "ParsingQCPassed": "TRUE",
                     "original_slide_path": "slide.svs",
@@ -100,6 +102,53 @@ class CompletedStagesTests(unittest.TestCase):
         context.load_completed_stages()
 
         self.assertEqual(context.completed_stages, {"QC": True, "Renamed": True})
+
+    def test_qc_row_validation_requires_all_fields_and_canonical_accession(self):
+        valid_row = {
+            "AccessionID": "NP25-1234",
+            "BlockNumber": "A1",
+            "Stain": "H&E",
+        }
+
+        self.assertEqual(qc_app._qc_row_validation_errors(valid_row), [])
+        self.assertIn(
+            "Accession ID must match A12-123",
+            qc_app._qc_row_validation_errors({**valid_row, "AccessionID": "np25-1234"}),
+        )
+        self.assertIn(
+            "Block Number is required",
+            qc_app._qc_row_validation_errors({**valid_row, "BlockNumber": "  "}),
+        )
+        self.assertIn(
+            "Stain is required",
+            qc_app._qc_row_validation_errors({**valid_row, "Stain": ""}),
+        )
+
+    def test_final_validation_requeues_invalid_completed_row(self):
+        batches, _ = qc_app.discover_batches()
+        context = batches[0]
+        row = context.data_manager.data[0]
+        row["AccessionID"] = "A12/123"
+        item = context.queue_manager.get(0)
+        item.completed_by_id = "reviewer"
+        item.completed_at = "2026-07-22T12:00:00"
+
+        invalid_indices = qc_app._requeue_invalid_qc_rows(context)
+
+        self.assertEqual(invalid_indices, [0])
+        self.assertFalse(row["_is_complete"])
+        self.assertEqual(item.status, "pending")
+        self.assertIsNone(item.completed_by_id)
+        self.assertIsNone(item.completed_at)
+
+    def test_final_validation_leaves_valid_completed_row_unchanged(self):
+        batches, _ = qc_app.discover_batches()
+        context = batches[0]
+        item = context.queue_manager.get(0)
+
+        self.assertEqual(qc_app._requeue_invalid_qc_rows(context), [])
+        self.assertTrue(context.data_manager.data[0]["_is_complete"])
+        self.assertEqual(item.status, "completed")
 
 
 if __name__ == "__main__":

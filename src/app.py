@@ -1237,6 +1237,48 @@ def _is_row_incomplete(row_dict: Dict[str, Any]) -> bool:
     return not row_dict.get("_is_complete", False)
 
 
+def _qc_row_validation_errors(row: Dict[str, Any]) -> List[str]:
+    """Return the QC fields that are missing or invalid for a completed row."""
+    errors = []
+    accession_id = str(row.get("AccessionID") or "").strip()
+    if not accession_id:
+        errors.append("Accession ID is required")
+    elif not _accession_pattern.fullmatch(accession_id):
+        errors.append("Accession ID must match A12-123")
+
+    if not str(row.get("BlockNumber") or "").strip():
+        errors.append("Block Number is required")
+    if not str(row.get("Stain") or "").strip():
+        errors.append("Stain is required")
+    return errors
+
+
+def _requeue_invalid_qc_rows(context: BatchContext) -> List[int]:
+    """Return invalid completed rows to the pending queue."""
+    invalid_indices = []
+    for row in context.data_manager.data:
+        if not _qc_row_validation_errors(row):
+            continue
+
+        index = row["_original_index"]
+        invalid_indices.append(index)
+        row["_is_complete"] = False
+
+        item = context.queue_manager.get(index)
+        if item is None:
+            item = QueueItem(original_index=index)
+            context.queue_manager.add(item)
+        item.status = "pending"
+        item.leased_by_id = None
+        item.leased_at = None
+        item.completed_by_id = None
+        item.completed_at = None
+
+    if invalid_indices:
+        context.queue_manager.save()
+    return invalid_indices
+
+
 def flash_messages() -> List[Dict[str, str]]:
     return [
         {"category": category, "message": message}
@@ -1622,7 +1664,7 @@ PIPELINE_FORM_DEFAULTS = {
     "thumbnail_height": "300",
     "ocr_workers": "4",
     "ocr_use_cpu": "",
-    "naming_accession_pattern": r"\b([A-Za-z]+\d+[ -/]\d+)\b",
+    "naming_accession_pattern": r"\b([A-Za-z]{1,3}\s*\d{2}\s*[ -/]\s*\d+)\b",
     "naming_workers": "4",
 }
 
@@ -2679,8 +2721,12 @@ def update():
         
         # Validation for completion
         if new_values["_is_complete"]:
-            if not new_values["AccessionID"] or not new_values["Stain"]:
-                flash("Cannot mark as complete: Accession ID and Stain are required.", "warning")
+            validation_errors = _qc_row_validation_errors(new_values)
+            if validation_errors:
+                flash(
+                    "Cannot mark as complete: " + "; ".join(validation_errors) + ".",
+                    "warning",
+                )
                 new_values["_is_complete"] = False
 
         # Apply updates
@@ -2710,18 +2756,33 @@ def update():
                 remaining = len([i for i in queue_manager.get_all() if i.status != "completed"])
 
                 if remaining == 0:
-                    app.logger.info("All items completed. Creating final backup.")
-                    _create_backup(context, suffix="FINAL_COMPLETED")
-                    try:
-                        context.mark_qc_complete()
-                    except DataSaveError as exc:
-                        app.logger.error("QC status update failed: %s", exc)
-                        flash(
-                            "Slide changes were saved, but the batch could not be marked as QC complete.",
-                            "error",
+                    invalid_indices = _requeue_invalid_qc_rows(context)
+                    if invalid_indices:
+                        data_manager.save_data(context.csv_path)
+                        context.csv_mod_time = context.csv_path.stat().st_mtime
+                        app.logger.warning(
+                            "Final QC validation returned %d row(s) to the queue for batch %s.",
+                            len(invalid_indices),
+                            context.id,
                         )
-                        return redirect(url_for("qc", batch=context.id))
-                    flash("🎉 ALL ITEMS COMPLETED! A final comprehensive backup has been created.", "success")
+                        flash(
+                            f"Final validation returned {len(invalid_indices)} slide(s) "
+                            "to the QC queue because required values were missing or invalid.",
+                            "warning",
+                        )
+                    else:
+                        app.logger.info("All items passed final validation. Creating final backup.")
+                        _create_backup(context, suffix="FINAL_COMPLETED")
+                        try:
+                            context.mark_qc_complete()
+                        except DataSaveError as exc:
+                            app.logger.error("QC status update failed: %s", exc)
+                            flash(
+                                "Slide changes were saved, but the batch could not be marked as QC complete.",
+                                "error",
+                            )
+                            return redirect(url_for("qc", batch=context.id))
+                        flash("🎉 ALL ITEMS COMPLETED! A final comprehensive backup has been created.", "success")
                 else:
                     flash("Changes saved successfully.", "success")
 
