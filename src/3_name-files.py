@@ -55,6 +55,12 @@ COL_EXTRACTION_SUCCESSFUL = "ExtractionSuccessful"
 # This column is added for compatibility with the manual review tool. It starts empty.
 COL_QC_PASSED = "ParsingQCPassed"
 
+CANONICAL_ACCESSION_PATTERN = re.compile(r"^[A-Z]{1,3}[0-9]{2}-[0-9]+$")
+DEFAULT_ACCESSION_PATTERN = r"\b([A-Za-z]{1,3}\s*\d{2}\s*[ -/]\s*\d+)\b"
+LOOSE_ACCESSION_PATTERN = re.compile(
+    r"^\s*([A-Za-z]{1,3})\s*(\d{2})\s*[- /]\s*(\d+)\s*$"
+)
+
 # A comprehensive dictionary to correct common OCR errors and variations for stain names.
 # The key is the "canonical" (standard) name, and the value is a list of all known
 # variations that should be mapped to it. This can be easily extended or moved to an
@@ -183,6 +189,16 @@ def build_stain_normalizer(
     return pattern, variation_lookup
 
 
+def normalize_accession_id(value: str) -> str:
+    """Normalize a recognized accession ID to the canonical A12-123 form."""
+    candidate = (value or "").strip()
+    match = LOOSE_ACCESSION_PATTERN.fullmatch(candidate)
+    if not match:
+        return candidate
+    prefix, year, number = match.groups()
+    return f"{prefix.upper()}{year}-{number}"
+
+
 def process_csv_row(
     row: Dict[str, str],
     accession_pattern: re.Pattern,
@@ -223,13 +239,13 @@ def process_csv_row(
     # so only extract if the name is delimited by semicolons
     file_name_split = file_name.split(';')
     if len(file_name_split) > 1:
-        accession_id = file_name_split[0]
+        accession_id = normalize_accession_id(file_name_split[0])
     else:
         # If no match is found, look in the label text
         accession_match = accession_pattern.search(search_text)
         # If a match is found, normalize it to a standard format (uppercase, hyphens, no spaces).
         if accession_match:
-            accession_id = accession_match.group(0).replace(" ", "-").upper()
+            accession_id = normalize_accession_id(accession_match.group(0))
             # Remove the match from the search text so that the regex doesn't attempt to find block number in the accession ID
             search_text = search_text.replace(accession_match.group(0), "")
         
@@ -262,7 +278,12 @@ def process_csv_row(
     updated_row[COL_STAIN] = canonical_stain
     updated_row[COL_BLOCK_NUMBER] = block_number
     # The extraction is considered successful only if an ID, a stain, and a block number were found.
-    updated_row[COL_EXTRACTION_SUCCESSFUL] = bool(accession_id and canonical_stain and block_number)
+    updated_row[COL_EXTRACTION_SUCCESSFUL] = bool(
+        accession_id
+        and CANONICAL_ACCESSION_PATTERN.fullmatch(accession_id)
+        and canonical_stain
+        and block_number
+    )
     # Initialize the QC_PASSED column as empty.
     updated_row[COL_QC_PASSED] = ""
 
@@ -392,7 +413,7 @@ if __name__ == "__main__":
         # A robust default regex that matches formats like 'NP 22-950' or 'NP22-123'.
         # \b ensures we match whole words only.
         # \s* allows for zero or more spaces.
-        default=r"\b([A-Za-z]+\d+[ -/]\d+)\b",
+        default=DEFAULT_ACCESSION_PATTERN,
         help="Regex pattern to extract the Accession ID.",
     )
 
