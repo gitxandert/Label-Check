@@ -8,4 +8,5 @@ openpyxl
 openslide-bin
 openslide-python
 pandas
+striprtf
 tqdm
