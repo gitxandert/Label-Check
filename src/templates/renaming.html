@@ -28,17 +28,16 @@
         button.secondary { background:#6c757d; }
         button.success { background:var(--success); }
         .review { height:calc(100vh - 145px); overflow:auto; border:1px solid var(--border); border-radius:9px; background:white; }
-        .grid { min-width:1420px; display:grid; grid-template-columns:36px 135px 115px 100px 125px 90px 100px 105px 115px 105px 105px; align-items:center; }
+        .table-header,.accession-form { min-width:1420px; display:grid; grid-template-columns:44px 135px 115px 100px 125px 90px 100px 105px 115px 105px minmax(170px,1fr); align-items:stretch; }
+        .table-header { position:sticky; top:0; z-index:5; }
         .column-header { position:sticky; top:0; z-index:5; padding:11px 8px; color:white; background:#344054; font-size:.82rem; font-weight:700; }
-        .accession-form { display:contents; }
         .cell { min-height:58px; display:flex; align-items:center; padding:8px; border-bottom:1px solid var(--border); }
         .cell input,.cell select { width:100%; min-width:0; padding:7px; border:1px solid #b8c0cc; border-radius:5px; background:white; }
         .approved .cell { background:#f0faf2; }
-        .accession-form > details { display:contents; }
-        .accession-form > details > summary { list-style:none; cursor:pointer; font-size:1.25rem; }
-        .accession-form > details > summary::-webkit-details-marker { display:none; }
-        .accession-form > details[open] > summary { transform:rotate(90deg); }
+        .toggle { width:30px; height:30px; padding:0; font-size:1rem; transition:transform .15s ease; }
+        .toggle[aria-expanded="true"] { transform:rotate(90deg); }
         .expanded { grid-column:1/-1; padding:10px 18px 16px 46px; border-bottom:1px solid var(--border); background:#fafbfc; }
+        .expanded[hidden] { display:none; }
         .slide { display:grid; grid-template-columns:minmax(320px,2fr) minmax(140px,1fr) 130px 110px minmax(330px,2fr); gap:10px; align-items:center; margin:7px 0; }
         .slide input { width:100%; padding:7px; border:1px solid #b8c0cc; border-radius:5px; }
         .path,.new-name { overflow-wrap:anywhere; font-family:monospace; font-size:.83rem; }
@@ -91,16 +90,16 @@
 
         {% if groups %}
         <div class="review">
-            <div class="grid">
+            <div class="table-header">
                 {% for label in ['', 'Accession ID','Organ','PID','Accession Date','Timepoint','Image Type','Sample Type','Reports','Approval','Actions'] %}<div class="column-header">{{ label }}</div>{% endfor %}
-                {% for group in groups %}
+            </div>
+            {% for group in groups %}
                 <form class="accession-form {% if group.approved %}approved{% endif %}" method="post" action="{{ url_for('renaming_approve', batch_id=context.id) }}">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <input type="hidden" name="old_accession" value="{{ group.accession }}">
                     <input type="hidden" name="mapping_signature" value="{{ signature }}">
                     <input type="hidden" name="slide_count" value="{{ group.slides|length }}">
-                    <details>
-                        <summary class="cell" title="Show slides">▶</summary>
+                        <div class="cell"><button class="toggle secondary" type="button" aria-expanded="false" aria-controls="slides-{{ loop.index0 }}" title="Show slides">▶</button></div>
                         <div class="cell"><input name="accession_id" value="{{ group.shared.AccessionID }}" required></div>
                         <div class="cell"><select name="organ">{% for value in ['BRAIN','BREAST','TESTIS','OTHER','UNKNOWN'] %}<option {% if group.shared.Organ==value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
                         <div class="cell"><input name="pid" value="{{ group.shared.PID }}" maxlength="6" required></div>
@@ -114,7 +113,7 @@
                             <button class="success" type="submit" {% if job_state.status in ('preparing','retrying') %}disabled{% endif %}>Approve</button>
                             <button class="secondary" type="submit" formaction="{{ url_for('renaming_retry', batch_id=context.id) }}" {% if job_state.status in ('preparing','retrying') %}disabled{% endif %}>Retry</button>
                         </div>
-                        <div class="expanded">
+                        <div class="expanded" id="slides-{{ loop.index0 }}" hidden>
                             <div class="slide"><strong>Original path</strong><strong>Stain</strong><strong>Block</strong><strong>Section</strong><strong>New name</strong></div>
                             {% for slide in group.slides %}
                             <div class="slide">
@@ -128,10 +127,8 @@
                             {% endfor %}
                             {% if group.report %}<details class="report"><summary>View Reports</summary><dl>{% for label,value in group.report %}<dt>{{ label }}</dt><dd>{{ value }}</dd>{% endfor %}</dl></details>{% endif %}
                         </div>
-                    </details>
                 </form>
-                {% endfor %}
-            </div>
+            {% endfor %}
         </div>
         {% elif job_state.status not in ('preparing','retrying') %}<p class="empty">No prepared slide mappings are available.</p>{% endif %}
     {% endif %}
@@ -139,6 +136,14 @@
 {% if context %}
 <script>
 document.querySelectorAll('.accession-form').forEach((form) => {
+  const toggle = form.querySelector('.toggle');
+  const expanded = form.querySelector('.expanded');
+  toggle.addEventListener('click', () => {
+    const opening = toggle.getAttribute('aria-expanded') !== 'true';
+    toggle.setAttribute('aria-expanded', String(opening));
+    toggle.title = opening ? 'Hide slides' : 'Show slides';
+    expanded.hidden = !opening;
+  });
   const updateNames = () => {
     form.querySelectorAll('.new-name').forEach((output) => {
       const row = output.closest('.slide');

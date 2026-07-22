@@ -198,6 +198,28 @@ class RenamingPageTests(unittest.TestCase):
         self.assertIn(b"NP25-100", detail.data)
         self.assertIn(b"Diagnosis text", detail.data)
 
+    def test_multiple_accessions_render_as_complete_rows_before_expansion(self):
+        _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
+        second = dict(rows[0])
+        second.update({
+            "AccessionID": "NP25-200", "PID": "AAAAAB", "OriginalPath": "two.svs",
+            "SectionCount": "001",
+        })
+        second["NewName"] = renaming.build_new_name(second)
+        renaming.atomic_write(
+            self.batch / "name_mapping.csv", renaming.MAPPING_FIELDS, [rows[0], second]
+        )
+        batches, _ = app_module._renaming_batches()
+
+        response = self.client.get(f"/renaming?batch={batches[0].id}")
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(2, response.data.count(b'class="accession-form'))
+        self.assertEqual(2, response.data.count(b'name="accession_id"'))
+        self.assertEqual(2, response.data.count(b'class="toggle secondary"'))
+        self.assertEqual(2, response.data.count(b'class="expanded"'))
+        self.assertNotIn(b'<details>\n                        <summary class="cell"', response.data)
+
     def test_approval_finalizes_clone_and_completed_stage(self):
         batches, _ = app_module._renaming_batches()
         _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
