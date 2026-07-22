@@ -1,3 +1,4 @@
+import argparse
 import csv
 import re
 import sys
@@ -19,6 +20,7 @@ INVALID_ACCESSIONS_FILENAME = "invalid_accessions.csv"
 ACCESSION_PATTERN = re.compile(r"^([A-Za-z]+)(\d{2})-(\d+)$")
 
 acc_query = """
+  SET NOCOUNT ON;
   DROP TABLE IF EXISTS #input_accessions;
   DROP TABLE IF EXISTS #matched_specimens;
   CREATE TABLE #input_accessions (
@@ -236,6 +238,7 @@ acc_query = """
 """
 
 mrn_query = """
+  SET NOCOUNT ON;
   DROP TABLE IF EXISTS #input_ids;
   DROP TABLE IF EXISTS #matched_specimens;
   CREATE TABLE #input_ids (
@@ -452,10 +455,11 @@ mrn_query = """
 
 # string to connect to CoPath
 CONN_STR = (
-    "DRIVER={ODBC Driver 17 for SQL Server};"
-    "SERVER=IUHWCPTHDB3980"
-    "DATABASE=COPLIVE"
+    "DRIVER={ODBC Driver 18 for SQL Server};"
+    "SERVER=IUHWCPTHDB3980;"
+    "DATABASE=COPLIVE;"
     "Trusted_Connection=yes;"
+    "TrustServerCertificate=yes;"
 )
 
 REPORT_FIELDS = [ tt[1] for tt in TEXT_TYPES ]
@@ -751,7 +755,7 @@ if __name__ == "__main__":
         ids = process_input_file(args.input_file, args.column)
         batch_size = validate_batch_size(args.batch_size)
     except Exception as e:
-        print(e)
+        print(f"Error processing input file: {e}")
         sys.exit(1)
 
     try:
@@ -774,27 +778,26 @@ if __name__ == "__main__":
                 args.separate_queries,
             )
     except Exception as e:
-        print(e)
+        print(f"Error generating SQL query: {e}")
         if invalid_accessions_csv is not None:
             print(f"Wrote invalid accession IDs to {invalid_accessions_csv}")
         sys.exit(1)
 
     # connect to database and run query
-    output_file = args.output_file
     try:
-        conn = pyodbc.connect(conn_str)
-        
+        conn = pyodbc.connect(CONN_STR)
         results = pd.read_sql(formatted_query, conn)
-
-        _ = clean_results(results)
-
-        results.to_csv(output_file, index=False)
-        print(f"CoPath data exported to {output_file}")
-
     except Exception as e:
-        print(e)
+        print(f"Error connecting to database: {e}")
         sys.exit(1)
-
     finally:
         if 'conn' in locals():
             conn.close()
+
+    output_file = args.output_file
+    try:
+        _ = clean_results(results)
+        results.to_csv(output_file, index=False)
+        print(f"CoPath data exported to {output_file}")
+    except Exception as e:
+        print(f"Error parsing results: {e}")
