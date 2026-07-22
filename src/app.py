@@ -971,6 +971,12 @@ class BatchContext:
         items = self.queue_manager.get_all()
         return bool(items) and all(item.status == "completed" for item in items)
 
+    @property
+    def pending_count(self) -> int:
+        return sum(
+            item.status == "pending" for item in self.queue_manager.get_all()
+        )
+
 
 batch_contexts: Dict[str, BatchContext] = {}
 batch_contexts_lock = threading.Lock()

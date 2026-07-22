@@ -41,7 +41,7 @@
                 {% for batch in batches %}
                     <a class="batch" href="{{ url_for('qc', batch=batch.id) }}">
                         <h2>{{ batch.display_name }}</h2>
-                        <p>{{ batch.queue_manager.get_all()|length }} slide(s)</p>
+                        <p>{{ batch.pending_count }} pending of {{ batch.queue_manager.get_all()|length }} slide(s)</p>
                     </a>
                 {% endfor %}
             </div>
