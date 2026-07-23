@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from openpyxl import Workbook, load_workbook
+
 
 SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC_DIR))
@@ -164,10 +166,18 @@ class RenamingPageTests(unittest.TestCase):
         self.old_batch_base = app_module.Config.LABEL_CHECK_BATCHES
         self.old_clone = app_module.Config.COPATH_CLONE
         self.old_instance = app_module.Config.INSTANCE_DIR
+        self.old_sdl = app_module.Config.SDL_FILE_PATH
         self.old_users = app_module.user_manager.users.copy()
         app_module.Config.LABEL_CHECK_BATCHES = str(self.batch_base)
         app_module.Config.COPATH_CLONE = str(self.clone)
         app_module.Config.INSTANCE_DIR = str(self.root / "instance")
+        app_module.Config.SDL_FILE_PATH = str(self.root / "Slide_Digitization_Log.xlsx")
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = app_module.Config.SDL_SHEET_NAME
+        worksheet.append(app_module.SDL_HEADERS)
+        workbook.save(app_module.Config.SDL_FILE_PATH)
+        workbook.close()
         app_module.batch_contexts.clear()
         app_module._renaming_jobs.clear()
         self.user = app_module.User("renamer", "", False)
@@ -182,6 +192,7 @@ class RenamingPageTests(unittest.TestCase):
         app_module.Config.LABEL_CHECK_BATCHES = self.old_batch_base
         app_module.Config.COPATH_CLONE = self.old_clone
         app_module.Config.INSTANCE_DIR = self.old_instance
+        app_module.Config.SDL_FILE_PATH = self.old_sdl
         app_module.user_manager.users = self.old_users
         app_module.batch_contexts.clear()
         app_module._renaming_jobs.clear()
@@ -252,6 +263,54 @@ class RenamingPageTests(unittest.TestCase):
         self.assertEqual("NP25-100", index_rows[0]["AccessionID"])
         _, clone_rows = renaming.read_csv(self.clone / "BRAIN" / "copath_data.csv")
         self.assertEqual("AAAAAA", clone_rows[0]["PID"])
+        workbook = load_workbook(app_module.Config.SDL_FILE_PATH)
+        worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
+        headers = app_module._sdl_header_columns(worksheet)
+        self.assertEqual(
+            "NP25-100",
+            worksheet.cell(row=2, column=headers["Accession ID"]).value,
+        )
+        self.assertEqual(
+            app_module.SDL_UNKNOWN_DATE,
+            worksheet.cell(row=2, column=headers["Date Loaded"]).value,
+        )
+        self.assertEqual(
+            "-----",
+            worksheet.cell(row=2, column=headers["Scanner"]).value,
+        )
+        workbook.close()
+
+    def test_sdl_failure_leaves_batch_available_for_retry(self):
+        Path(app_module.Config.SDL_FILE_PATH).unlink()
+        batches, _ = app_module._renaming_batches()
+        _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
+
+        response = self.client.post(
+            f"/renaming/approve/{batches[0].id}",
+            data={
+                "old_accession": "NP25-100",
+                "mapping_signature": renaming.mapping_signature(rows),
+                "accession_id": "NP25-100",
+                "organ": "BRAIN",
+                "pid": "AAAAAA",
+                "accession_date": "20250304",
+                "timepoint": "XXXX",
+                "image_type": "WSI",
+                "samp_acq_type": "RE",
+                "slide_count": "1",
+                "original_path_0": "one.svs",
+                "stain_0": "HE",
+                "block_number_0": "B4",
+                "section_count_0": "001",
+            },
+        )
+
+        self.assertEqual(302, response.status_code)
+        self.assertEqual(
+            "QC,Renamed\nTrue,False\n",
+            (self.batch / "completed_stages.csv").read_text(),
+        )
+        self.assertEqual(1, len(app_module._renaming_batches()[0]))
 
 
 if __name__ == "__main__":

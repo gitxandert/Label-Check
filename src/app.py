@@ -42,7 +42,7 @@ import time
 import uuid
 from collections import Counter, defaultdict
 from logging.handlers import RotatingFileHandler
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import click
@@ -124,7 +124,7 @@ class Config:
     # Slide Digitization Log workbook configuration.
     SDL_FILE_PATH = os.path.join(BASE_DIR, "logs", "Slide_Digitization_Log.xlsx")
     SDL_SHEET_NAME = "general"
-    SDL_ORGANS = ("BRAIN", "BREAST", "TESTES", "CYTO")
+    SDL_ORGANS = ("BRAIN", "BREAST", "TESTIS", "OTHER", "UNKNOWN", "CYTO")
     SDL_SCANNERS = ("-----", "RSCH1 (SS12797)", "CLIN1 (SS12602)")
 
 
@@ -1432,6 +1432,8 @@ SDL_FORM_FIELDS = {
     "Notes": "notes",
 }
 
+SDL_UNKNOWN_DATE = "----------"
+
 _sdl_workbook_lock = threading.Lock()
 _accession_pattern = re.compile(r"^[A-Z]{1,3}[0-9]{2}-[0-9]+$")
 _rack_pattern = re.compile(r"^[0-9]+(?:\s*,\s*[0-9]+)*$")
@@ -1454,6 +1456,31 @@ def _save_sdl_workbook(workbook) -> None:
     finally:
         if os.path.exists(temporary_path):
             os.remove(temporary_path)
+
+
+def _sdl_header_columns(worksheet: Worksheet) -> Dict[str, int]:
+    """Map managed SDL headers to their worksheet columns."""
+    header_locations: Dict[str, List[int]] = defaultdict(list)
+    for column in range(1, worksheet.max_column + 1):
+        value = worksheet.cell(row=1, column=column).value
+        if value is not None:
+            header_locations[str(value).strip()].append(column)
+
+    missing = [header for header in SDL_HEADERS if not header_locations[header]]
+    duplicates = [
+        header for header in SDL_HEADERS if len(header_locations[header]) > 1
+    ]
+    if missing or duplicates:
+        details = []
+        if missing:
+            details.append(f"missing: {', '.join(missing)}")
+        if duplicates:
+            details.append(f"duplicated: {', '.join(duplicates)}")
+        raise SDLWorkbookError(
+            "The SDL worksheet does not contain exactly one of each required "
+            f"header ({'; '.join(details)})."
+        )
+    return {header: header_locations[header][0] for header in SDL_HEADERS}
 
 
 def _load_sdl_workbook():
@@ -1485,23 +1512,11 @@ def _load_sdl_workbook():
     if not has_any_value:
         worksheet.append(SDL_HEADERS)
         initialized_headers = True
-    else:
-        actual_headers = tuple(
-            str(worksheet.cell(row=1, column=column).value).strip()
-            if worksheet.cell(row=1, column=column).value is not None
-            else ""
-            for column in range(1, len(SDL_HEADERS) + 1)
-        )
-        extra_headers = [
-            worksheet.cell(row=1, column=column).value
-            for column in range(len(SDL_HEADERS) + 1, worksheet.max_column + 1)
-            if worksheet.cell(row=1, column=column).value is not None
-        ]
-        if actual_headers != SDL_HEADERS or extra_headers:
-            workbook.close()
-            raise SDLWorkbookError(
-                "The SDL worksheet headers do not match the required schema."
-            )
+    try:
+        _sdl_header_columns(worksheet)
+    except SDLWorkbookError:
+        workbook.close()
+        raise
 
     return workbook, worksheet, initialized_headers
 
@@ -1527,19 +1542,23 @@ def _format_sdl_value(header: str, value: Any) -> str:
 
 
 def _sdl_row_signature(worksheet: Worksheet, row_number: int) -> str:
+    header_columns = _sdl_header_columns(worksheet)
     values = tuple(
-        worksheet.cell(row=row_number, column=column).value
-        for column in range(1, len(SDL_HEADERS) + 1)
+        worksheet.cell(row=row_number, column=header_columns[header]).value
+        for header in SDL_HEADERS
     )
     return hashlib.sha256(repr(values).encode("utf-8")).hexdigest()
 
 
 def _read_sdl_rows(worksheet: Worksheet) -> List[Dict[str, Any]]:
+    header_columns = _sdl_header_columns(worksheet)
     rows = []
     for row_number in range(2, worksheet.max_row + 1):
         raw_values = {
-            header: worksheet.cell(row=row_number, column=column).value
-            for column, header in enumerate(SDL_HEADERS, start=1)
+            header: worksheet.cell(
+                row=row_number, column=header_columns[header]
+            ).value
+            for header in SDL_HEADERS
         }
         if all(value is None for value in raw_values.values()):
             continue
@@ -1596,10 +1615,15 @@ def _validate_sdl_form(values: Dict[str, str]) -> Dict[str, Any]:
     if any(value < 1 for value in rack_numbers):
         raise SDLValidationError("Carousel Rack numbers must be at least 1.")
 
-    try:
-        date_loaded = datetime.date.fromisoformat(values["Date Loaded"])
-    except ValueError as exc:
-        raise SDLValidationError("Date Loaded must use YYYY-MM-DD format.") from exc
+    if values["Date Loaded"] == SDL_UNKNOWN_DATE:
+        date_loaded: Union[datetime.date, str] = SDL_UNKNOWN_DATE
+    else:
+        try:
+            date_loaded = datetime.date.fromisoformat(values["Date Loaded"])
+        except ValueError as exc:
+            raise SDLValidationError(
+                f"Date Loaded must use YYYY-MM-DD format or {SDL_UNKNOWN_DATE}."
+            ) from exc
     if not _time_pattern.fullmatch(values["Time Loaded"]):
         raise SDLValidationError("Time Loaded must use HH:MM 24-hour format.")
     try:
@@ -1616,18 +1640,26 @@ def _validate_sdl_form(values: Dict[str, str]) -> Dict[str, Any]:
     date_unloaded = None
     time_unloaded = None
     if date_unloaded_value:
-        try:
-            date_unloaded = datetime.date.fromisoformat(date_unloaded_value)
-        except ValueError as exc:
-            raise SDLValidationError("Date Unloaded must use YYYY-MM-DD format.") from exc
+        if date_unloaded_value == SDL_UNKNOWN_DATE:
+            date_unloaded = SDL_UNKNOWN_DATE
+        else:
+            try:
+                date_unloaded = datetime.date.fromisoformat(date_unloaded_value)
+            except ValueError as exc:
+                raise SDLValidationError(
+                    f"Date Unloaded must use YYYY-MM-DD format or {SDL_UNKNOWN_DATE}."
+                ) from exc
         if not _time_pattern.fullmatch(time_unloaded_value):
             raise SDLValidationError("Time Unloaded must use HH:MM 24-hour format.")
         try:
             time_unloaded = datetime.time.fromisoformat(time_unloaded_value)
         except ValueError as exc:
             raise SDLValidationError("Time Unloaded must be a valid 24-hour time.") from exc
-        if datetime.datetime.combine(date_unloaded, time_unloaded) < datetime.datetime.combine(
-            date_loaded, time_loaded
+        if (
+            isinstance(date_loaded, datetime.date)
+            and isinstance(date_unloaded, datetime.date)
+            and datetime.datetime.combine(date_unloaded, time_unloaded)
+            < datetime.datetime.combine(date_loaded, time_loaded)
         ):
             raise SDLValidationError("The unloaded timestamp cannot precede the loaded timestamp.")
 
@@ -1644,6 +1676,141 @@ def _validate_sdl_form(values: Dict[str, str]) -> Dict[str, Any]:
         "Time Unloaded": time_unloaded,
         "Notes": values["Notes"],
     }
+
+
+def _strict_sdl_date(value: str) -> Optional[datetime.date]:
+    """Return a calendar date only for canonical YYYY-MM-DD values."""
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+        return None
+    try:
+        return datetime.date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _original_path_parent_name(value: str) -> str:
+    """Return the immediate parent for native or Windows-formatted paths."""
+    if "\\" in value:
+        return PureWindowsPath(value).parent.name
+    return Path(value).parent.name
+
+
+def _sdl_scanner_for_batch(batch_root: Path) -> str:
+    scanner_directory = batch_root.parent.name
+    if not scanner_directory.upper().startswith("SS"):
+        return "-----"
+    marker = f"({scanner_directory})".upper()
+    return next(
+        (
+            option
+            for option in Config.SDL_SCANNERS
+            if marker in option.upper()
+        ),
+        "-----",
+    )
+
+
+def _post_qc_sdl_rows(
+    batch_root: Path,
+    worksheet: Worksheet,
+) -> List[Dict[str, Any]]:
+    """Build new SDL rows for accessions absent from the workbook."""
+    _, mapping = renaming.read_csv(batch_root / "name_mapping.csv")
+    header_columns = _sdl_header_columns(worksheet)
+    accession_column = header_columns["Accession ID"]
+    existing_accessions = {
+        str(worksheet.cell(row=row_number, column=accession_column).value).strip().upper()
+        for row_number in range(2, worksheet.max_row + 1)
+        if worksheet.cell(row=row_number, column=accession_column).value is not None
+    }
+
+    slides_by_accession: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    mapping_organs: Dict[str, str] = {}
+    for slide in mapping:
+        accession = renaming.row_accession(slide)
+        if not accession:
+            continue
+        slides_by_accession[accession].append(slide)
+        organ = slide.get("Organ", "").strip().upper()
+        if organ and accession not in mapping_organs:
+            mapping_organs[accession] = organ
+
+    clone_organs: Dict[str, str] = {}
+    clone_index = Path(Config.COPATH_CLONE) / "all_accessions.csv"
+    if clone_index.exists():
+        _, clone_rows = renaming.read_csv(clone_index)
+        clone_organs = {
+            renaming.row_accession(row): row.get("Organ", "").strip().upper()
+            for row in clone_rows
+            if renaming.row_accession(row) and row.get("Organ", "").strip()
+        }
+
+    batch_date = _strict_sdl_date(batch_root.name)
+    scanner = _sdl_scanner_for_batch(batch_root)
+    new_rows: List[Dict[str, Any]] = []
+    for accession, slides in slides_by_accession.items():
+        if accession in existing_accessions:
+            continue
+        if batch_date is not None:
+            date_groups: Dict[Union[datetime.date, str], List[Dict[str, str]]] = {
+                batch_date: slides
+            }
+        else:
+            date_groups = {}
+            for slide in slides:
+                parent_name = _original_path_parent_name(
+                    slide.get("OriginalPath", "")
+                )
+                date_key: Union[datetime.date, str] = (
+                    _strict_sdl_date(parent_name) or SDL_UNKNOWN_DATE
+                )
+                date_groups.setdefault(date_key, []).append(slide)
+
+        organ = mapping_organs.get(accession) or clone_organs.get(accession) or "UNKNOWN"
+        for loaded_date, grouped_slides in date_groups.items():
+            row = {header: None for header in SDL_HEADERS}
+            row.update(
+                {
+                    "Accession ID": accession,
+                    "Organ": organ,
+                    "Slides Count": len(grouped_slides),
+                    "Scanner": scanner,
+                    "Date Loaded": loaded_date,
+                    "Ran Label-Check": True,
+                    "Finished QC": True,
+                    "Collected CoPath Data": True,
+                    "Renamed": True,
+                    "Pushed to SFTP Server": False,
+                }
+            )
+            new_rows.append(row)
+    return new_rows
+
+
+def _update_sdl_after_renaming(batch_root: Path) -> int:
+    """Append missing post-QC rows and return the number added."""
+    with _sdl_workbook_lock:
+        workbook, worksheet, initialized_headers = _load_sdl_workbook()
+        try:
+            header_columns = _sdl_header_columns(worksheet)
+            new_rows = _post_qc_sdl_rows(batch_root, worksheet)
+            for values in new_rows:
+                row_number = worksheet.max_row + 1
+                for header, value in values.items():
+                    worksheet.cell(
+                        row=row_number, column=header_columns[header]
+                    ).value = value
+                loaded_date = values["Date Loaded"]
+                if isinstance(loaded_date, datetime.date):
+                    worksheet.cell(
+                        row=row_number,
+                        column=header_columns["Date Loaded"],
+                    ).number_format = "yyyy-mm-dd"
+            if initialized_headers or new_rows:
+                _save_sdl_workbook(workbook)
+            return len(new_rows)
+        finally:
+            workbook.close()
 
 
 def _render_sdl_page(
@@ -2469,10 +2636,11 @@ def renaming_approve(batch_id: str):
         if updated and all(renaming.parse_bool(row["Approved"]) for row in updated):
             with _renaming_clone_lock:
                 renaming.finalize_batch(context.root, Path(Config.COPATH_CLONE))
+                _update_sdl_after_renaming(context.root)
                 context.mark_renamed_complete()
             flash("All names are approved and the batch has been finalized.", "success")
             return redirect(url_for("renaming_page"))
-    except (renaming.RenamingError, DataSaveError) as exc:
+    except (renaming.RenamingError, DataSaveError, SDLWorkbookError) as exc:
         app.logger.warning("Renaming approval failed for %s: %s", batch_id, exc)
         flash(str(exc), "error")
     except Exception as exc:
@@ -2684,6 +2852,7 @@ def sdl():
     try:
         with _sdl_workbook_lock:
             workbook, worksheet, initialized_headers = _load_sdl_workbook()
+            header_columns = _sdl_header_columns(worksheet)
             if action == "update":
                 try:
                     row_number = int(request.form.get("worksheet_row", ""))
@@ -2692,8 +2861,10 @@ def sdl():
                 if row_number < 2 or row_number > worksheet.max_row:
                     raise SDLValidationError("The selected SDL row no longer exists.")
                 if all(
-                    worksheet.cell(row=row_number, column=column).value is None
-                    for column in range(1, len(SDL_HEADERS) + 1)
+                    worksheet.cell(
+                        row=row_number, column=header_columns[header]
+                    ).value is None
+                    for header in SDL_HEADERS
                 ):
                     raise SDLValidationError("The selected SDL row no longer exists.")
                 expected_signature = request.form.get("row_signature", "")
@@ -2708,16 +2879,21 @@ def sdl():
             else:
                 raise SDLValidationError("Invalid SDL action.")
 
-            for column, header in enumerate(SDL_HEADERS, start=1):
+            for header in SDL_HEADERS:
+                column = header_columns[header]
                 if header in normalized_values:
                     worksheet.cell(row=row_number, column=column).value = normalized_values[header]
                 elif action == "add" and header in SDL_STATUS_HEADERS:
                     worksheet.cell(row=row_number, column=column).value = False
 
             for header in ("Date Loaded", "Date Unloaded"):
-                worksheet.cell(row=row_number, column=SDL_HEADERS.index(header) + 1).number_format = "yyyy-mm-dd"
+                worksheet.cell(
+                    row=row_number, column=header_columns[header]
+                ).number_format = "yyyy-mm-dd"
             for header in ("Time Loaded", "Time Unloaded"):
-                worksheet.cell(row=row_number, column=SDL_HEADERS.index(header) + 1).number_format = "hh:mm"
+                worksheet.cell(
+                    row=row_number, column=header_columns[header]
+                ).number_format = "hh:mm"
 
             _save_sdl_workbook(workbook)
     except (SDLWorkbookError, SDLValidationError) as exc:
