@@ -2572,11 +2572,47 @@ def renaming_retry(batch_id: str):
     return redirect(url_for("renaming_page", batch=batch_id))
 
 
+def _renaming_group_html(
+    context: BatchContext,
+    rows: List[Dict[str, str]],
+    accession: str,
+    signature: str,
+) -> str:
+    """Render one current mapping group for an in-page approval update."""
+    reports = renaming.report_rows(context.root, Path(Config.COPATH_CLONE))
+    group = next(
+        (
+            candidate
+            for candidate in renaming.group_mapping(rows, reports)
+            if candidate["accession"] == accession
+        ),
+        None,
+    )
+    if group is None:
+        raise renaming.RenamingError(
+            f"The updated accession group {accession} could not be found"
+        )
+    return render_template(
+        "_renaming_group.html",
+        context=context,
+        group=group,
+        signature=signature,
+        group_key=f"updated-{uuid.uuid4().hex}",
+        job_state=_renaming_job_state(context.id),
+    )
+
+
 @app.route("/renaming/approve/<batch_id>", methods=["POST"])
 @login_required
 def renaming_approve(batch_id: str):
+    wants_json = request.accept_mimetypes.best == "application/json"
     context = _renaming_context(batch_id)
     if context is None:
+        if wants_json:
+            return jsonify({
+                "success": False,
+                "message": "The batch is no longer available for renaming.",
+            }), 404
         flash("The batch is no longer available for renaming.", "warning")
         return redirect(url_for("renaming_page"))
     mapping_path = context.root / "name_mapping.csv"
@@ -2590,6 +2626,8 @@ def renaming_approve(batch_id: str):
         "ImageType": request.form.get("image_type", "").strip().upper(),
         "SampAcqType": request.form.get("samp_acq_type", "").strip().upper(),
     }
+    updated: Optional[List[Dict[str, str]]] = None
+    merged = False
     try:
         if _renaming_job_state(batch_id).get("status") in {"preparing", "retrying"}:
             raise renaming.RenamingError(
@@ -2630,22 +2668,92 @@ def renaming_approve(batch_id: str):
             request.form.get("mapping_signature", ""),
         )
         if merged:
-            flash("Accessions were merged. Review and approve the combined group.", "info")
+            message = "Accessions were merged. Review and approve the combined group."
+            category = "info"
         else:
-            flash(f"Approved names for {values['AccessionID']}.", "success")
+            message = f"Approved names for {values['AccessionID']}."
+            category = "success"
         if updated and all(renaming.parse_bool(row["Approved"]) for row in updated):
             with _renaming_clone_lock:
                 renaming.finalize_batch(context.root, Path(Config.COPATH_CLONE))
                 _update_sdl_after_renaming(context.root)
                 context.mark_renamed_complete()
-            flash("All names are approved and the batch has been finalized.", "success")
+            message = "All names are approved and the batch has been finalized."
+            if wants_json:
+                flash(message, "success")
+                return jsonify({
+                    "success": True,
+                    "finalized": True,
+                    "message": message,
+                    "redirect_url": url_for("renaming_page"),
+                })
+            flash(message, "success")
             return redirect(url_for("renaming_page"))
+        signature = renaming.mapping_signature(updated)
+        if wants_json:
+            return jsonify({
+                "success": True,
+                "finalized": False,
+                "message": message,
+                "category": category,
+                "old_accession": old_accession,
+                "accession": values["AccessionID"],
+                "merged": merged,
+                "signature": signature,
+                "group_html": _renaming_group_html(
+                    context, updated, values["AccessionID"], signature
+                ),
+            })
+        flash(message, category)
     except (renaming.RenamingError, DataSaveError, SDLWorkbookError) as exc:
         app.logger.warning("Renaming approval failed for %s: %s", batch_id, exc)
+        if wants_json:
+            payload: Dict[str, Any] = {
+                "success": False,
+                "message": str(exc),
+                "saved": updated is not None,
+            }
+            if updated is not None:
+                signature = renaming.mapping_signature(updated)
+                payload.update({
+                    "old_accession": old_accession,
+                    "accession": values["AccessionID"],
+                    "merged": merged,
+                    "signature": signature,
+                    "group_html": _renaming_group_html(
+                        context, updated, values["AccessionID"], signature
+                    ),
+                })
+            if "changed in another session" in str(exc):
+                status = 409
+            elif isinstance(exc, renaming.RenamingError):
+                status = 400
+            else:
+                status = 500
+            return jsonify(payload), status
         flash(str(exc), "error")
     except Exception as exc:
         app.logger.exception("Renaming finalization failed for %s", batch_id)
-        flash(f"Renaming finalization failed: {exc}", "error")
+        message = f"Renaming finalization failed: {exc}"
+        if wants_json:
+            payload = {
+                "success": False,
+                "message": message,
+                "saved": updated is not None,
+            }
+            if updated is not None:
+                signature = renaming.mapping_signature(updated)
+                payload.update({
+                    "old_accession": old_accession,
+                    "accession": values["AccessionID"],
+                    "merged": merged,
+                    "signature": signature,
+                    "group_html": _renaming_group_html(
+                        context, updated, values["AccessionID"], signature
+                    ),
+                })
+            return jsonify(payload), 500
+        flash(message, "error")
     return redirect(url_for("renaming_page", batch=batch_id))
 
 

@@ -188,6 +188,40 @@ class RenamingPageTests(unittest.TestCase):
             session["_user_id"] = self.user.id
             session["_fresh"] = True
 
+    def add_second_accession(self):
+        _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
+        second = dict(rows[0])
+        second.update({
+            "AccessionID": "NP25-200", "PID": "AAAAAB", "OriginalPath": "two.svs",
+            "SectionCount": "001",
+        })
+        second["NewName"] = renaming.build_new_name(second)
+        renaming.atomic_write(
+            self.batch / "name_mapping.csv", renaming.MAPPING_FIELDS, [rows[0], second]
+        )
+        return [rows[0], second]
+
+    @staticmethod
+    def approval_data(rows, **overrides):
+        data = {
+            "old_accession": "NP25-100",
+            "mapping_signature": renaming.mapping_signature(rows),
+            "accession_id": "NP25-100",
+            "organ": "BRAIN",
+            "pid": "AAAAAA",
+            "accession_date": "20250304",
+            "timepoint": "XXXX",
+            "image_type": "WSI",
+            "samp_acq_type": "RE",
+            "slide_count": "1",
+            "original_path_0": "one.svs",
+            "stain_0": "HE",
+            "block_number_0": "B4",
+            "section_count_0": "001",
+        }
+        data.update(overrides)
+        return data
+
     def tearDown(self):
         app_module.Config.LABEL_CHECK_BATCHES = self.old_batch_base
         app_module.Config.COPATH_CLONE = self.old_clone
@@ -208,18 +242,11 @@ class RenamingPageTests(unittest.TestCase):
         self.assertEqual(200, detail.status_code)
         self.assertIn(b"NP25-100", detail.data)
         self.assertIn(b"Diagnosis text", detail.data)
+        self.assertIn(b"fetch(form.action", detail.data)
+        self.assertIn(b'class="success approve-button"', detail.data)
 
     def test_multiple_accessions_render_as_complete_rows_before_expansion(self):
-        _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
-        second = dict(rows[0])
-        second.update({
-            "AccessionID": "NP25-200", "PID": "AAAAAB", "OriginalPath": "two.svs",
-            "SectionCount": "001",
-        })
-        second["NewName"] = renaming.build_new_name(second)
-        renaming.atomic_write(
-            self.batch / "name_mapping.csv", renaming.MAPPING_FIELDS, [rows[0], second]
-        )
+        self.add_second_accession()
         batches, _ = app_module._renaming_batches()
 
         response = self.client.get(f"/renaming?batch={batches[0].id}")
@@ -243,18 +270,75 @@ class RenamingPageTests(unittest.TestCase):
         self.assertIn(b'id="reports-0" hidden', response.data)
         self.assertNotIn(b'<details class="report">', response.data)
 
+    def test_async_approval_updates_one_group_without_redirecting(self):
+        rows = self.add_second_accession()
+        batches, _ = app_module._renaming_batches()
+
+        response = self.client.post(
+            f"/renaming/approve/{batches[0].id}",
+            data=self.approval_data(rows, stain_0="H&E"),
+            headers={"Accept": "application/json"},
+        )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.get_json()
+        self.assertTrue(payload["success"])
+        self.assertFalse(payload["finalized"])
+        self.assertFalse(payload["merged"])
+        self.assertIn('class="accession-form approved"', payload["group_html"])
+        _, saved = renaming.read_csv(self.batch / "name_mapping.csv")
+        first = next(row for row in saved if row["AccessionID"] == "NP25-100")
+        second = next(row for row in saved if row["AccessionID"] == "NP25-200")
+        self.assertEqual("H&E", first["Stain"])
+        self.assertEqual("True", first["Approved"])
+        self.assertEqual("False", second["Approved"])
+        self.assertEqual(renaming.mapping_signature(saved), payload["signature"])
+
+    def test_async_approval_rejects_a_stale_mapping_without_saving(self):
+        rows = self.add_second_accession()
+        batches, _ = app_module._renaming_batches()
+
+        response = self.client.post(
+            f"/renaming/approve/{batches[0].id}",
+            data=self.approval_data(rows, mapping_signature="stale"),
+            headers={"Accept": "application/json"},
+        )
+
+        self.assertEqual(409, response.status_code)
+        payload = response.get_json()
+        self.assertFalse(payload["success"])
+        self.assertFalse(payload["saved"])
+        self.assertIn("changed in another session", payload["message"])
+        _, saved = renaming.read_csv(self.batch / "name_mapping.csv")
+        self.assertEqual(rows, saved)
+
+    def test_async_merge_returns_one_combined_pending_group(self):
+        rows = self.add_second_accession()
+        batches, _ = app_module._renaming_batches()
+
+        response = self.client.post(
+            f"/renaming/approve/{batches[0].id}",
+            data=self.approval_data(rows, accession_id="NP25-200"),
+            headers={"Accept": "application/json"},
+        )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.get_json()
+        self.assertTrue(payload["success"])
+        self.assertTrue(payload["merged"])
+        self.assertEqual("NP25-200", payload["accession"])
+        self.assertIn('name="slide_count" value="2"', payload["group_html"])
+        self.assertIn("<span>Pending</span>", payload["group_html"])
+        _, saved = renaming.read_csv(self.batch / "name_mapping.csv")
+        self.assertEqual({"NP25-200"}, {row["AccessionID"] for row in saved})
+        self.assertTrue(all(row["Approved"] == "False" for row in saved))
+
     def test_approval_finalizes_clone_and_completed_stage(self):
         batches, _ = app_module._renaming_batches()
         _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
         response = self.client.post(
             f"/renaming/approve/{batches[0].id}",
-            data={
-                "old_accession": "NP25-100", "mapping_signature": renaming.mapping_signature(rows),
-                "accession_id": "NP25-100", "organ": "BRAIN", "pid": "AAAAAA",
-                "accession_date": "20250304", "timepoint": "XXXX", "image_type": "WSI",
-                "samp_acq_type": "RE", "slide_count": "1", "original_path_0": "one.svs",
-                "stain_0": "HE", "block_number_0": "B4", "section_count_0": "001",
-            },
+            data=self.approval_data(rows),
         )
 
         self.assertEqual(302, response.status_code)
@@ -279,6 +363,26 @@ class RenamingPageTests(unittest.TestCase):
             worksheet.cell(row=2, column=headers["Scanner"]).value,
         )
         workbook.close()
+
+    def test_async_final_approval_returns_destination(self):
+        batches, _ = app_module._renaming_batches()
+        _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
+
+        response = self.client.post(
+            f"/renaming/approve/{batches[0].id}",
+            data=self.approval_data(rows),
+            headers={"Accept": "application/json"},
+        )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.get_json()
+        self.assertTrue(payload["success"])
+        self.assertTrue(payload["finalized"])
+        self.assertEqual("/renaming", payload["redirect_url"])
+        self.assertEqual(
+            "QC,Renamed\nTrue,True\n",
+            (self.batch / "completed_stages.csv").read_text(),
+        )
 
     def test_sdl_failure_leaves_batch_available_for_retry(self):
         Path(app_module.Config.SDL_FILE_PATH).unlink()
@@ -311,6 +415,25 @@ class RenamingPageTests(unittest.TestCase):
             (self.batch / "completed_stages.csv").read_text(),
         )
         self.assertEqual(1, len(app_module._renaming_batches()[0]))
+
+    def test_async_finalization_error_returns_the_saved_group_state(self):
+        Path(app_module.Config.SDL_FILE_PATH).unlink()
+        batches, _ = app_module._renaming_batches()
+        _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
+
+        response = self.client.post(
+            f"/renaming/approve/{batches[0].id}",
+            data=self.approval_data(rows),
+            headers={"Accept": "application/json"},
+        )
+
+        self.assertEqual(500, response.status_code)
+        payload = response.get_json()
+        self.assertFalse(payload["success"])
+        self.assertTrue(payload["saved"])
+        self.assertIn('class="accession-form approved"', payload["group_html"])
+        _, saved = renaming.read_csv(self.batch / "name_mapping.csv")
+        self.assertEqual(renaming.mapping_signature(saved), payload["signature"])
 
 
 if __name__ == "__main__":
