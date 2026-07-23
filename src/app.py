@@ -2938,8 +2938,56 @@ def sdl():
             return redirect(url_for("sdl"))
         return _render_sdl_page(edit_row=edit_row)
 
+    action = (
+        "delete"
+        if request.form.get("delete") == "1"
+        else request.form.get("action", "add")
+    )
+    if action == "delete":
+        workbook = None
+        try:
+            try:
+                row_number = int(request.form.get("worksheet_row", ""))
+            except ValueError as exc:
+                raise SDLValidationError("Invalid SDL row selected.") from exc
+
+            with _sdl_workbook_lock:
+                workbook, worksheet, _ = _load_sdl_workbook()
+                header_columns = _sdl_header_columns(worksheet)
+                if row_number < 2 or row_number > worksheet.max_row:
+                    raise SDLValidationError("The selected SDL row no longer exists.")
+                if all(
+                    worksheet.cell(
+                        row=row_number, column=header_columns[header]
+                    ).value is None
+                    for header in SDL_HEADERS
+                ):
+                    raise SDLValidationError("The selected SDL row no longer exists.")
+
+                expected_signature = request.form.get("row_signature", "")
+                if not expected_signature or expected_signature != _sdl_row_signature(
+                    worksheet, row_number
+                ):
+                    raise SDLValidationError(
+                        "This SDL row changed after it was opened. Reload it before deleting."
+                    )
+
+                worksheet.delete_rows(row_number, 1)
+                _save_sdl_workbook(workbook)
+        except (SDLWorkbookError, SDLValidationError) as exc:
+            flash(str(exc), "error")
+            app.logger.warning("SDL delete rejected: %s", exc)
+        except Exception as exc:
+            app.logger.exception("Unexpected error while deleting an SDL row")
+            flash(f"The Slide Digitization Log row could not be deleted: {exc}", "error")
+        else:
+            flash("Slide Digitization Log row deleted successfully.", "success")
+        finally:
+            if workbook is not None:
+                workbook.close()
+        return redirect(url_for("sdl"))
+
     submitted_values = _submitted_sdl_form()
-    action = request.form.get("action", "add")
     try:
         normalized_values = _validate_sdl_form(submitted_values)
     except SDLValidationError as exc:
