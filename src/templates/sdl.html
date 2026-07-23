@@ -267,13 +267,14 @@
                                 </tr>
                             </thead>
                             <tbody>
-                                {% for row in rows %}
+                                {% for row in rows|reverse %}
+                                    {% set count = loop.index0 + 1 %}
                                     <tr
                                         class="editable-row"
                                         data-edit-url="{{ url_for('sdl', edit_row=row.worksheet_row) }}#entry-form"
                                         title="Double-click to edit this row"
                                     >
-                                        <td>{{ row.worksheet_row }}</td>
+                                        <td>{{ count }}</td>
                                         {% for header in headers %}
                                             <td>
                                                 {% if header in status_headers %}
