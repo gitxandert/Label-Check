@@ -1402,7 +1402,6 @@ SDL_HEADERS = (
     "Time Loaded",
     "Date Unloaded",
     "Time Unloaded",
-    "Pulled from Server",
     "Ran Label-Check",
     "Finished QC",
     "Collected CoPath Data",
@@ -1412,7 +1411,6 @@ SDL_HEADERS = (
 )
 
 SDL_STATUS_HEADERS = (
-    "Pulled from Server",
     "Ran Label-Check",
     "Finished QC",
     "Collected CoPath Data",
