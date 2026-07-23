@@ -125,7 +125,7 @@ class Config:
     SDL_FILE_PATH = os.path.join(BASE_DIR, "logs", "Slide_Digitization_Log.xlsx")
     SDL_SHEET_NAME = "general"
     SDL_ORGANS = ("BRAIN", "BREAST", "TESTES", "CYTO")
-    SDL_SCANNERS = ("RSCH1 (SS12797)", "CLIN1 (SS12602)")
+    SDL_SCANNERS = ("-----", "RSCH1 (SS12797)", "CLIN1 (SS12602)")
 
 
     # Path to scanner inventories
