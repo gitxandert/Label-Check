@@ -95,6 +95,22 @@
         }
         .table-heading h3 { margin: 0; overflow-wrap: anywhere; }
         .table-heading p { margin: 0; color: var(--muted); white-space: nowrap; }
+        .table-search-form { display: flex; align-items: end; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
+        .table-search-form label { display: flex; flex: 1 1 300px; flex-direction: column; gap: 6px; font-size: 0.85rem; font-weight: 600; }
+        .table-search-form input,
+        .column-search {
+            min-width: 140px;
+            padding: 8px 10px;
+            border: 1px solid #ced4da;
+            border-radius: 5px;
+            background: white;
+            color: var(--text);
+            font: inherit;
+        }
+        .table-search-form input:focus,
+        .column-search:focus { border-color: var(--primary); outline: 2px solid rgba(0, 123, 255, 0.18); }
+        .table-search-form button { padding: 9px 14px; border: 0; border-radius: 6px; background: var(--primary); color: white; cursor: pointer; font: inherit; font-weight: 600; }
+        .clear-filters { padding: 9px 12px; color: var(--primary-dark); font-weight: 600; }
         .table-wrapper { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }
         table { width: 100%; border-collapse: collapse; background: white; }
         th, td {
@@ -105,6 +121,11 @@
             white-space: nowrap;
         }
         th { position: sticky; top: 0; background: #e9ecef; font-size: 0.82rem; }
+        .sort-link { display: inline-flex; align-items: center; gap: 5px; color: var(--text); text-decoration: none; }
+        .sort-link:hover { color: var(--primary-dark); text-decoration: underline; }
+        .sort-indicator { color: var(--primary-dark); }
+        .column-search-row th { top: 38px; padding: 6px; background: #f8f9fa; }
+        .column-search-row .column-search { width: 100%; font-size: 0.8rem; }
         td { font-size: 0.87rem; }
         tbody tr:hover { background: #f5f9ff; }
         tbody tr:last-child td { border-bottom: 0; }
@@ -164,7 +185,7 @@
                     <ul class="file-list">
                         {% for inventory_file in inventory_files %}
                             <li>
-                                <a href="{{ url_for('inventories', file=inventory_file.name) }}" class="{{ 'selected' if selected_name == inventory_file.name else '' }}" {% if selected_name == inventory_file.name %}aria-current="page"{% endif %}>
+                                <a href="{{ inventory_file_urls[inventory_file.name] }}" class="{{ 'selected' if selected_name == inventory_file.name else '' }}" {% if selected_name == inventory_file.name %}aria-current="page"{% endif %}>
                                     {{ inventory_file.name }}
                                 </a>
                             </li>
@@ -185,17 +206,67 @@
                 {% else %}
                     <div class="table-heading">
                         <h3>{{ selected_name }}</h3>
-                        <p>{{ total_rows }} {{ 'row' if total_rows == 1 else 'rows' }}</p>
+                        <p>
+                            {% if matching_rows != total_rows %}{{ matching_rows }} of {% endif %}
+                            {{ total_rows }} {{ 'row' if total_rows == 1 else 'rows' }}
+                        </p>
                     </div>
-                    {% if rows %}
+                    {% if total_rows %}
+                        <form class="table-search-form" id="inventory-table-controls" method="GET" action="{{ url_for('inventories') }}">
+                            <input type="hidden" name="file" value="{{ selected_name }}">
+                            {% if sort_column is not none %}
+                                <input type="hidden" name="sort" value="{{ sort_column }}">
+                                <input type="hidden" name="direction" value="{{ sort_direction }}">
+                            {% endif %}
+                            <label for="inventory-global-search">
+                                Search entire inventory
+                                <input id="inventory-global-search" type="search" name="q" value="{{ global_query }}" maxlength="200" placeholder="Search all columns" data-table-search>
+                            </label>
+                            <button type="submit">Search</button>
+                            {% if global_query or column_filters or sort_column is not none %}
+                                <a class="clear-filters" href="{{ url_for('inventories', file=selected_name) }}">Clear</a>
+                            {% endif %}
+                        </form>
                         <div class="table-wrapper">
                             <table>
                                 <thead>
-                                    <tr>{% for header in headers %}<th scope="col">{{ header }}</th>{% endfor %}</tr>
+                                    <tr>
+                                        {% for header in headers %}
+                                            <th scope="col">
+                                                <a class="sort-link" href="{{ sort_urls[loop.index0] }}">
+                                                    {{ header }}
+                                                    {% if sort_column == loop.index0 %}
+                                                        <span class="sort-indicator" aria-label="{{ sort_direction }}">
+                                                            {{ '▲' if sort_direction == 'asc' else '▼' }}
+                                                        </span>
+                                                    {% endif %}
+                                                </a>
+                                            </th>
+                                        {% endfor %}
+                                    </tr>
+                                    <tr class="column-search-row">
+                                        {% for header in headers %}
+                                            <th>
+                                                <input
+                                                    class="column-search"
+                                                    form="inventory-table-controls"
+                                                    type="search"
+                                                    name="filter_{{ loop.index0 }}"
+                                                    value="{{ column_filters.get(loop.index0, '') }}"
+                                                    maxlength="200"
+                                                    placeholder="Search"
+                                                    aria-label="Search {{ header }}"
+                                                    data-table-search
+                                                >
+                                            </th>
+                                        {% endfor %}
+                                    </tr>
                                 </thead>
                                 <tbody>
                                     {% for row in rows %}
                                         <tr>{% for value in row %}<td>{{ value }}</td>{% endfor %}</tr>
+                                    {% else %}
+                                        <tr><td class="empty" colspan="{{ headers|length }}">No rows match current search.</td></tr>
                                     {% endfor %}
                                 </tbody>
                             </table>
@@ -206,14 +277,14 @@
 
                     {% if total_pages > 1 %}
                         <nav class="pagination" aria-label="Inventory pages">
-                            {% if current_page > 1 %}
-                                <a href="{{ url_for('inventories', file=selected_name, page=current_page - 1) }}">Previous</a>
+                            {% if previous_url %}
+                                <a href="{{ previous_url }}">Previous</a>
                             {% else %}
                                 <span class="disabled">Previous</span>
                             {% endif %}
                             <span>Page {{ current_page }} of {{ total_pages }}</span>
-                            {% if current_page < total_pages %}
-                                <a href="{{ url_for('inventories', file=selected_name, page=current_page + 1) }}">Next</a>
+                            {% if next_url %}
+                                <a href="{{ next_url }}">Next</a>
                             {% else %}
                                 <span class="disabled">Next</span>
                             {% endif %}
@@ -223,5 +294,16 @@
             </section>
         </div>
     </main>
+    <script>
+        let tableSearchTimer;
+        document.querySelectorAll('[data-table-search]').forEach((input) => {
+            input.addEventListener('input', () => {
+                window.clearTimeout(tableSearchTimer);
+                tableSearchTimer = window.setTimeout(() => {
+                    document.getElementById('inventory-table-controls').requestSubmit();
+                }, 400);
+            });
+        });
+    </script>
 </body>
 </html>

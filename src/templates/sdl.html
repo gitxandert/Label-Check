@@ -126,10 +126,36 @@
 
         .table-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 15px; }
         .table-heading p { margin: 0; color: var(--muted); }
+        .table-search-form {
+            display: flex;
+            align-items: end;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin: 16px 0;
+        }
+        .table-search-form label { display: flex; flex: 1 1 320px; flex-direction: column; gap: 6px; font-size: 0.85rem; font-weight: 600; }
+        .table-search-form input,
+        .column-search {
+            min-width: 140px;
+            padding: 8px 10px;
+            border: 1px solid #ced4da;
+            border-radius: 5px;
+            background: white;
+            color: var(--text);
+            font: inherit;
+        }
+        .table-search-form input:focus,
+        .column-search:focus { border-color: var(--primary); outline: 2px solid rgba(0, 123, 255, 0.18); }
+        .clear-filters { padding: 9px 12px; color: var(--primary-dark); font-weight: 600; }
         .table-wrapper { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }
         table { width: 100%; min-width: 2150px; border-collapse: collapse; background: white; }
         th, td { padding: 11px 12px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
         th { position: sticky; top: 0; background: #e9ecef; font-size: 0.82rem; white-space: nowrap; }
+        .sort-link { display: inline-flex; align-items: center; gap: 5px; color: var(--text); text-decoration: none; }
+        .sort-link:hover { color: var(--primary-dark); text-decoration: underline; }
+        .sort-indicator { color: var(--primary-dark); }
+        .column-search-row th { top: 38px; padding: 6px; background: #f8f9fa; }
+        .column-search-row .column-search { width: 100%; font-size: 0.8rem; }
         td { font-size: 0.87rem; }
         tbody tr:hover { background: #f5f9ff; }
         tbody tr.editable-row { cursor: pointer; }
@@ -278,24 +304,72 @@
             <section class="card">
                 <div class="table-heading">
                     <h3>Workbook entries</h3>
-                    <p>{{ rows|length }} {{ 'entry' if rows|length == 1 else 'entries' }}</p>
+                    <p>
+                        {% if rows|length != total_rows %}{{ rows|length }} of {% endif %}
+                        {{ total_rows }} {{ 'entry' if total_rows == 1 else 'entries' }}
+                    </p>
                 </div>
-                {% if rows %}
+                {% if total_rows %}
+                    <form class="table-search-form" id="sdl-table-controls" method="GET" action="{{ url_for('sdl') }}">
+                        {% if sort_column is not none %}
+                            <input type="hidden" name="sort" value="{{ sort_column }}">
+                            <input type="hidden" name="direction" value="{{ sort_direction }}">
+                        {% endif %}
+                        <label for="sdl-global-search">
+                            Search entire log
+                            <input id="sdl-global-search" type="search" name="q" value="{{ global_query }}" maxlength="200" placeholder="Search all columns" data-table-search>
+                        </label>
+                        <button type="submit">Search</button>
+                        {% if global_query or column_filters or sort_column is not none %}
+                            <a class="clear-filters" href="{{ url_for('sdl') }}">Clear</a>
+                        {% endif %}
+                    </form>
                     <div class="table-wrapper">
                         <table>
                             <thead>
                                 <tr>
                                     <th>Row</th>
-                                    {% for header in headers %}<th>{{ header }}</th>{% endfor %}
+                                    {% for header in headers %}
+                                        <th>
+                                            <a class="sort-link" href="{{ sort_urls[loop.index0] }}">
+                                                {{ header }}
+                                                {% if sort_column == loop.index0 %}
+                                                    <span class="sort-indicator" aria-label="{{ sort_direction }}">
+                                                        {{ '▲' if sort_direction == 'asc' else '▼' }}
+                                                    </span>
+                                                {% endif %}
+                                            </a>
+                                        </th>
+                                    {% endfor %}
                                     <th>Actions</th>
+                                </tr>
+                                <tr class="column-search-row">
+                                    <th aria-hidden="true"></th>
+                                    {% for header in headers %}
+                                        <th>
+                                            <input
+                                                class="column-search"
+                                                id="sdl-filter-{{ loop.index0 }}"
+                                                form="sdl-table-controls"
+                                                type="search"
+                                                name="filter_{{ loop.index0 }}"
+                                                value="{{ column_filters.get(loop.index0, '') }}"
+                                                maxlength="200"
+                                                placeholder="Search"
+                                                aria-label="Search {{ header }}"
+                                                data-table-search
+                                            >
+                                        </th>
+                                    {% endfor %}
+                                    <th aria-hidden="true"></th>
                                 </tr>
                             </thead>
                             <tbody>
-                                {% for row in rows|reverse %}
+                                {% for row in rows %}
                                     {% set count = loop.index0 + 1 %}
                                     <tr
                                         class="editable-row"
-                                        data-edit-url="{{ url_for('sdl', edit_row=row.worksheet_row) }}#entry-form"
+                                        data-edit-url="{{ edit_urls[row.worksheet_row] }}"
                                         title="Double-click to edit this row"
                                     >
                                         <td>{{ count }}</td>
@@ -310,7 +384,7 @@
                                         {% endfor %}
                                         <td>
                                             <div class="row-actions">
-                                                <a class="edit-link" href="{{ url_for('sdl', edit_row=row.worksheet_row) }}#entry-form">Edit</a>
+                                                <a class="edit-link" href="{{ edit_urls[row.worksheet_row] }}">Edit</a>
                                                 <form
                                                     class="delete-form"
                                                     method="POST"
@@ -326,6 +400,8 @@
                                             </div>
                                         </td>
                                     </tr>
+                                {% else %}
+                                    <tr><td class="empty" colspan="{{ headers|length + 2 }}">No entries match current search.</td></tr>
                                 {% endfor %}
                             </tbody>
                         </table>
@@ -337,6 +413,15 @@
         {% endif %}
     </main>
     <script>
+        let tableSearchTimer;
+        document.querySelectorAll('[data-table-search]').forEach((input) => {
+            input.addEventListener('input', () => {
+                window.clearTimeout(tableSearchTimer);
+                tableSearchTimer = window.setTimeout(() => {
+                    document.getElementById('sdl-table-controls').requestSubmit();
+                }, 400);
+            });
+        });
         document.querySelectorAll('tr[data-edit-url]').forEach((row) => {
             row.addEventListener('dblclick', (event) => {
                 if (event.target.closest('a, button, input, select, textarea')) {

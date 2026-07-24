@@ -1579,6 +1579,107 @@ def _read_sdl_rows(worksheet: Worksheet) -> List[Dict[str, Any]]:
     return rows
 
 
+TABLE_QUERY_MAX_LENGTH = 200
+
+
+def _clean_table_query(value: Optional[str]) -> str:
+    return (value or "").strip()[:TABLE_QUERY_MAX_LENGTH]
+
+
+def _natural_sort_key(value: str) -> Tuple[Tuple[int, Any], ...]:
+    """Build a case-insensitive key that orders embedded numbers numerically."""
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part)
+        for part in re.split(r"(\d+)", value.strip().casefold())
+        if part
+    )
+
+
+def _filter_sort_records(
+    records: List[Any],
+    values_for_record,
+    global_query: str = "",
+    column_filters: Optional[Dict[int, str]] = None,
+    sort_column: Optional[int] = None,
+    sort_direction: str = "asc",
+) -> List[Any]:
+    """Filter displayed row values, then apply a stable natural sort."""
+    global_term = _clean_table_query(global_query).casefold()
+    filters = {
+        column: cleaned.casefold()
+        for column, value in (column_filters or {}).items()
+        if (cleaned := _clean_table_query(value))
+    }
+    matched = []
+    for record in records:
+        values = [str(value or "") for value in values_for_record(record)]
+        folded_values = [value.casefold() for value in values]
+        if global_term and not any(global_term in value for value in folded_values):
+            continue
+        if any(
+            column >= len(folded_values) or term not in folded_values[column]
+            for column, term in filters.items()
+        ):
+            continue
+        matched.append(record)
+
+    if sort_column is None:
+        return matched
+
+    nonblank = []
+    blank = []
+    for record in matched:
+        values = values_for_record(record)
+        value = str(values[sort_column] or "") if sort_column < len(values) else ""
+        (blank if not value.strip() else nonblank).append(record)
+    nonblank.sort(
+        key=lambda record: _natural_sort_key(
+            str(values_for_record(record)[sort_column] or "")
+        ),
+        reverse=sort_direction == "desc",
+    )
+    return nonblank + blank
+
+
+def _request_table_state(
+    column_count: int,
+) -> Tuple[str, Dict[int, str], Optional[int], str]:
+    global_query = _clean_table_query(request.args.get("q"))
+    column_filters = {
+        column: value
+        for column in range(column_count)
+        if (value := _clean_table_query(request.args.get(f"filter_{column}")))
+    }
+    try:
+        sort_column = int(request.args.get("sort", ""))
+    except (TypeError, ValueError):
+        sort_column = None
+    if sort_column is not None and not 0 <= sort_column < column_count:
+        sort_column = None
+    sort_direction = request.args.get("direction", "asc").casefold()
+    if sort_direction not in {"asc", "desc"}:
+        sort_direction = "asc"
+    return global_query, column_filters, sort_column, sort_direction
+
+
+def _table_query_params(
+    global_query: str,
+    column_filters: Dict[int, str],
+    sort_column: Optional[int],
+    sort_direction: str,
+) -> Dict[str, str]:
+    params: Dict[str, str] = {}
+    if global_query:
+        params["q"] = global_query
+    params.update(
+        {f"filter_{column}": value for column, value in column_filters.items()}
+    )
+    if sort_column is not None:
+        params["sort"] = str(sort_column)
+        params["direction"] = sort_direction
+    return params
+
+
 def _submitted_sdl_form() -> Dict[str, str]:
     return {
         header: request.form.get(field_name, "").strip()
@@ -1857,10 +1958,68 @@ def _render_sdl_page(
         }
         edit_signature = selected_row["signature"]
 
+    total_rows = len(rows)
+    global_query, column_filters, sort_column, sort_direction = (
+        _request_table_state(len(SDL_HEADERS))
+    )
+
+    def displayed_values(row):
+        values = []
+        for header in SDL_HEADERS:
+            if header in SDL_STATUS_HEADERS:
+                values.append("Yes" if row["statuses"][header] else "No")
+            else:
+                values.append(row["values"][header])
+        return values
+
+    if sort_column is None:
+        rows.reverse()
+        rows = _filter_sort_records(
+            rows, displayed_values, global_query, column_filters
+        )
+    else:
+        rows = _filter_sort_records(
+            rows,
+            displayed_values,
+            global_query,
+            column_filters,
+            sort_column,
+            sort_direction,
+        )
+    query_params = _table_query_params(
+        global_query, column_filters, sort_column, sort_direction
+    )
+    sort_urls = []
+    for column in range(len(SDL_HEADERS)):
+        next_direction = (
+            "desc"
+            if sort_column == column and sort_direction == "asc"
+            else "asc"
+        )
+        sort_urls.append(
+            url_for(
+                "sdl",
+                **{
+                    **query_params,
+                    "sort": column,
+                    "direction": next_direction,
+                },
+            )
+        )
+    edit_urls = {
+        row["worksheet_row"]: url_for(
+            "sdl",
+            **{**query_params, "edit_row": row["worksheet_row"]},
+        )
+        + "#entry-form"
+        for row in rows
+    }
+
     return render_template(
         "sdl.html",
         workbook_available=True,
         rows=rows,
+        total_rows=total_rows,
         headers=SDL_HEADERS,
         status_headers=SDL_STATUS_HEADERS,
         form_fields=SDL_FORM_FIELDS,
@@ -1869,17 +2028,32 @@ def _render_sdl_page(
         edit_signature=edit_signature,
         organ_options=Config.SDL_ORGANS,
         scanner_options=Config.SDL_SCANNERS,
+        global_query=global_query,
+        column_filters=column_filters,
+        sort_column=sort_column,
+        sort_direction=sort_direction,
+        query_params=query_params,
+        sort_urls=sort_urls,
+        edit_urls=edit_urls,
         messages=flash_messages(),
     )
 
 
 def _read_inventory_page(
-    inventory_path: Path, requested_page: int, rows_per_page: int = 100
-) -> Tuple[List[str], List[List[str]], int, int, int]:
-    """Read one page of a headered inventory CSV without retaining the whole file."""
+    inventory_path: Path,
+    requested_page: int,
+    rows_per_page: int = 100,
+    global_query: str = "",
+    column_filters: Optional[Dict[int, str]] = None,
+    sort_column: Optional[int] = None,
+    sort_direction: str = "asc",
+) -> Tuple[List[str], List[List[str]], int, int, int, int]:
+    """Filter and sort a headered inventory CSV before returning one page."""
     headers: List[str] = []
+    matched_rows: List[List[str]] = []
     page_rows: List[List[str]] = []
     total_rows = 0
+    matching_rows = 0
 
     try:
         with inventory_path.open("r", encoding="utf-8-sig", newline="") as inventory_file:
@@ -1891,12 +2065,32 @@ def _read_inventory_page(
             if not headers:
                 raise InventoryReadError("This inventory does not contain a usable header row.")
 
+            column_filters = {
+                column: value
+                for column, value in (column_filters or {}).items()
+                if 0 <= column < len(headers)
+            }
+            if sort_column is not None and not 0 <= sort_column < len(headers):
+                sort_column = None
+            if sort_direction not in {"asc", "desc"}:
+                sort_direction = "asc"
             page_start = (requested_page - 1) * rows_per_page
             page_end = page_start + rows_per_page
-            for row_number, row in enumerate(reader):
-                if page_start <= row_number < page_end:
-                    page_rows.append(row)
+            for row in reader:
                 total_rows += 1
+                normalized_row = (row + [""] * len(headers))[:len(headers)]
+                if not _filter_sort_records(
+                    [normalized_row],
+                    lambda candidate: candidate,
+                    global_query,
+                    column_filters,
+                ):
+                    continue
+                if sort_column is not None:
+                    matched_rows.append(normalized_row)
+                elif page_start <= matching_rows < page_end:
+                    page_rows.append(normalized_row)
+                matching_rows += 1
     except InventoryReadError:
         raise
     except UnicodeDecodeError as exc:
@@ -1906,13 +2100,36 @@ def _read_inventory_page(
     except OSError as exc:
         raise InventoryReadError(f"This inventory could not be read: {exc}") from exc
 
-    total_pages = max(1, (total_rows + rows_per_page - 1) // rows_per_page)
+    total_pages = max(1, (matching_rows + rows_per_page - 1) // rows_per_page)
     current_page = min(requested_page, total_pages)
-
     if current_page != requested_page:
-        return _read_inventory_page(inventory_path, current_page, rows_per_page)
+        return _read_inventory_page(
+            inventory_path,
+            current_page,
+            rows_per_page,
+            global_query,
+            column_filters,
+            sort_column,
+            sort_direction,
+        )
+    page_start = (current_page - 1) * rows_per_page
+    if sort_column is not None:
+        matched_rows = _filter_sort_records(
+            matched_rows,
+            lambda row: row,
+            sort_column=sort_column,
+            sort_direction=sort_direction,
+        )
+        page_rows = matched_rows[page_start:page_start + rows_per_page]
 
-    return headers, page_rows, total_rows, current_page, total_pages
+    return (
+        headers,
+        page_rows,
+        total_rows,
+        matching_rows,
+        current_page,
+        total_pages,
+    )
 
 
 # ==============================================================================
@@ -2882,9 +3099,19 @@ def inventories():
     headers: List[str] = []
     rows: List[List[str]] = []
     total_rows = 0
+    matching_rows = 0
     current_page = 1
     total_pages = 1
     inventory_error = None
+    global_query = ""
+    column_filters: Dict[int, str] = {}
+    sort_column = None
+    sort_direction = "asc"
+    query_params: Dict[str, str] = {}
+    sort_urls: List[str] = []
+    previous_url = None
+    next_url = None
+    inventory_file_urls: Dict[str, str] = {}
 
     if selected_name:
         files_by_name = {path.name: path for path in inventory_files}
@@ -2899,15 +3126,90 @@ def inventories():
             requested_page = 1
 
         try:
+            with selected_path.open(
+                "r", encoding="utf-8-sig", newline=""
+            ) as inventory_file:
+                preview_reader = csv.reader(inventory_file, strict=True)
+                headers = next(preview_reader)
+            if not headers:
+                raise InventoryReadError(
+                    "This inventory does not contain a usable header row."
+                )
+            global_query, column_filters, sort_column, sort_direction = (
+                _request_table_state(len(headers))
+            )
             (
                 headers,
                 rows,
                 total_rows,
+                matching_rows,
                 current_page,
                 total_pages,
-            ) = _read_inventory_page(selected_path, requested_page)
+            ) = _read_inventory_page(
+                selected_path,
+                requested_page,
+                global_query=global_query,
+                column_filters=column_filters,
+                sort_column=sort_column,
+                sort_direction=sort_direction,
+            )
+        except StopIteration:
+            inventory_error = "This inventory is empty and has no header row."
+        except UnicodeDecodeError:
+            inventory_error = "This inventory is not valid UTF-8 text."
+        except csv.Error as exc:
+            inventory_error = f"This inventory contains invalid CSV data: {exc}"
+        except OSError as exc:
+            inventory_error = f"This inventory could not be read: {exc}"
         except InventoryReadError as exc:
             inventory_error = str(exc)
+
+        if not inventory_error:
+            query_params = _table_query_params(
+                global_query, column_filters, sort_column, sort_direction
+            )
+            for column in range(len(headers)):
+                next_direction = (
+                    "desc"
+                    if sort_column == column and sort_direction == "asc"
+                    else "asc"
+                )
+                sort_urls.append(
+                    url_for(
+                        "inventories",
+                        **{
+                            **query_params,
+                            "file": selected_path.name,
+                            "sort": column,
+                            "direction": next_direction,
+                        },
+                    )
+                )
+            if current_page > 1:
+                previous_url = url_for(
+                    "inventories",
+                    **{
+                        **query_params,
+                        "file": selected_path.name,
+                        "page": current_page - 1,
+                    },
+                )
+            if current_page < total_pages:
+                next_url = url_for(
+                    "inventories",
+                    **{
+                        **query_params,
+                        "file": selected_path.name,
+                        "page": current_page + 1,
+                    },
+                )
+
+    inventory_file_urls = {
+        path.name: url_for(
+            "inventories", **{**query_params, "file": path.name}
+        )
+        for path in inventory_files
+    }
 
     return render_template(
         "inventories.html",
@@ -2916,10 +3218,20 @@ def inventories():
         headers=headers,
         rows=rows,
         total_rows=total_rows,
+        matching_rows=matching_rows,
         current_page=current_page,
         total_pages=total_pages,
         directory_error=directory_error,
         inventory_error=inventory_error,
+        global_query=global_query,
+        column_filters=column_filters,
+        sort_column=sort_column,
+        sort_direction=sort_direction,
+        query_params=query_params,
+        sort_urls=sort_urls,
+        previous_url=previous_url,
+        next_url=next_url,
+        inventory_file_urls=inventory_file_urls,
         messages=flash_messages(),
     )
 
