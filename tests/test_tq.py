@@ -199,6 +199,28 @@ class TQTransferTests(unittest.TestCase):
         self.assertIn(b"Review Transfer", response.data)
         self.assertIn(b"AAAAAA", response.data)
 
+    def test_transfer_console_uses_ansi_renderer(self):
+        job = SimpleNamespace(
+            id="ansi-job",
+            owner_id=self.user.id,
+            status="running",
+            log_path=None,
+        )
+        with app_module._tq_state_lock:
+            app_module._tq_jobs[job.id] = job
+        with self.client.session_transaction() as session:
+            session["tq_job_id"] = job.id
+
+        response = self.client.get("/tq")
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn(b"function appendAnsiOutput(text)", response.data)
+        self.assertIn(b"applyAnsiCodes", response.data)
+        self.assertIn(b"appendChild(span)", response.data)
+        self.assertNotIn(
+            b"consoleElement.textContent += data.output", response.data
+        )
+
     def test_filter_validation_rejects_bad_typed_values_and_date_ranges(self):
         self.assertIn(
             "six uppercase letters",

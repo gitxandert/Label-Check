@@ -399,13 +399,136 @@ const statusElement = document.getElementById('job-status');
 const outputUrl = {{ url_for('tq_job_output', job_id=job.id)|tojson }};
 const reloadWhenComplete = {{ (job.status == 'running')|tojson }};
 let outputOffset = 0;
+let ansiBuffer = '';
+const ansiState = {
+    bold:false, dim:false, italic:false, underline:false,
+    inverse:false, hidden:false, strike:false, foreground:null, background:null
+};
+const ansiColors = [
+    '#000000','#cd3131','#0dbc79','#e5e510','#2472c8','#bc3fbc','#11a8cd','#e5e5e5',
+    '#666666','#f14c4c','#23d18b','#f5f543','#3b8eea','#d670d6','#29b8db','#ffffff'
+];
+function resetAnsiState() {
+    Object.assign(ansiState, {
+        bold:false, dim:false, italic:false, underline:false,
+        inverse:false, hidden:false, strike:false, foreground:null, background:null
+    });
+}
+function ansi256Color(value) {
+    if (value < 16) return ansiColors[value];
+    if (value < 232) {
+        const index = value - 16;
+        const levels = [0,95,135,175,215,255];
+        return `rgb(${levels[Math.floor(index / 36)]},${levels[Math.floor(index / 6) % 6]},${levels[index % 6]})`;
+    }
+    const level = 8 + (value - 232) * 10;
+    return `rgb(${level},${level},${level})`;
+}
+function applyAnsiCodes(parameters) {
+    const codes = (parameters === '' ? [0] : parameters.replaceAll(':',';').split(';').map(
+        (value) => value === '' ? 0 : Number.parseInt(value,10)
+    ));
+    for (let index = 0; index < codes.length; index += 1) {
+        const code = codes[index];
+        if (code === 0) resetAnsiState();
+        else if (code === 1) ansiState.bold = true;
+        else if (code === 2) ansiState.dim = true;
+        else if (code === 3) ansiState.italic = true;
+        else if (code === 4 || code === 21) ansiState.underline = true;
+        else if (code === 7) ansiState.inverse = true;
+        else if (code === 8) ansiState.hidden = true;
+        else if (code === 9) ansiState.strike = true;
+        else if (code === 22) { ansiState.bold = false; ansiState.dim = false; }
+        else if (code === 23) ansiState.italic = false;
+        else if (code === 24) ansiState.underline = false;
+        else if (code === 27) ansiState.inverse = false;
+        else if (code === 28) ansiState.hidden = false;
+        else if (code === 29) ansiState.strike = false;
+        else if (code >= 30 && code <= 37) ansiState.foreground = ansiColors[code - 30];
+        else if (code === 39) ansiState.foreground = null;
+        else if (code >= 40 && code <= 47) ansiState.background = ansiColors[code - 40];
+        else if (code === 49) ansiState.background = null;
+        else if (code >= 90 && code <= 97) ansiState.foreground = ansiColors[code - 90 + 8];
+        else if (code >= 100 && code <= 107) ansiState.background = ansiColors[code - 100 + 8];
+        else if ((code === 38 || code === 48) && codes[index + 1] === 5 && Number.isInteger(codes[index + 2])) {
+            const value = Math.max(0,Math.min(255,codes[index + 2]));
+            ansiState[code === 38 ? 'foreground' : 'background'] = ansi256Color(value);
+            index += 2;
+        } else if ((code === 38 || code === 48) && codes[index + 1] === 2 && codes.slice(index + 2,index + 5).every(Number.isInteger)) {
+            const rgb = codes.slice(index + 2,index + 5).map((value) => Math.max(0,Math.min(255,value)));
+            ansiState[code === 38 ? 'foreground' : 'background'] = `rgb(${rgb.join(',')})`;
+            index += 4;
+        }
+    }
+}
+function appendStyledConsoleText(text) {
+    if (!text) return;
+    const span = document.createElement('span');
+    let foreground = ansiState.foreground;
+    let background = ansiState.background;
+    if (ansiState.inverse) {
+        [foreground,background] = [background || '#111820',foreground || '#e7edf3'];
+    }
+    if (foreground) span.style.color = foreground;
+    if (background) span.style.backgroundColor = background;
+    if (ansiState.bold) span.style.fontWeight = '700';
+    if (ansiState.dim) span.style.opacity = '.65';
+    if (ansiState.italic) span.style.fontStyle = 'italic';
+    const decorations = [];
+    if (ansiState.underline) decorations.push('underline');
+    if (ansiState.strike) decorations.push('line-through');
+    if (decorations.length) span.style.textDecoration = decorations.join(' ');
+    if (ansiState.hidden) span.style.visibility = 'hidden';
+    span.textContent = text;
+    consoleElement.appendChild(span);
+}
+function appendAnsiOutput(text) {
+    ansiBuffer += text.replace(/\r(?!\n)/g,'\n');
+    while (ansiBuffer) {
+        const escapeIndex = ansiBuffer.indexOf('\x1b');
+        if (escapeIndex < 0) {
+            appendStyledConsoleText(ansiBuffer);
+            ansiBuffer = '';
+            return;
+        }
+        appendStyledConsoleText(ansiBuffer.slice(0,escapeIndex));
+        ansiBuffer = ansiBuffer.slice(escapeIndex);
+        if (ansiBuffer.length === 1) return;
+        if (ansiBuffer[1] === '[') {
+            let finalIndex = 2;
+            while (finalIndex < ansiBuffer.length) {
+                const character = ansiBuffer.charCodeAt(finalIndex);
+                if (character >= 0x40 && character <= 0x7e) break;
+                finalIndex += 1;
+            }
+            if (finalIndex === ansiBuffer.length) return;
+            if (ansiBuffer[finalIndex] === 'm') {
+                applyAnsiCodes(ansiBuffer.slice(2,finalIndex));
+            }
+            ansiBuffer = ansiBuffer.slice(finalIndex + 1);
+        } else if (ansiBuffer[1] === ']') {
+            const bellIndex = ansiBuffer.indexOf('\x07',2);
+            const terminatorIndex = ansiBuffer.indexOf('\x1b\\',2);
+            let endIndex = bellIndex;
+            let terminatorLength = 1;
+            if (terminatorIndex >= 0 && (endIndex < 0 || terminatorIndex < endIndex)) {
+                endIndex = terminatorIndex;
+                terminatorLength = 2;
+            }
+            if (endIndex < 0) return;
+            ansiBuffer = ansiBuffer.slice(endIndex + terminatorLength);
+        } else {
+            ansiBuffer = ansiBuffer.slice(2);
+        }
+    }
+}
 async function pollOutput() {
     try {
         const response = await fetch(`${outputUrl}?offset=${outputOffset}`,{cache:'no-store'});
         if (!response.ok) throw new Error(`Output request failed (${response.status})`);
         const data = await response.json();
         const nearBottom = consoleElement.scrollHeight-consoleElement.scrollTop-consoleElement.clientHeight < 60;
-        if (data.output) consoleElement.textContent += data.output.replace(/\r(?!\n)/g,'\n');
+        if (data.output) appendAnsiOutput(data.output);
         outputOffset = data.next_offset;
         statusElement.textContent = data.status;
         statusElement.className = `status ${data.status}`;
@@ -413,7 +536,7 @@ async function pollOutput() {
         if (data.status === 'running') window.setTimeout(pollOutput,750);
         else if (data.log_path && reloadWhenComplete) window.setTimeout(() => window.location.reload(),500);
     } catch (error) {
-        consoleElement.textContent += `\nUnable to refresh output: ${error.message}\n`;
+        appendStyledConsoleText(`\nUnable to refresh output: ${error.message}\n`);
         window.setTimeout(pollOutput,2000);
     }
 }
