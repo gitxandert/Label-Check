@@ -156,6 +156,8 @@ class TableSearchRouteTests(unittest.TestCase):
         self.assertIn(b'value="NP25-2"', response.data)
         self.assertIn(b'NP25-2', response.data)
         self.assertNotIn(b'NP25-10</td>', response.data)
+        self.assertIn(b"await fetch(url", response.data)
+        self.assertNotIn(b"requestSubmit()", response.data)
 
     def test_inventory_route_renders_naturally_sorted_results(self):
         response = self.client.get(
@@ -169,6 +171,8 @@ class TableSearchRouteTests(unittest.TestCase):
             response.data.index(b"Slide 10"),
         )
         self.assertIn(b'name="filter_1"', response.data)
+        self.assertIn(b"await fetch(url", response.data)
+        self.assertNotIn(b"requestSubmit()", response.data)
 
 
 if __name__ == "__main__":

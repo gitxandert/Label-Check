@@ -206,7 +206,7 @@
                 {% else %}
                     <div class="table-heading">
                         <h3>{{ selected_name }}</h3>
-                        <p>
+                        <p data-table-count>
                             {% if matching_rows != total_rows %}{{ matching_rows }} of {% endif %}
                             {{ total_rows }} {{ 'row' if total_rows == 1 else 'rows' }}
                         </p>
@@ -262,7 +262,7 @@
                                         {% endfor %}
                                     </tr>
                                 </thead>
-                                <tbody>
+                                <tbody data-table-body>
                                     {% for row in rows %}
                                         <tr>{% for value in row %}<td>{{ value }}</td>{% endfor %}</tr>
                                     {% else %}
@@ -275,33 +275,82 @@
                         <p class="empty">This inventory contains a header row but no slide records.</p>
                     {% endif %}
 
-                    {% if total_pages > 1 %}
-                        <nav class="pagination" aria-label="Inventory pages">
-                            {% if previous_url %}
-                                <a href="{{ previous_url }}">Previous</a>
-                            {% else %}
-                                <span class="disabled">Previous</span>
-                            {% endif %}
-                            <span>Page {{ current_page }} of {{ total_pages }}</span>
-                            {% if next_url %}
-                                <a href="{{ next_url }}">Next</a>
-                            {% else %}
-                                <span class="disabled">Next</span>
-                            {% endif %}
-                        </nav>
-                    {% endif %}
+                    <div data-table-pagination>
+                        {% if total_pages > 1 %}
+                            <nav class="pagination" aria-label="Inventory pages">
+                                {% if previous_url %}
+                                    <a href="{{ previous_url }}">Previous</a>
+                                {% else %}
+                                    <span class="disabled">Previous</span>
+                                {% endif %}
+                                <span>Page {{ current_page }} of {{ total_pages }}</span>
+                                {% if next_url %}
+                                    <a href="{{ next_url }}">Next</a>
+                                {% else %}
+                                    <span class="disabled">Next</span>
+                                {% endif %}
+                            </nav>
+                        {% endif %}
+                    </div>
                 {% endif %}
             </section>
         </div>
     </main>
     <script>
         let tableSearchTimer;
+        let tableSearchRequest;
+        const tableControls = document.getElementById('inventory-table-controls');
+
+        async function updateTable() {
+            tableSearchRequest?.abort();
+            tableSearchRequest = new AbortController();
+            const url = new URL(tableControls.action, window.location.href);
+            url.search = new URLSearchParams(new FormData(tableControls)).toString();
+            try {
+                const response = await fetch(url, {
+                    headers: { 'X-Requested-With': 'XMLHttpRequest' },
+                    signal: tableSearchRequest.signal,
+                });
+                if (!response.ok) {
+                    throw new Error(`Search failed with HTTP ${response.status}`);
+                }
+                const nextPage = new DOMParser().parseFromString(
+                    await response.text(),
+                    'text/html',
+                );
+                const nextBody = nextPage.querySelector('[data-table-body]');
+                const nextCount = nextPage.querySelector('[data-table-count]');
+                const nextPagination = nextPage.querySelector('[data-table-pagination]');
+                if (!nextBody || !nextCount || !nextPagination) {
+                    window.location.assign(response.url);
+                    return;
+                }
+                document.querySelector('[data-table-body]').innerHTML = nextBody.innerHTML;
+                document.querySelector('[data-table-count]').innerHTML = nextCount.innerHTML;
+                document.querySelector('[data-table-pagination]').innerHTML =
+                    nextPagination.innerHTML;
+                const nextSortLinks = nextPage.querySelectorAll('.sort-link');
+                document.querySelectorAll('.sort-link').forEach((link, index) => {
+                    if (nextSortLinks[index]) {
+                        link.href = nextSortLinks[index].getAttribute('href');
+                    }
+                });
+                window.history.replaceState({}, '', url);
+            } catch (error) {
+                if (error.name !== 'AbortError') {
+                    console.error(error.message);
+                }
+            }
+        }
+
+        tableControls?.addEventListener('submit', (event) => {
+            event.preventDefault();
+            updateTable();
+        });
         document.querySelectorAll('[data-table-search]').forEach((input) => {
             input.addEventListener('input', () => {
                 window.clearTimeout(tableSearchTimer);
-                tableSearchTimer = window.setTimeout(() => {
-                    document.getElementById('inventory-table-controls').requestSubmit();
-                }, 400);
+                tableSearchTimer = window.setTimeout(updateTable, 400);
             });
         });
     </script>

@@ -304,7 +304,7 @@
             <section class="card">
                 <div class="table-heading">
                     <h3>Workbook entries</h3>
-                    <p>
+                    <p data-table-count>
                         {% if rows|length != total_rows %}{{ rows|length }} of {% endif %}
                         {{ total_rows }} {{ 'entry' if total_rows == 1 else 'entries' }}
                     </p>
@@ -364,7 +364,7 @@
                                     <th aria-hidden="true"></th>
                                 </tr>
                             </thead>
-                            <tbody>
+                            <tbody data-table-body>
                                 {% for row in rows %}
                                     {% set count = loop.index0 + 1 %}
                                     <tr
@@ -414,22 +414,72 @@
     </main>
     <script>
         let tableSearchTimer;
+        let tableSearchRequest;
+        const tableControls = document.getElementById('sdl-table-controls');
+
+        async function updateTable() {
+            tableSearchRequest?.abort();
+            tableSearchRequest = new AbortController();
+            const url = new URL(tableControls.action, window.location.href);
+            url.search = new URLSearchParams(new FormData(tableControls)).toString();
+            try {
+                const response = await fetch(url, {
+                    headers: { 'X-Requested-With': 'XMLHttpRequest' },
+                    signal: tableSearchRequest.signal,
+                });
+                if (!response.ok) {
+                    throw new Error(`Search failed with HTTP ${response.status}`);
+                }
+                const nextPage = new DOMParser().parseFromString(
+                    await response.text(),
+                    'text/html',
+                );
+                const nextBody = nextPage.querySelector('[data-table-body]');
+                const nextCount = nextPage.querySelector('[data-table-count]');
+                if (!nextBody || !nextCount) {
+                    window.location.assign(response.url);
+                    return;
+                }
+                document.querySelector('[data-table-body]').innerHTML = nextBody.innerHTML;
+                document.querySelector('[data-table-count]').innerHTML = nextCount.innerHTML;
+                const nextSortLinks = nextPage.querySelectorAll('.sort-link');
+                document.querySelectorAll('.sort-link').forEach((link, index) => {
+                    if (nextSortLinks[index]) {
+                        link.href = nextSortLinks[index].getAttribute('href');
+                    }
+                });
+                window.history.replaceState({}, '', url);
+                attachEditableRows();
+            } catch (error) {
+                if (error.name !== 'AbortError') {
+                    console.error(error.message);
+                }
+            }
+        }
+
+        tableControls?.addEventListener('submit', (event) => {
+            event.preventDefault();
+            updateTable();
+        });
         document.querySelectorAll('[data-table-search]').forEach((input) => {
             input.addEventListener('input', () => {
                 window.clearTimeout(tableSearchTimer);
-                tableSearchTimer = window.setTimeout(() => {
-                    document.getElementById('sdl-table-controls').requestSubmit();
-                }, 400);
+                tableSearchTimer = window.setTimeout(updateTable, 400);
             });
         });
-        document.querySelectorAll('tr[data-edit-url]').forEach((row) => {
-            row.addEventListener('dblclick', (event) => {
-                if (event.target.closest('a, button, input, select, textarea')) {
-                    return;
-                }
-                window.location.assign(row.dataset.editUrl);
+
+        function attachEditableRows() {
+            document.querySelectorAll('tr[data-edit-url]').forEach((row) => {
+                row.addEventListener('dblclick', (event) => {
+                    if (event.target.closest('a, button, input, select, textarea')) {
+                        return;
+                    }
+                    window.location.assign(row.dataset.editUrl);
+                });
             });
-        });
+        }
+
+        attachEditableRows();
     </script>
 </body>
 </html>
