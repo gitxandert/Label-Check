@@ -2872,11 +2872,16 @@ def _tq_job_for_user(job_id: Optional[str]) -> Optional[TQJob]:
         return job
 
 
-def _tq_safe_log_file(relative_path: str) -> Path:
+def _tq_safe_path(relative_path: str, expected: str = "any") -> Path:
     root = Path(Config.TQ_HOME_DIR).expanduser().resolve()
-    lexical = Path(relative_path)
+    normalized = relative_path.replace("\\", "/").strip("/")
+    if not normalized:
+        if expected == "file":
+            raise TQError("The requested TQ file is unavailable.")
+        return root
+    lexical = Path(normalized)
     if lexical.is_absolute() or any(part in {"", ".", ".."} for part in lexical.parts):
-        raise TQError("The requested TQ file is outside the log directory.")
+        raise TQError("The requested TQ path is outside the TQ directory.")
     current = root
     for part in lexical.parts:
         current = current / part
@@ -2885,11 +2890,49 @@ def _tq_safe_log_file(relative_path: str) -> Path:
     try:
         relative = current.resolve().relative_to(root)
     except (OSError, ValueError) as exc:
-        raise TQError("The requested TQ file is outside the log directory.") from exc
+        raise TQError("The requested TQ path is outside the TQ directory.") from exc
     resolved = root / relative
-    if not resolved.is_file():
+    if expected == "file" and not resolved.is_file():
         raise TQError("The requested TQ file is unavailable.")
+    if expected == "directory" and not resolved.is_dir():
+        raise TQError("The requested TQ folder is unavailable.")
+    if expected == "any" and not resolved.exists():
+        raise TQError("The requested TQ path is unavailable.")
     return resolved
+
+
+def _tq_relative_path(path: Path) -> str:
+    root = Path(Config.TQ_HOME_DIR).expanduser().resolve()
+    return str(path.resolve().relative_to(root)).replace(os.sep, "/")
+
+
+def _save_tq_config(contents: str) -> None:
+    if len(contents.encode("utf-8")) > 1024 * 1024:
+        raise TQError("config.toml cannot exceed 1 MiB.")
+    try:
+        tomllib.loads(contents)
+    except tomllib.TOMLDecodeError as exc:
+        raise TQError(f"config.toml is not valid TOML: {exc}") from exc
+    root = Path(Config.TQ_HOME_DIR).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / "config.toml"
+    if target.is_symlink():
+        raise TQError("config.toml cannot be edited through a symbolic link.")
+    mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else None
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=".config.", suffix=".toml.tmp", dir=root
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            handle.write(contents)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if mode is not None:
+            os.chmod(temporary_path, mode)
+        os.replace(temporary_path, target)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
 
 
 # ==============================================================================
@@ -3672,22 +3715,45 @@ def tq_job_output(job_id: str):
 @app.route("/tq/logs", methods=["GET"])
 @login_required
 def tq_logs():
-    root = Path(Config.TQ_HOME_DIR).expanduser()
-    files: List[str] = []
+    root = Path(Config.TQ_HOME_DIR).expanduser().resolve()
+    entries: List[Dict[str, Any]] = []
+    breadcrumbs = [{"name": ".tq", "path": ""}]
     error = None
+    current_name = request.args.get("path", "").strip()
     selected_name = request.args.get("file", "").strip()
     content = None
     truncated = False
     try:
         if not root.is_dir():
             raise TQError(f"The TQ directory is unavailable: {root}")
-        files = sorted(
-            str(path.relative_to(root)).replace(os.sep, "/")
-            for path in root.rglob("*")
-            if path.is_file() and not path.is_symlink()
-        )
+        current_path = _tq_safe_path(current_name, "directory")
+        accumulated = []
+        for part in Path(current_name.replace("\\", "/")).parts:
+            if part in {"", "."}:
+                continue
+            accumulated.append(part)
+            breadcrumbs.append(
+                {"name": part, "path": "/".join(accumulated)}
+            )
+        children = []
+        for path in current_path.iterdir():
+            if path.is_symlink():
+                continue
+            if not current_name and not path.is_dir():
+                continue
+            if path.is_dir() or path.is_file():
+                children.append(path)
+        children.sort(key=lambda path: (not path.is_dir(), path.name.casefold()))
+        entries = [
+            {
+                "name": path.name,
+                "path": _tq_relative_path(path),
+                "is_dir": path.is_dir(),
+            }
+            for path in children
+        ]
         if selected_name:
-            selected_path = _tq_safe_log_file(selected_name)
+            selected_path = _tq_safe_path(selected_name, "file")
             with selected_path.open("r", encoding="utf-8", errors="replace") as handle:
                 content = handle.read(1024 * 1024 + 1)
             if len(content) > 1024 * 1024:
@@ -3700,11 +3766,53 @@ def tq_logs():
     return render_template(
         "tq_logs.html",
         root=root,
-        files=files,
+        entries=entries,
+        breadcrumbs=breadcrumbs,
+        current_name=current_name,
         selected_name=selected_name,
         content=content,
         truncated=truncated,
         error=error,
+        messages=flash_messages(),
+    )
+
+
+@app.route("/tq/config", methods=["GET", "POST"])
+@login_required
+def tq_edit_config():
+    config_path = Path(Config.TQ_HOME_DIR).expanduser() / "config.toml"
+    if request.method == "POST":
+        contents = request.form.get("config_text", "")
+        try:
+            _save_tq_config(contents)
+        except (TQError, OSError) as exc:
+            flash(str(exc), "error")
+            return render_template(
+                "tq_config.html",
+                config_path=config_path,
+                config_text=contents,
+                messages=flash_messages(),
+            )
+        flash("config.toml was saved successfully.", "success")
+        return redirect(url_for("tq_edit_config"))
+
+    try:
+        if config_path.is_symlink():
+            raise TQError("config.toml cannot be opened through a symbolic link.")
+        config_text = config_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        config_text = ""
+        flash(
+            "config.toml does not exist yet. Saving will create it.",
+            "warning",
+        )
+    except (TQError, OSError, UnicodeError) as exc:
+        config_text = ""
+        flash(f"config.toml could not be read: {exc}", "error")
+    return render_template(
+        "tq_config.html",
+        config_path=config_path,
+        config_text=config_text,
         messages=flash_messages(),
     )
 

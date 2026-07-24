@@ -348,6 +348,58 @@ class TQTransferTests(unittest.TestCase):
         self.assertIn(b"Symbolic links cannot be opened", response.data)
         self.assertNotIn(b"secret", response.data)
 
+    def test_log_browser_starts_with_folders_and_drills_into_files(self):
+        log_file = self.tq_home / "logs" / "2026-07-24" / "transfer.log"
+        log_file.parent.mkdir(parents=True)
+        log_file.write_text("transfer complete", encoding="utf-8")
+        loose_file = self.tq_home / "loose.log"
+        loose_file.write_text("not shown at root", encoding="utf-8")
+
+        root_response = self.client.get("/tq/logs")
+        logs_response = self.client.get("/tq/logs?path=logs")
+        date_response = self.client.get("/tq/logs?path=logs/2026-07-24")
+        file_response = self.client.get(
+            "/tq/logs?path=logs/2026-07-24&file=logs/2026-07-24/transfer.log"
+        )
+
+        self.assertEqual(200, root_response.status_code)
+        self.assertIn(b"Log folders", root_response.data)
+        self.assertIn(b"logs", root_response.data)
+        self.assertNotIn(b"loose.log", root_response.data)
+        self.assertIn(b"2026-07-24", logs_response.data)
+        self.assertIn(b"transfer.log", date_response.data)
+        self.assertIn(b"transfer complete", file_response.data)
+        self.assertIn(b"Edit Config", root_response.data)
+
+    def test_config_editor_validates_and_atomically_saves_toml(self):
+        valid = (
+            'username = "new-user"\n'
+            'ftp_addr = "new.example"\n'
+            'ftp_dir = "/new-transfer"\n'
+        )
+
+        response = self.client.post(
+            "/tq/config", data={"config_text": valid}, follow_redirects=True
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn(b"saved successfully", response.data)
+        self.assertEqual(
+            valid,
+            (self.tq_home / "config.toml").read_text(encoding="utf-8"),
+        )
+
+        invalid_response = self.client.post(
+            "/tq/config", data={"config_text": 'username = "unterminated'}
+        )
+
+        self.assertEqual(200, invalid_response.status_code)
+        self.assertIn(b"not valid TOML", invalid_response.data)
+        self.assertEqual(
+            valid,
+            (self.tq_home / "config.toml").read_text(encoding="utf-8"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
