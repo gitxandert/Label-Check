@@ -127,7 +127,8 @@ class Config:
     SDL_SHEET_NAME = "general"
     SDL_ORGANS = ("BRAIN", "BREAST", "TESTIS", "OTHER", "UNKNOWN", "CYTO")
     SDL_SCANNERS = ("-----", "RSCH1 (SS12797)", "CLIN1 (SS12602)")
-    TQ_EXECUTABLE = os.environ.get("TQ_EXECUTABLE", "tq")
+    CARGO_EXECUTABLE = os.environ.get("CARGO_EXE", "")
+    TQ_DIR = os.environ.get("TQ_DIR", "")
     TQ_HOME_DIR = os.environ.get("TQ_HOME_DIR", str(Path.home() / ".tq"))
     TQ_TRANSFER_LOG_DIR = os.environ.get("TQ_TRANSFER_LOG_DIR", "")
 
@@ -2826,7 +2827,7 @@ def _start_tq_job(
     global _tq_active_job_id
     _tq_config()
     manifest_path = _tq_write_manifest(slides)
-    command = [Config.TQ_EXECUTABLE, "pusher", "--paths", str(manifest_path)]
+    command = [Config.CARGO_EXECUTABLE, "run", "--release", "--", "pusher", "--paths", str(manifest_path)]
     with _tq_state_lock:
         if _tq_active_job_id:
             active = _tq_jobs.get(_tq_active_job_id)
@@ -2837,7 +2838,7 @@ def _start_tq_job(
         try:
             process = subprocess.Popen(
                 command,
-                cwd=Path(__file__).resolve().parent.parent,
+                cwd=Config.TQ_DIR,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
