@@ -155,9 +155,22 @@ class TableSearchRouteTests(unittest.TestCase):
         self.assertIn(b'Search entire log', response.data)
         self.assertIn(b'value="NP25-2"', response.data)
         self.assertIn(b'NP25-2', response.data)
-        self.assertNotIn(b'NP25-10</td>', response.data)
+        self.assertNotIn(b"NP25-10", response.data)
         self.assertIn(b"await fetch(url", response.data)
         self.assertNotIn(b"requestSubmit()", response.data)
+        self.assertIn(b"updateTable(link.href)", response.data)
+
+    def test_sdl_route_sorts_by_workbook_row(self):
+        response = self.client.get("/sdl?sort=16&direction=asc")
+
+        self.assertEqual(200, response.status_code)
+        self.assertLess(
+            response.data.index(b"NP25-10"),
+            response.data.index(b"NP25-2"),
+        )
+        self.assertIn(b"Row", response.data)
+        self.assertIn("▲".encode(), response.data)
+        self.assertIn("↕".encode(), response.data)
 
     def test_inventory_route_renders_naturally_sorted_results(self):
         response = self.client.get(
@@ -173,6 +186,7 @@ class TableSearchRouteTests(unittest.TestCase):
         self.assertIn(b'name="filter_1"', response.data)
         self.assertIn(b"await fetch(url", response.data)
         self.assertNotIn(b"requestSubmit()", response.data)
+        self.assertIn(b"updateTable(link.href)", response.data)
 
 
 if __name__ == "__main__":

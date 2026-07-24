@@ -328,16 +328,21 @@
                         <table>
                             <thead>
                                 <tr>
-                                    <th>Row</th>
+                                    <th>
+                                        <a class="sort-link" href="{{ row_sort_url }}">
+                                            Row
+                                            <span class="sort-indicator" aria-label="{{ sort_direction if sort_column == row_sort_column else 'not sorted' }}">
+                                                {% if sort_column == row_sort_column %}{{ '▲' if sort_direction == 'asc' else '▼' }}{% else %}↕{% endif %}
+                                            </span>
+                                        </a>
+                                    </th>
                                     {% for header in headers %}
                                         <th>
                                             <a class="sort-link" href="{{ sort_urls[loop.index0] }}">
                                                 {{ header }}
-                                                {% if sort_column == loop.index0 %}
-                                                    <span class="sort-indicator" aria-label="{{ sort_direction }}">
-                                                        {{ '▲' if sort_direction == 'asc' else '▼' }}
-                                                    </span>
-                                                {% endif %}
+                                                <span class="sort-indicator" aria-label="{{ sort_direction if sort_column == loop.index0 else 'not sorted' }}">
+                                                    {% if sort_column == loop.index0 %}{{ '▲' if sort_direction == 'asc' else '▼' }}{% else %}↕{% endif %}
+                                                </span>
                                             </a>
                                         </th>
                                     {% endfor %}
@@ -366,13 +371,12 @@
                             </thead>
                             <tbody data-table-body>
                                 {% for row in rows %}
-                                    {% set count = loop.index0 + 1 %}
                                     <tr
                                         class="editable-row"
                                         data-edit-url="{{ edit_urls[row.worksheet_row] }}"
                                         title="Double-click to edit this row"
                                     >
-                                        <td>{{ count }}</td>
+                                        <td>{{ row.worksheet_row - 1 }}</td>
                                         {% for header in headers %}
                                             <td>
                                                 {% if header in status_headers %}
@@ -417,11 +421,15 @@
         let tableSearchRequest;
         const tableControls = document.getElementById('sdl-table-controls');
 
-        async function updateTable() {
+        async function updateTable(targetUrl) {
             tableSearchRequest?.abort();
             tableSearchRequest = new AbortController();
-            const url = new URL(tableControls.action, window.location.href);
-            url.search = new URLSearchParams(new FormData(tableControls)).toString();
+            const url = targetUrl
+                ? new URL(targetUrl, window.location.href)
+                : new URL(tableControls.action, window.location.href);
+            if (!targetUrl) {
+                url.search = new URLSearchParams(new FormData(tableControls)).toString();
+            }
             try {
                 const response = await fetch(url, {
                     headers: { 'X-Requested-With': 'XMLHttpRequest' },
@@ -446,6 +454,16 @@
                 document.querySelectorAll('.sort-link').forEach((link, index) => {
                     if (nextSortLinks[index]) {
                         link.href = nextSortLinks[index].getAttribute('href');
+                        link.innerHTML = nextSortLinks[index].innerHTML;
+                    }
+                });
+                ['sort', 'direction'].forEach((name) => {
+                    tableControls.querySelector(`input[name="${name}"]`)?.remove();
+                    const nextInput = nextPage.querySelector(
+                        `#sdl-table-controls input[name="${name}"]`,
+                    );
+                    if (nextInput) {
+                        tableControls.appendChild(nextInput.cloneNode());
                     }
                 });
                 window.history.replaceState({}, '', url);
@@ -465,6 +483,12 @@
             input.addEventListener('input', () => {
                 window.clearTimeout(tableSearchTimer);
                 tableSearchTimer = window.setTimeout(updateTable, 400);
+            });
+        });
+        document.querySelectorAll('.sort-link').forEach((link) => {
+            link.addEventListener('click', (event) => {
+                event.preventDefault();
+                updateTable(link.href);
             });
         });
 

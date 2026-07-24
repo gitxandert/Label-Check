@@ -1959,9 +1959,15 @@ def _render_sdl_page(
         edit_signature = selected_row["signature"]
 
     total_rows = len(rows)
+    row_sort_column = len(SDL_HEADERS)
     global_query, column_filters, sort_column, sort_direction = (
-        _request_table_state(len(SDL_HEADERS))
+        _request_table_state(len(SDL_HEADERS) + 1)
     )
+    column_filters = {
+        column: value
+        for column, value in column_filters.items()
+        if column < len(SDL_HEADERS)
+    }
 
     def displayed_values(row):
         values = []
@@ -1972,7 +1978,15 @@ def _render_sdl_page(
                 values.append(row["values"][header])
         return values
 
-    if sort_column is None:
+    if sort_column == row_sort_column:
+        rows = _filter_sort_records(
+            rows, displayed_values, global_query, column_filters
+        )
+        rows.sort(
+            key=lambda row: row["worksheet_row"],
+            reverse=sort_direction == "desc",
+        )
+    elif sort_column is None:
         rows.reverse()
         rows = _filter_sort_records(
             rows, displayed_values, global_query, column_filters
@@ -1988,6 +2002,18 @@ def _render_sdl_page(
         )
     query_params = _table_query_params(
         global_query, column_filters, sort_column, sort_direction
+    )
+    row_sort_url = url_for(
+        "sdl",
+        **{
+            **query_params,
+            "sort": row_sort_column,
+            "direction": (
+                "desc"
+                if sort_column == row_sort_column and sort_direction == "asc"
+                else "asc"
+            ),
+        },
     )
     sort_urls = []
     for column in range(len(SDL_HEADERS)):
@@ -2032,6 +2058,8 @@ def _render_sdl_page(
         column_filters=column_filters,
         sort_column=sort_column,
         sort_direction=sort_direction,
+        row_sort_column=row_sort_column,
+        row_sort_url=row_sort_url,
         query_params=query_params,
         sort_urls=sort_urls,
         edit_urls=edit_urls,
