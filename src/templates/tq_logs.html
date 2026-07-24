@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TQ Logs - Label Check</title>
+    <style>
+        :root { --primary:#007bff;--primary-dark:#0056b3;--bg:#f7f9fb;--text:#27313d;--border:#dce2e8;--muted:#687482; }
+        *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:Arial,sans-serif}
+        header{display:flex;justify-content:space-between;align-items:center;padding:15px 30px;color:white;background:linear-gradient(90deg,var(--primary),var(--primary-dark))}
+        header h1{margin:0;font-size:1.5rem} header a{margin-left:14px;color:white;text-decoration:none}
+        main{display:grid;grid-template-columns:minmax(220px,320px) 1fr;gap:20px;width:min(1300px,calc(100% - 36px));margin:28px auto}
+        .card{padding:20px;border:1px solid var(--border);border-radius:10px;background:white;box-shadow:0 4px 14px rgba(0,0,0,.05)}
+        h2{margin-top:0}.root{color:var(--muted);overflow-wrap:anywhere}.files{padding:0;list-style:none}.files a{display:block;padding:8px;border-radius:5px;color:var(--primary-dark);text-decoration:none;overflow-wrap:anywhere}.files a:hover,.files a.active{background:#eaf3ff}
+        pre{min-height:400px;max-height:75vh;overflow:auto;padding:16px;border-radius:8px;background:#111820;color:#e7edf3;white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.5 ui-monospace,Consolas,monospace}
+        .error{padding:12px;border:1px solid #f1aeb5;border-radius:7px;background:#f8d7da}
+        @media(max-width:760px){header{align-items:flex-start;flex-direction:column;gap:10px;padding:15px 20px}main{grid-template-columns:1fr}}
+    </style>
+</head>
+<body>
+<header><h1>TQ Logs</h1><nav><a href="{{ url_for('tq_page') }}">Transfers</a><a href="{{ url_for('index') }}">Home</a><a href="{{ url_for('logout') }}">Logout</a></nav></header>
+<main>
+    <aside class="card">
+        <h2>Files</h2>
+        <p class="root">{{ root }}</p>
+        {% if error %}<p class="error">{{ error }}</p>{% endif %}
+        <ul class="files">
+            {% for file in files %}<li><a class="{% if file == selected_name %}active{% endif %}" href="{{ url_for('tq_logs', file=file) }}">{{ file }}</a></li>{% endfor %}
+        </ul>
+        {% if not files and not error %}<p>No regular files are available.</p>{% endif %}
+    </aside>
+    <section class="card">
+        <h2>{{ selected_name or 'Choose a file' }}</h2>
+        {% if content is not none %}
+            {% if truncated %}<p class="error">Only the first 1 MiB is shown.</p>{% endif %}
+            <pre>{{ content }}</pre>
+        {% else %}<p>Select a configuration or log file to view it.</p>{% endif %}
+    </section>
+</main>
+</body>
+</html>

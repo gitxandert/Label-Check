@@ -39,6 +39,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 import uuid
 from collections import Counter, defaultdict
 from logging.handlers import RotatingFileHandler
@@ -126,6 +127,9 @@ class Config:
     SDL_SHEET_NAME = "general"
     SDL_ORGANS = ("BRAIN", "BREAST", "TESTIS", "OTHER", "UNKNOWN", "CYTO")
     SDL_SCANNERS = ("-----", "RSCH1 (SS12797)", "CLIN1 (SS12602)")
+    TQ_EXECUTABLE = os.environ.get("TQ_EXECUTABLE", "tq")
+    TQ_HOME_DIR = os.environ.get("TQ_HOME_DIR", str(Path.home() / ".tq"))
+    TQ_TRANSFER_LOG_DIR = os.environ.get("TQ_TRANSFER_LOG_DIR", "")
 
 
     # Path to scanner inventories
@@ -215,6 +219,10 @@ class SDLValidationError(Exception):
 
 
 class InventoryReadError(Exception):
+    pass
+
+
+class TQError(Exception):
     pass
 
 
@@ -2161,6 +2169,730 @@ def _read_inventory_page(
 
 
 # ==============================================================================
+# TQ TRANSFER HELPERS
+# ==============================================================================
+TQ_LOG_FIELDS = (
+    "original_path",
+    "destination_dir",
+    "destination_name",
+    "organ",
+    "pid",
+    "digitization_date",
+    "status",
+)
+TQ_FILTER_FIELDS = (
+    "None",
+    "Organ",
+    "PID",
+    "AccessionDate",
+    "Stain",
+    "ImageType",
+    "SampAcqType",
+    "BlockNumber",
+    "SectionCount",
+    "OriginalPath",
+    "NewName",
+)
+_tq_pid_pattern = re.compile(r"^[A-Z]{6}$")
+_tq_section_pattern = re.compile(r"^[0-9]{3}$")
+_tq_state_lock = threading.Lock()
+_tq_drafts: Dict[str, Dict[str, Any]] = {}
+_tq_jobs: Dict[str, "TQJob"] = {}
+_tq_active_job_id: Optional[str] = None
+
+
+class TQJob:
+    def __init__(
+        self,
+        job_id: str,
+        owner_id: str,
+        process: subprocess.Popen,
+        slides: List[Dict[str, str]],
+        all_slides: List[Dict[str, str]],
+        manifest_path: Path,
+    ):
+        self.id = job_id
+        self.owner_id = owner_id
+        self.process = process
+        self.slides = slides
+        self.all_slides = all_slides
+        self.manifest_path = manifest_path
+        self.status = "running"
+        self.return_code: Optional[int] = None
+        self.output = ""
+        self.results: Dict[str, Dict[str, Any]] = {}
+        self.result_errors: Dict[str, str] = {}
+        self.started_at = datetime.datetime.now().astimezone()
+        self.log_path: Optional[Path] = None
+
+
+def _tq_transfer_log_root() -> Path:
+    configured = str(Config.TQ_TRANSFER_LOG_DIR or "").strip()
+    return (
+        Path(configured).expanduser()
+        if configured
+        else Path(Config.LABEL_CHECK_BATCHES) / "transfer_logs"
+    )
+
+
+def _tq_slide_id(batch_id: str, original_path: str) -> str:
+    value = f"{batch_id}\0{original_path}".encode("utf-8")
+    return hashlib.sha256(value).hexdigest()[:24]
+
+
+def _tq_sdl_accession_dates() -> Tuple[Dict[str, List[str]], Optional[str]]:
+    workbook = None
+    try:
+        with _sdl_workbook_lock:
+            workbook, worksheet, _ = _load_sdl_workbook()
+            dates: Dict[str, set] = defaultdict(set)
+            for row in _read_sdl_rows(worksheet):
+                accession = row["values"]["Accession ID"].strip().upper()
+                loaded = row["values"]["Date Loaded"].strip()
+                if accession and _strict_sdl_date(loaded):
+                    dates[accession].add(loaded)
+            return {
+                accession: sorted(values)
+                for accession, values in dates.items()
+            }, None
+    except (SDLWorkbookError, OSError) as exc:
+        return {}, f"Slide Digitization Log dates are unavailable: {exc}"
+    finally:
+        if workbook is not None:
+            workbook.close()
+
+
+def _tq_digitization_date(
+    original_path: str,
+    batch_root: Path,
+    accession: str,
+    sdl_dates: Dict[str, List[str]],
+) -> str:
+    original_parent = _strict_sdl_date(_original_path_parent_name(original_path))
+    if original_parent:
+        return original_parent.isoformat()
+    batch_date = _strict_sdl_date(batch_root.name)
+    if batch_date:
+        return batch_date.isoformat()
+    candidates = sdl_dates.get(accession.upper(), [])
+    return candidates[0] if len(candidates) == 1 else ""
+
+
+def _tq_catalog() -> Tuple[List[Dict[str, str]], List[str]]:
+    batches, warnings = discover_batches()
+    sdl_dates, sdl_warning = _tq_sdl_accession_dates()
+    if sdl_warning:
+        warnings.append(sdl_warning)
+    slides: List[Dict[str, str]] = []
+    required = set(renaming.MAPPING_FIELDS)
+    for context in batches:
+        if not (
+            context.completed_stages["QC"]
+            and context.completed_stages["Renamed"]
+        ):
+            continue
+        mapping_path = context.root / "name_mapping.csv"
+        try:
+            fields, rows = renaming.read_csv(mapping_path)
+            missing = required.difference(fields)
+            if missing:
+                raise renaming.RenamingError(
+                    f"missing columns: {', '.join(sorted(missing))}"
+                )
+            for row in rows:
+                original_path = row["OriginalPath"].strip()
+                accession = renaming.row_accession(row)
+                organ = row["Organ"].strip().upper()
+                pid = row["PID"].strip().upper()
+                destination_name = row["NewName"].strip()
+                if not all((original_path, accession, organ, pid, destination_name)):
+                    raise renaming.RenamingError(
+                        "contains a row missing OriginalPath, AccessionID, "
+                        "Organ, PID, or NewName"
+                    )
+                slides.append(
+                    {
+                        "id": _tq_slide_id(context.id, original_path),
+                        "batch_id": context.id,
+                        "batch_name": context.display_name,
+                        "batch_root": str(context.root),
+                        "accession": accession,
+                        "organ": organ,
+                        "pid": pid,
+                        "accession_date": row["AccessionDate"].strip(),
+                        "stain": row["Stain"].strip(),
+                        "image_type": row["ImageType"].strip().upper(),
+                        "samp_acq_type": row["SampAcqType"].strip().upper(),
+                        "block_number": row["BlockNumber"].strip(),
+                        "section_count": row["SectionCount"].strip(),
+                        "original_path": original_path,
+                        "destination_name": destination_name,
+                        "digitization_date": _tq_digitization_date(
+                            original_path, context.root, accession, sdl_dates
+                        ),
+                    }
+                )
+        except renaming.RenamingError as exc:
+            warnings.append(
+                f"Skipped {context.display_name}: name_mapping.csv {exc}."
+            )
+    return slides, warnings
+
+
+def _tq_validate_filter(
+    field: str,
+    value: str,
+    start: str,
+    end: str,
+) -> Optional[str]:
+    if field not in TQ_FILTER_FIELDS:
+        return "Choose a valid filter field."
+    if field == "PID" and value and not _tq_pid_pattern.fullmatch(value.upper()):
+        return "PID must contain exactly six uppercase letters."
+    if field == "SectionCount" and value and not _tq_section_pattern.fullmatch(value):
+        return "Section Count must contain exactly three digits."
+    if field == "AccessionDate":
+        parsed = []
+        for label, candidate in (("Start", start), ("End", end)):
+            if not candidate:
+                parsed.append(None)
+                continue
+            try:
+                parsed.append(datetime.date.fromisoformat(candidate))
+            except ValueError:
+                return f"{label} date must use YYYY-MM-DD."
+        if parsed[0] and parsed[1] and parsed[1] < parsed[0]:
+            return "End date cannot precede Start date."
+    return None
+
+
+def _tq_filtered_slides(
+    slides: List[Dict[str, str]],
+    field: str,
+    value: str,
+    start: str,
+    end: str,
+    sort_order: str,
+) -> List[Dict[str, str]]:
+    attribute = {
+        "Organ": "organ",
+        "PID": "pid",
+        "AccessionDate": "accession_date",
+        "Stain": "stain",
+        "ImageType": "image_type",
+        "SampAcqType": "samp_acq_type",
+        "BlockNumber": "block_number",
+        "SectionCount": "section_count",
+        "OriginalPath": "original_path",
+        "NewName": "destination_name",
+    }.get(field)
+    matched = []
+    for slide in slides:
+        candidate = slide.get(attribute, "") if attribute else ""
+        include = True
+        if field == "AccessionDate":
+            try:
+                candidate_date = datetime.datetime.strptime(
+                    candidate, "%Y%m%d"
+                ).date()
+            except ValueError:
+                include = False
+            else:
+                start_date = datetime.date.fromisoformat(start) if start else None
+                end_date = datetime.date.fromisoformat(end) if end else None
+                include = not (
+                    (start_date and candidate_date < start_date)
+                    or (end_date and candidate_date > end_date)
+                )
+        elif field in {"Organ", "PID", "ImageType", "SampAcqType", "SectionCount"}:
+            include = not value or candidate.casefold() == value.casefold()
+        elif attribute:
+            include = not value or value.casefold() in candidate.casefold()
+        if include:
+            matched.append(slide)
+
+    if sort_order in {"az", "za"}:
+        matched.sort(
+            key=lambda item: (
+                item["destination_name"].casefold(),
+                item["original_path"].casefold(),
+            ),
+            reverse=sort_order == "za",
+        )
+    elif sort_order in {"date", "date_reverse"}:
+        dated = [item for item in matched if item["digitization_date"]]
+        undated = [item for item in matched if not item["digitization_date"]]
+        dated.sort(
+            key=lambda item: (
+                item["digitization_date"],
+                item["destination_name"].casefold(),
+            ),
+            reverse=sort_order == "date_reverse",
+        )
+        matched = dated + undated
+    return matched
+
+
+def _tq_date_summary(slides: List[Dict[str, str]]) -> str:
+    values = sorted(
+        {slide["digitization_date"] for slide in slides if slide["digitization_date"]}
+    )
+    if not values:
+        return "Unknown"
+    return values[0] if len(values) == 1 else f"{values[0]} – {values[-1]}"
+
+
+def _tq_grouped_rows(
+    slides: List[Dict[str, str]], selection_type: str
+) -> List[Dict[str, Any]]:
+    if selection_type == "Slide":
+        return [{"type": "slide", "slide": slide} for slide in slides]
+    if selection_type == "Accession":
+        grouped: Dict[Tuple[str, str], List[Dict[str, str]]] = defaultdict(list)
+        for slide in slides:
+            grouped[(slide["batch_name"], slide["accession"])].append(slide)
+        return [
+            {
+                "type": "accession",
+                "name": accession,
+                "batch_name": batch_name,
+                "slides": values,
+                "date": _tq_date_summary(values),
+            }
+            for (batch_name, accession), values in grouped.items()
+        ]
+
+    batch_groups: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    for slide in slides:
+        batch_groups[slide["batch_name"]].append(slide)
+    rows = []
+    for batch_name, batch_slides in batch_groups.items():
+        accessions: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+        for slide in batch_slides:
+            accessions[slide["accession"]].append(slide)
+        rows.append(
+            {
+                "type": "batch",
+                "name": batch_name,
+                "slides": batch_slides,
+                "date": _tq_date_summary(batch_slides),
+                "accessions": [
+                    {
+                        "name": accession,
+                        "slides": values,
+                        "date": _tq_date_summary(values),
+                    }
+                    for accession, values in accessions.items()
+                ],
+            }
+        )
+    return rows
+
+
+def _tq_sort_grouped_rows(
+    rows: List[Dict[str, Any]], sort_order: str
+) -> List[Dict[str, Any]]:
+    if sort_order not in {"az", "za", "date", "date_reverse"}:
+        return rows
+    if sort_order in {"az", "za"}:
+        rows.sort(
+            key=lambda row: (
+                (
+                    row["slide"]["destination_name"]
+                    if row["type"] == "slide"
+                    else row["name"]
+                ).casefold()
+            ),
+            reverse=sort_order == "za",
+        )
+        for row in rows:
+            if row["type"] == "batch":
+                row["accessions"].sort(
+                    key=lambda accession: accession["name"].casefold(),
+                    reverse=sort_order == "za",
+                )
+        return rows
+    dated = []
+    undated = []
+    for row in rows:
+        date_value = (
+            row["slide"]["digitization_date"]
+            if row["type"] == "slide"
+            else next(
+                (
+                    slide["digitization_date"]
+                    for slide in row["slides"]
+                    if slide["digitization_date"]
+                ),
+                "",
+            )
+        )
+        (dated if date_value else undated).append((date_value, row))
+        if row["type"] == "batch":
+            row["accessions"] = _tq_sort_grouped_rows(
+                [
+                    {
+                        "type": "accession",
+                        "name": accession["name"],
+                        "slides": accession["slides"],
+                        "date": accession["date"],
+                    }
+                    for accession in row["accessions"]
+                ],
+                sort_order,
+            )
+    dated.sort(
+        key=lambda item: item[0],
+        reverse=sort_order == "date_reverse",
+    )
+    return [row for _, row in dated] + [row for _, row in undated]
+
+
+def _tq_safe_prefix(value: str) -> str:
+    cleaned = value.strip().replace("\\", "/").strip("/")
+    if not cleaned:
+        raise TQError("Destination prefix is required.")
+    if re.match(r"^[A-Za-z]:", value.strip()) or value.strip().startswith(("/", "\\")):
+        raise TQError("Destination prefix must be relative to ftp_dir.")
+    parts = cleaned.split("/")
+    if any(not part or part in {".", ".."} for part in parts):
+        raise TQError("Destination prefix contains an unsafe path component.")
+    if any("\0" in part for part in parts):
+        raise TQError("Destination prefix contains an invalid character.")
+    return "/".join(parts)
+
+
+def _tq_destination_dir(prefix: str, slide: Dict[str, str]) -> str:
+    return f"{_tq_safe_prefix(prefix)}/{slide['organ']}/{slide['pid']}"
+
+
+def _tq_config() -> Dict[str, Any]:
+    path = Path(Config.TQ_HOME_DIR).expanduser() / "config.toml"
+    try:
+        with path.open("rb") as handle:
+            values = tomllib.load(handle)
+    except FileNotFoundError as exc:
+        raise TQError(f"TQ configuration was not found at {path}.") from exc
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise TQError(f"TQ configuration could not be read: {exc}") from exc
+    missing = [
+        key for key in ("username", "ftp_addr", "ftp_dir")
+        if not str(values.get(key, "")).strip()
+    ]
+    if missing:
+        raise TQError(
+            f"TQ configuration requires values for: {', '.join(missing)}."
+        )
+    return values
+
+
+def _tq_write_manifest(slides: List[Dict[str, str]]) -> Path:
+    directory = Path(Config.INSTANCE_DIR) / "tq_manifests"
+    directory.mkdir(parents=True, exist_ok=True)
+    descriptor, path_value = tempfile.mkstemp(
+        prefix="transfer-", suffix=".csv", dir=directory
+    )
+    try:
+        with os.fdopen(descriptor, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=("original_path", "destination_dir", "destination_name"),
+            )
+            writer.writeheader()
+            writer.writerows(
+                {
+                    key: slide[key]
+                    for key in ("original_path", "destination_dir", "destination_name")
+                }
+                for slide in slides
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        Path(path_value).unlink(missing_ok=True)
+        raise
+    return Path(path_value)
+
+
+def _tq_history_successes() -> set:
+    successes = set()
+    root = _tq_transfer_log_root()
+    if not root.is_dir():
+        return successes
+    for path in root.glob("*/*.csv"):
+        try:
+            with path.open("r", newline="", encoding="utf-8-sig") as handle:
+                reader = csv.DictReader(handle)
+                for row in reader:
+                    if row.get("status") == "SUCCESS" and row.get("original_path"):
+                        successes.add(row["original_path"])
+        except (OSError, UnicodeError, csv.Error):
+            app.logger.warning("Could not read TQ transfer history %s", path)
+    return successes
+
+
+def _tq_update_sdl_push_status(all_slides: List[Dict[str, str]]) -> int:
+    successes = _tq_history_successes()
+    grouped: Dict[Tuple[str, str], set] = defaultdict(set)
+    for slide in all_slides:
+        if slide["digitization_date"]:
+            grouped[(slide["accession"].upper(), slide["digitization_date"])].add(
+                slide["original_path"]
+            )
+    workbook = None
+    changed = 0
+    with _sdl_workbook_lock:
+        workbook, worksheet, _ = _load_sdl_workbook()
+        try:
+            columns = _sdl_header_columns(worksheet)
+            for row_number in range(2, worksheet.max_row + 1):
+                accession = str(
+                    worksheet.cell(
+                        row=row_number, column=columns["Accession ID"]
+                    ).value or ""
+                ).strip().upper()
+                loaded = _format_sdl_value(
+                    "Date Loaded",
+                    worksheet.cell(
+                        row=row_number, column=columns["Date Loaded"]
+                    ).value,
+                )
+                paths = grouped.get((accession, loaded), set())
+                if not paths or not paths.issubset(successes):
+                    continue
+                status_cell = worksheet.cell(
+                    row=row_number, column=columns["Pushed to SFTP Server"]
+                )
+                if not _coerce_sdl_bool(status_cell.value):
+                    status_cell.value = True
+                    changed += 1
+            if changed:
+                _save_sdl_workbook(workbook)
+        finally:
+            workbook.close()
+    return changed
+
+
+def _tq_write_transfer_log(job: TQJob) -> Path:
+    root = _tq_transfer_log_root()
+    date_directory = root / job.started_at.strftime("%Y-%m-%d")
+    date_directory.mkdir(parents=True, exist_ok=True)
+    base_name = job.started_at.strftime("%H-%M-%S.%f")
+    target = date_directory / f"{base_name}.csv"
+    counter = 1
+    while target.exists():
+        target = date_directory / f"{base_name}-{counter}.csv"
+        counter += 1
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=TQ_LOG_FIELDS)
+            writer.writeheader()
+            for slide in job.slides:
+                result = job.results.get(slide["original_path"])
+                result_error = job.result_errors.get(slide["original_path"])
+                if result_error:
+                    status = result_error
+                elif result is None:
+                    status = (
+                        "tq did not report a result "
+                        f"(exit code {job.return_code})."
+                    )
+                elif result["success"]:
+                    status = "SUCCESS"
+                else:
+                    status = result["error"]
+                writer.writerow(
+                    {
+                        "original_path": slide["original_path"],
+                        "destination_dir": slide["destination_dir"],
+                        "destination_name": slide["destination_name"],
+                        "organ": slide["organ"],
+                        "pid": slide["pid"],
+                        "digitization_date": slide["digitization_date"],
+                        "status": status,
+                    }
+                )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
+
+
+def _tq_parse_result_line(job: TQJob, line: str) -> None:
+    try:
+        result = json.loads(line)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(result, dict) or "original_path" not in result:
+        return
+    original_path = result.get("original_path")
+    success = result.get("success")
+    error = result.get("error")
+    expected = {slide["original_path"] for slide in job.slides}
+    if isinstance(original_path, str) and original_path in expected:
+        if original_path in job.results or original_path in job.result_errors:
+            job.results.pop(original_path, None)
+            job.result_errors[original_path] = (
+                "tq reported more than one result for this slide."
+            )
+            return
+        if not isinstance(success, bool) or (
+            not success and not isinstance(error, str)
+        ):
+            job.result_errors[original_path] = (
+                "tq reported a malformed result for this slide."
+            )
+            return
+    if (
+        not isinstance(original_path, str)
+        or original_path not in expected
+        or not isinstance(success, bool)
+        or (not success and not isinstance(error, str))
+    ):
+        return
+    job.results[original_path] = {
+        "success": success,
+        "error": "" if success else error.strip() or "tq reported an unspecified error.",
+    }
+
+
+def _read_tq_output(job: TQJob) -> None:
+    global _tq_active_job_id
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    pending = ""
+    try:
+        if job.process.stdout is not None:
+            while True:
+                chunk = job.process.stdout.read(4096)
+                if not chunk:
+                    break
+                text = decoder.decode(chunk)
+                with _tq_state_lock:
+                    job.output += text
+                pending += text
+                lines = pending.splitlines(keepends=True)
+                pending = ""
+                if lines and not lines[-1].endswith(("\n", "\r")):
+                    pending = lines.pop()
+                for line in lines:
+                    _tq_parse_result_line(job, line.strip())
+        trailing = pending + decoder.decode(b"", final=True)
+        if trailing:
+            _tq_parse_result_line(job, trailing.strip())
+        job.return_code = job.process.wait()
+        job.log_path = _tq_write_transfer_log(job)
+        try:
+            updated_rows = _tq_update_sdl_push_status(job.all_slides)
+            if updated_rows:
+                with _tq_state_lock:
+                    job.output += (
+                        f"\nUpdated {updated_rows} Slide Digitization Log row(s).\n"
+                    )
+        except Exception as exc:
+            app.logger.exception("Could not update SDL after TQ transfer")
+            with _tq_state_lock:
+                job.output += (
+                    "\nTransfer results were logged, but the Slide Digitization "
+                    f"Log could not be updated: {exc}\n"
+                )
+        complete = (
+            job.return_code == 0
+            and len(job.results) == len(job.slides)
+            and not job.result_errors
+            and all(result["success"] for result in job.results.values())
+        )
+        job.status = "succeeded" if complete else "failed"
+    except Exception as exc:
+        app.logger.exception("TQ transfer finalization failed")
+        with _tq_state_lock:
+            job.output += f"\nLauncher error: {exc}\n"
+        job.status = "failed"
+        job.return_code = job.process.poll()
+    finally:
+        job.manifest_path.unlink(missing_ok=True)
+        with _tq_state_lock:
+            if _tq_active_job_id == job.id:
+                _tq_active_job_id = None
+
+
+def _start_tq_job(
+    owner_id: str,
+    slides: List[Dict[str, str]],
+    all_slides: List[Dict[str, str]],
+) -> TQJob:
+    global _tq_active_job_id
+    _tq_config()
+    manifest_path = _tq_write_manifest(slides)
+    command = [Config.TQ_EXECUTABLE, "pusher", "--paths", str(manifest_path)]
+    with _tq_state_lock:
+        if _tq_active_job_id:
+            active = _tq_jobs.get(_tq_active_job_id)
+            if active and active.status == "running":
+                manifest_path.unlink(missing_ok=True)
+                raise TQError("Another transfer is already running.")
+            _tq_active_job_id = None
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=Path(__file__).resolve().parent.parent,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=0,
+            )
+        except OSError as exc:
+            manifest_path.unlink(missing_ok=True)
+            raise TQError(f"The TQ process could not be started: {exc}") from exc
+        job = TQJob(
+            uuid.uuid4().hex,
+            owner_id,
+            process,
+            slides,
+            all_slides,
+            manifest_path,
+        )
+        _tq_jobs[job.id] = job
+        _tq_active_job_id = job.id
+    threading.Thread(target=_read_tq_output, args=(job,), daemon=True).start()
+    return job
+
+
+def _tq_job_for_user(job_id: Optional[str]) -> Optional[TQJob]:
+    if not job_id:
+        return None
+    with _tq_state_lock:
+        job = _tq_jobs.get(job_id)
+        if job is None:
+            return None
+        if job.owner_id != str(current_user.id) and not current_user.is_admin:
+            return None
+        return job
+
+
+def _tq_safe_log_file(relative_path: str) -> Path:
+    root = Path(Config.TQ_HOME_DIR).expanduser().resolve()
+    lexical = Path(relative_path)
+    if lexical.is_absolute() or any(part in {"", ".", ".."} for part in lexical.parts):
+        raise TQError("The requested TQ file is outside the log directory.")
+    current = root
+    for part in lexical.parts:
+        current = current / part
+        if current.is_symlink():
+            raise TQError("Symbolic links cannot be opened from the TQ log browser.")
+    try:
+        relative = current.resolve().relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise TQError("The requested TQ file is outside the log directory.") from exc
+    resolved = root / relative
+    if not resolved.is_file():
+        raise TQError("The requested TQ file is unavailable.")
+    return resolved
+
+
+# ==============================================================================
 # 9. PIPELINE LAUNCHER
 # ==============================================================================
 PIPELINE_FORM_DEFAULTS = {
@@ -2725,6 +3457,256 @@ def index():
         return redirect(url_for("qc", index=requested_index))
 
     return render_template("index.html", messages=flash_messages())
+
+
+@app.route("/tq", methods=["GET"])
+@login_required
+def tq_page():
+    all_slides, discovery_warnings = _tq_catalog()
+    selection_type = request.args.get("select", "Batch")
+    if selection_type not in {"Batch", "Accession", "Slide"}:
+        selection_type = "Batch"
+    filter_field = request.args.get("filter", "None")
+    filter_value = request.args.get("filter_value", "").strip()
+    start_date = request.args.get("start_date", "").strip()
+    end_date = request.args.get("end_date", "").strip()
+    sort_order = request.args.get("sort", "none")
+    if sort_order not in {"none", "az", "za", "date", "date_reverse"}:
+        sort_order = "none"
+    filter_error = _tq_validate_filter(
+        filter_field, filter_value, start_date, end_date
+    )
+    filtered_slides = (
+        []
+        if filter_error
+        else _tq_filtered_slides(
+            all_slides,
+            filter_field,
+            filter_value,
+            start_date,
+            end_date,
+            sort_order,
+        )
+    )
+    rows = _tq_sort_grouped_rows(
+        _tq_grouped_rows(filtered_slides, selection_type), sort_order
+    )
+    owner_id = str(current_user.id)
+    with _tq_state_lock:
+        draft = _tq_drafts.setdefault(
+            owner_id, {"selected_ids": set(), "prefixes": {}, "phase": "select"}
+        )
+        draft_snapshot = {
+            "selected_ids": set(draft["selected_ids"]),
+            "prefixes": dict(draft["prefixes"]),
+            "phase": draft["phase"],
+        }
+    catalog_by_id = {slide["id"]: slide for slide in all_slides}
+    selected_slides = [
+        catalog_by_id[slide_id]
+        for slide_id in draft_snapshot["selected_ids"]
+        if slide_id in catalog_by_id
+    ]
+    requested_view = request.args.get("view")
+    review = requested_view == "review" or (
+        requested_view is None and draft_snapshot["phase"] == "review"
+    )
+    job = _tq_job_for_user(session.get("tq_job_id"))
+    return render_template(
+        "tq.html",
+        rows=rows,
+        all_slides=all_slides,
+        filtered_count=len(filtered_slides),
+        selection_type=selection_type,
+        filter_fields=TQ_FILTER_FIELDS,
+        filter_field=filter_field,
+        filter_value=filter_value,
+        start_date=start_date,
+        end_date=end_date,
+        sort_order=sort_order,
+        filter_error=filter_error,
+        selected_ids=draft_snapshot["selected_ids"],
+        selected_slides=selected_slides,
+        prefixes=draft_snapshot["prefixes"],
+        review=review,
+        job=job,
+        discovery_warnings=discovery_warnings,
+        messages=flash_messages(),
+        organ_options=renaming.ORGANS,
+    )
+
+
+@app.route("/tq/review", methods=["POST"])
+@login_required
+def tq_review():
+    requested_ids = set(request.form.getlist("slide_id"))
+    all_slides, _ = _tq_catalog()
+    valid_ids = {slide["id"] for slide in all_slides}
+    selected_ids = requested_ids.intersection(valid_ids)
+    if not selected_ids:
+        flash("Select at least one slide to review for transfer.", "warning")
+        return redirect(url_for("tq_page"))
+    with _tq_state_lock:
+        draft = _tq_drafts.setdefault(
+            str(current_user.id),
+            {"selected_ids": set(), "prefixes": {}, "phase": "select"},
+        )
+        draft["selected_ids"] = selected_ids
+        draft["phase"] = "review"
+    return redirect(url_for("tq_page", view="review"))
+
+
+@app.route("/tq/draft", methods=["POST"])
+@login_required
+def tq_save_draft():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"success": False, "message": "Invalid draft request."}), 400
+    selected_ids = payload.get("selected_ids")
+    prefixes = payload.get("prefixes")
+    phase = payload.get("phase")
+    with _tq_state_lock:
+        draft = _tq_drafts.setdefault(
+            str(current_user.id),
+            {"selected_ids": set(), "prefixes": {}, "phase": "select"},
+        )
+        if selected_ids is not None:
+            if not isinstance(selected_ids, list) or any(
+                not isinstance(value, str)
+                or not re.fullmatch(r"[a-f0-9]{24}", value)
+                for value in selected_ids
+            ):
+                return jsonify(
+                    {"success": False, "message": "Invalid slide selection."}
+                ), 400
+            draft["selected_ids"] = set(selected_ids)
+        if prefixes is not None:
+            if not isinstance(prefixes, dict) or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in prefixes.items()
+            ):
+                return jsonify(
+                    {"success": False, "message": "Invalid destination draft."}
+                ), 400
+            draft["prefixes"].update(
+                {key: value[:500] for key, value in prefixes.items()}
+            )
+        if phase in {"select", "review"}:
+            draft["phase"] = phase
+    return jsonify({"success": True})
+
+
+@app.route("/tq/reset", methods=["POST"])
+@login_required
+def tq_reset():
+    with _tq_state_lock:
+        _tq_drafts.pop(str(current_user.id), None)
+    flash("The transfer draft was cleared.", "success")
+    return redirect(url_for("tq_page"))
+
+
+@app.route("/tq/transfer", methods=["POST"])
+@login_required
+def tq_transfer():
+    owner_id = str(current_user.id)
+    with _tq_state_lock:
+        draft = _tq_drafts.get(owner_id)
+        selected_ids = set(draft["selected_ids"]) if draft else set()
+    all_slides, _ = _tq_catalog()
+    by_id = {slide["id"]: slide for slide in all_slides}
+    selected = [
+        dict(by_id[slide_id])
+        for slide_id in selected_ids
+        if slide_id in by_id
+    ]
+    if not selected:
+        flash("The transfer draft no longer contains any available slides.", "error")
+        return redirect(url_for("tq_page"))
+    prefixes: Dict[str, str] = {}
+    try:
+        for slide in selected:
+            prefix = request.form.get(f"prefix_{slide['id']}", "")
+            prefixes[slide["id"]] = _tq_safe_prefix(prefix)
+            slide["destination_dir"] = _tq_destination_dir(prefix, slide)
+        job = _start_tq_job(owner_id, selected, all_slides)
+    except TQError as exc:
+        flash(str(exc), "error")
+        with _tq_state_lock:
+            if draft:
+                draft["prefixes"].update(prefixes)
+                draft["phase"] = "review"
+        return redirect(url_for("tq_page", view="review"))
+    session["tq_job_id"] = job.id
+    with _tq_state_lock:
+        _tq_drafts.pop(owner_id, None)
+    flash(f"Transfer started for {len(selected)} slide(s).", "success")
+    return redirect(url_for("tq_page"))
+
+
+@app.route("/tq/jobs/<job_id>/output", methods=["GET"])
+@login_required
+def tq_job_output(job_id: str):
+    job = _tq_job_for_user(job_id)
+    if job is None:
+        return jsonify({"error": "Transfer job not found."}), 404
+    try:
+        offset = max(0, int(request.args.get("offset", "0")))
+    except ValueError:
+        offset = 0
+    with _tq_state_lock:
+        output = job.output[offset:]
+        next_offset = len(job.output)
+        status = job.status
+        log_path = str(job.log_path) if job.log_path else None
+    return jsonify(
+        {
+            "output": output,
+            "next_offset": next_offset,
+            "status": status,
+            "return_code": job.return_code,
+            "log_path": log_path,
+        }
+    )
+
+
+@app.route("/tq/logs", methods=["GET"])
+@login_required
+def tq_logs():
+    root = Path(Config.TQ_HOME_DIR).expanduser()
+    files: List[str] = []
+    error = None
+    selected_name = request.args.get("file", "").strip()
+    content = None
+    truncated = False
+    try:
+        if not root.is_dir():
+            raise TQError(f"The TQ directory is unavailable: {root}")
+        files = sorted(
+            str(path.relative_to(root)).replace(os.sep, "/")
+            for path in root.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        )
+        if selected_name:
+            selected_path = _tq_safe_log_file(selected_name)
+            with selected_path.open("r", encoding="utf-8", errors="replace") as handle:
+                content = handle.read(1024 * 1024 + 1)
+            if len(content) > 1024 * 1024:
+                content = content[: 1024 * 1024]
+                truncated = True
+    except TQError as exc:
+        error = str(exc)
+    except OSError as exc:
+        error = f"The TQ file could not be read: {exc}"
+    return render_template(
+        "tq_logs.html",
+        root=root,
+        files=files,
+        selected_name=selected_name,
+        content=content,
+        truncated=truncated,
+        error=error,
+        messages=flash_messages(),
+    )
 
 
 @app.route("/renaming", methods=["GET"])
