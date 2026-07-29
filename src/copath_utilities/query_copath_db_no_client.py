@@ -449,11 +449,6 @@ mrn_query = """
           om.sequence,
           p.prettyprint_name
   ) ap
-  WHERE EXISTS (
-      SELECT 1
-      FROM #input_ids i
-      WHERE i.id_value = mr.medrec_num
-  )
   ORDER BY mr.medrec_num, ms.accession_date, ms.specnum_formatted;
 """
 
@@ -500,6 +495,38 @@ def clean_results(results):
     for column in results.columns.to_list():
         if column in REPORT_FIELDS:
             clean_column(results, column)
+    return results
+
+
+def filter_results_by_mrn(results, input_mrns):
+    if "mrn" not in results.columns:
+        raise KeyError("Error: query results do not contain an 'mrn' column")
+
+    allowed_mrns = set(input_mrns)
+    returned_mrns = results["mrn"].astype("string").str.strip()
+    return results.loc[returned_mrns.isin(allowed_mrns)].copy()
+
+
+def compile_report_column(results):
+    report_columns = [
+        column for column in REPORT_FIELDS
+        if column in results.columns
+    ]
+    if not report_columns:
+        results["report"] = ""
+        return results
+
+    report_column_index = min(results.columns.get_loc(column) for column in report_columns)
+    compiled_reports = results[report_columns].apply(
+        lambda row: "\n\n".join(
+            value for value in row
+            if isinstance(value, str) and value
+        ),
+        axis=1,
+    )
+
+    results.drop(columns=report_columns, inplace=True)
+    results.insert(report_column_index, "report", compiled_reports)
     return results
 
 
@@ -800,7 +827,10 @@ if __name__ == "__main__":
 
     output_file = args.output_file
     try:
-        _ = clean_results(results)
+        clean_results(results)
+        if args.id_type == 'mrn':
+            results = filter_results_by_mrn(results, normalized_ids)
+        compile_report_column(results)
         results.to_csv(output_file, index=False)
         print(f"CoPath data exported to {output_file}")
     except Exception as e:
