@@ -449,6 +449,11 @@ mrn_query = """
           om.sequence,
           p.prettyprint_name
   ) ap
+  WHERE EXISTS (
+      SELECT 1
+      FROM #input_ids i
+      WHERE i.id_value = mr.medrec_num
+  )
   ORDER BY mr.medrec_num, ms.accession_date, ms.specnum_formatted;
 """
 
