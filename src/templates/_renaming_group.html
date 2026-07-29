@@ -32,7 +32,7 @@
     </div>
     {% if group.report %}
     <div class="expanded report-expanded" id="reports-{{ group_key }}" hidden>
-        <div class="report-content"><dl>{% for label,value in group.report %}<dt>{{ label }}</dt><dd>{{ value }}</dd>{% endfor %}</dl></div>
+        <div class="report-content">{{ group.report }}</div>
     </div>
     {% endif %}
 </form>

@@ -47,7 +47,7 @@ REPORT_FIELDS = (
 COPATH_FIELDS = (
     "accession_id", "mrn", "specimen_id", "accession_date", "date_of_birth",
     "attending_physician", "specimen_class_id", "specimen_class_name",
-    "sample_acquisition_type", "blocks_and_stains", *REPORT_FIELDS, "signout_date",
+    "sample_acquisition_type", "blocks_and_stains", "report", "signout_date",
     "specimen_status", "status_date", "report_status", "latest_report_status_datetime",
     "proc_or_add_status", "latest_procedure_addendum_signout_date",
     *DERIVED_COPATH_FIELDS,
@@ -121,10 +121,60 @@ def initialize_csv(path: Path, fields: Sequence[str]) -> None:
 
 
 def initialize_clone(clone_root: Path) -> None:
-    """Create the CoPath clone index and all required organ CSVs when absent."""
+    """Create CoPath CSVs and migrate legacy per-section report columns."""
     initialize_csv(clone_root / "all_accessions.csv", ("AccessionID", "Organ"))
     for organ in ORGANS:
-        initialize_csv(clone_root / organ / "copath_data.csv", COPATH_FIELDS)
+        path = clone_root / organ / "copath_data.csv"
+        initialize_csv(path, COPATH_FIELDS)
+        headers, rows = read_csv(path)
+        collapsed_headers = collapse_report_headers(headers)
+        if headers != collapsed_headers:
+            atomic_write(
+                path,
+                collapsed_headers,
+                (collapse_report_fields(row) for row in rows),
+            )
+
+
+def compile_report(row: Dict[str, str]) -> str:
+    """Return one readable report value from current or legacy CoPath fields."""
+    existing = (row.get("report") or "").strip()
+    if existing:
+        return existing
+    sections = []
+    for field in REPORT_FIELDS:
+        value = (row.get(field) or "").strip()
+        if value:
+            sections.append(f"{field.replace('_', ' ').title()}:\n{value}")
+    return "\n\n".join(sections)
+
+
+def collapse_report_fields(row: Dict[str, str]) -> Dict[str, str]:
+    """Replace legacy per-section report values with one report value."""
+    collapsed = {
+        field: value for field, value in row.items() if field not in REPORT_FIELDS
+    }
+    collapsed["report"] = compile_report(row)
+    return collapsed
+
+
+def collapse_report_headers(fields: Sequence[str]) -> List[str]:
+    """Replace legacy report headers with one report header in the same position."""
+    collapsed: List[str] = []
+    report_added = False
+    for field in fields:
+        if field == "signout_date" and not report_added:
+            collapsed.append("report")
+            report_added = True
+        if field in REPORT_FIELDS or field == "report":
+            if not report_added:
+                collapsed.append("report")
+                report_added = True
+            continue
+        collapsed.append(field)
+    if not report_added:
+        collapsed.append("report")
+    return collapsed
 
 
 def row_accession(row: Dict[str, str]) -> str:
@@ -170,7 +220,7 @@ def derive_sample_type(row: Optional[Dict[str, str]]) -> str:
     if row is None:
         return "XX"
     text = " ".join(
-        str(row.get(field, "")) for field in ("sample_acquisition_type", *REPORT_FIELDS)
+        ((row.get("sample_acquisition_type") or ""), compile_report(row))
     ).lower()
     if "resection" in text:
         return "RE"
@@ -259,7 +309,9 @@ def _clone_rows(clone_root: Path) -> Tuple[Dict[str, str], Dict[str, List[Dict[s
     headers: Dict[str, List[str]] = {}
     for organ in ORGANS:
         path = clone_root / organ / "copath_data.csv"
-        headers[organ], by_organ[organ] = read_csv(path)
+        raw_headers, raw_rows = read_csv(path)
+        headers[organ] = collapse_report_headers(raw_headers)
+        by_organ[organ] = [collapse_report_fields(row) for row in raw_rows]
     return accession_org, by_organ, headers
 
 
@@ -344,6 +396,9 @@ def prepare_batch(
     unknown = [accession for accession in accessions if accession not in existing]
     query(batch_root, unknown, pending_path)
     pending_headers, pending_rows = read_csv(pending_path)
+    pending_headers = collapse_report_headers(pending_headers)
+    pending_rows = [collapse_report_fields(row) for row in pending_rows]
+    atomic_write(pending_path, pending_headers, pending_rows)
     pending_by_accession = {row_accession(row): row for row in pending_rows}
     reserved = _reserved_pids(batch_base)
     accession_values: Dict[str, Dict[str, str]] = {}
@@ -390,7 +445,11 @@ def report_rows(batch_root: Path, clone_root: Path) -> Dict[str, Dict[str, str]]
     pending = batch_root / "pending_CoPath_data.csv"
     if pending.exists():
         _, rows = read_csv(pending)
-        result.update({row_accession(row): row for row in rows if row_accession(row)})
+        result.update({
+            row_accession(row): collapse_report_fields(row)
+            for row in rows
+            if row_accession(row)
+        })
     accession_org, clone_rows, _ = _clone_rows(clone_root)
     for accession, organ in accession_org.items():
         if accession not in result and organ in clone_rows:
@@ -423,7 +482,7 @@ def group_mapping(rows: Sequence[Dict[str, str]], reports: Dict[str, Dict[str, s
         result.append({
             "accession": accession, "shared": slides[0], "slides": slides,
             "approved": all(parse_bool(row["Approved"]) for row in slides),
-            "report": [(field.replace("_", " ").title(), report.get(field, "")) for field in REPORT_FIELDS if report.get(field, "").strip()],
+            "report": compile_report(report),
         })
     return result
 
@@ -509,10 +568,14 @@ def retry_group(
         try:
             query(batch_root, [new_accession], retry_path)
             headers, queried = read_csv(retry_path)
+            headers = collapse_report_headers(headers)
+            queried = [collapse_report_fields(row) for row in queried]
             source = next((row for row in queried if row_accession(row) == new_accession), None)
             pending_path = batch_root / "pending_CoPath_data.csv"
             if pending_path.exists():
                 pending_headers, pending = read_csv(pending_path)
+                pending_headers = collapse_report_headers(pending_headers)
+                pending = [collapse_report_fields(row) for row in pending]
             else:
                 pending_headers, pending = headers, []
             pending = [row for row in pending if row_accession(row) not in {old_accession, new_accession}]
@@ -590,7 +653,7 @@ def finalize_batch(batch_root: Path, clone_root: Path) -> None:
             raw = reports.get(accession)
             if raw:
                 organ = approved["Organ"]
-                enriched = dict(raw)
+                enriched = collapse_report_fields(raw)
                 enriched.update({
                     "organ": organ, "PID": approved["PID"], "_accdate": approved["AccessionDate"],
                     "timepoint": approved["Timepoint"], "image_type": approved["ImageType"],
@@ -606,6 +669,8 @@ def finalize_batch(batch_root: Path, clone_root: Path) -> None:
         pending_path = batch_root / "pending_CoPath_data.csv"
         if pending_path.exists():
             headers, pending = read_csv(pending_path)
+            headers = collapse_report_headers(headers)
+            pending = [collapse_report_fields(raw) for raw in pending]
             pending = [
                 raw for raw in pending if row_accession(raw) in approved_by_accession
             ]
