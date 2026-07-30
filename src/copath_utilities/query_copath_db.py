@@ -499,6 +499,29 @@ def clean_results(results):
     return results
 
 
+def compile_report_column(results):
+    report_columns = [
+        column for column in REPORT_FIELDS
+        if column in results.columns
+    ]
+    if not report_columns:
+        results["report"] = ""
+        return results
+
+    report_column_index = min(results.columns.get_loc(column) for column in report_columns)
+    compiled_reports = results[report_columns].apply(
+        lambda row: "\n\n".join(
+            value for value in row
+            if isinstance(value, str) and value
+        ),
+        axis=1,
+    )
+
+    results.drop(columns=report_columns, inplace=True)
+    results.insert(report_column_index, "report", compiled_reports)
+    return results
+
+
 def process_input_file(file_path, target_column):
     with open(file_path, 'r', newline='', encoding='utf-8') as f:
         if target_column is None:
@@ -796,7 +819,8 @@ if __name__ == "__main__":
 
     output_file = args.output_file
     try:
-        _ = clean_results(results)
+        clean_results(results)
+        compile_report_column(results)
         results.to_csv(output_file, index=False)
         print(f"CoPath data exported to {output_file}")
     except Exception as e:
