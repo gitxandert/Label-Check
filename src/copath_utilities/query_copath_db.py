@@ -625,6 +625,7 @@ def validate_batch_size(batch_size):
 def format_insert_statement(ids):
     formatted_rows = [f"('{escape_sql_literal(cur_id)}')" for cur_id in ids]
     values_block = ",\n  ".join(formatted_rows)
+
     return (
         "  INSERT INTO #input_ids (id_value)\n"
         "  VALUES\n"

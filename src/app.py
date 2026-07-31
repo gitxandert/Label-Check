@@ -2827,7 +2827,7 @@ def _start_tq_job(
     global _tq_active_job_id
     _tq_config()
     manifest_path = _tq_write_manifest(slides)
-    command = [Config.CARGO_EXECUTABLE, "run", "--release", "--", "pusher", "--paths", str(manifest_path)]
+    command = [Config.CARGO_EXECUTABLE, "run", "--release", "--quiet", "--target", "x86_64-pc-windows-gnu", "--", "pusher", "--paths", str(manifest_path)]
     with _tq_state_lock:
         if _tq_active_job_id:
             active = _tq_jobs.get(_tq_active_job_id)
