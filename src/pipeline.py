@@ -31,6 +31,8 @@ def parse_except(error: subprocess.CalledProcessError) -> None:
 
 def open_browser_wsl(url: str) -> None:
     """Open a URL using the host browser, including from WSL."""
+    if os.environ.get("LABEL_CHECK_CONTAINER", "false").lower() == "true":
+        return
     if "microsoft-standard" in platform.uname().release.lower():
         subprocess.run(["powershell.exe", "-Command", f"Start-Process '{url}'"])
     else:
@@ -165,12 +167,17 @@ def copy_app_bundle(output_dir: Path) -> Path:
         "1_get_macro.py",
         "2_run_dual_ocr.py",
         "3_name-files.py",
+        "renaming.py",
+        "openapi.json",
     ):
         source = SCRIPT_DIR / filename
         destination = output_src / filename
         if source.resolve() != destination.resolve():
             shutil.copyfile(source, destination)
     copytree_pure_data(SCRIPT_DIR / "templates", output_src / "templates")
+    copytree_pure_data(
+        SCRIPT_DIR / "copath_utilities", output_src / "copath_utilities"
+    )
     return output_src / "app.py"
 
 
@@ -249,11 +256,18 @@ def main() -> int:
         return error.returncode or 1
 
     output_src = output_app.parent
-    kill_existing_flask()
+    containerized = os.environ.get("LABEL_CHECK_CONTAINER", "false").lower() == "true"
+    if not containerized:
+        kill_existing_flask()
     print("\n\x1b[1mOpening QC app...\x1b[0m\n", flush=True)
     global qc_app
+    server_command = (
+        [sys.executable, "-m", "waitress", "--listen=0.0.0.0:5000", "app:app"]
+        if containerized
+        else [sys.executable, "-m", "flask", "run", "--host", "0.0.0.0"]
+    )
     qc_app = subprocess.Popen(
-        [sys.executable, "-m", "flask", "run", "--host", "0.0.0.0"],
+        server_command,
         cwd=output_src,
         env={
             **os.environ,

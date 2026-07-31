@@ -23,6 +23,7 @@ successfully processed by OCR.
 import argparse
 import csv
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -241,7 +242,12 @@ def add_ocr_to_mapping(
     logger.info("Initializing EasyOCR reader... (This may take a moment)")
     # Initialize the OCR reader once and share it among all threads.
     # GPU is generally much faster if available.
-    reader = easyocr.Reader(["en"], gpu=not use_cpu)
+    force_cpu = os.environ.get("EASYOCR_FORCE_CPU", "false").lower() == "true"
+    reader_options = {"gpu": not (use_cpu or force_cpu)}
+    model_directory = os.environ.get("EASYOCR_MODEL_DIR", "").strip()
+    if model_directory:
+        reader_options["model_storage_directory"] = model_directory
+    reader = easyocr.Reader(["en"], **reader_options)
 
     # Read the entire CSV into a list of dictionaries.
     with open(mapping_csv, "r", encoding="utf-8") as f:

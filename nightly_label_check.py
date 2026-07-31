@@ -1,10 +1,15 @@
+import os
 import subprocess, sys
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
 
-label_check_batches = Path("D:\\label_check_batches")
-scanner_inventories = Path("D:\\scanner_inventories")
+label_check_batches = Path(
+    os.environ.get("LABEL_CHECK_BATCHES", "D:\\label_check_batches")
+)
+scanner_inventories = Path(
+    os.environ.get("SCANNER_INVENTORIES", "D:\\scanner_inventories")
+)
 inventory_chunk_size = 10000
 
 for scanner_dir in label_check_batches.iterdir():
@@ -111,5 +116,4 @@ for scanner_dir in label_check_batches.iterdir():
         print(f"Updated {scanner_log_path}\n")
     except Exception as e:
         print(f"\x1b[31mERROR\x1b[0m -- unable to update log: {e}\n")
-
 

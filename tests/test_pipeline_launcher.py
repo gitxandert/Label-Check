@@ -60,6 +60,11 @@ class PipelineCommandTests(unittest.TestCase):
             self.assertTrue((output_app.parent / "1_get_macro.py").is_file())
             self.assertTrue((output_app.parent / "2_run_dual_ocr.py").is_file())
             self.assertTrue((output_app.parent / "3_name-files.py").is_file())
+            self.assertTrue((output_app.parent / "renaming.py").is_file())
+            self.assertTrue((output_app.parent / "openapi.json").is_file())
+            self.assertTrue(
+                (output_app.parent / "copath_utilities" / "copath_texttypes.py").is_file()
+            )
             self.assertTrue((output_app.parent / "templates" / "pipeline.html").is_file())
 
 

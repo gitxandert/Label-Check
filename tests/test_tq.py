@@ -350,6 +350,7 @@ class TQTransferTests(unittest.TestCase):
         command = popen.call_args.args[0]
         self.assertEqual(["tq", "pusher", "--paths"], command[:3])
         self.assertNotIn("shell", popen.call_args.kwargs)
+        self.assertNotIn("cwd", popen.call_args.kwargs)
         with Path(command[3]).open("r", newline="", encoding="utf-8") as handle:
             manifest_rows = list(csv.DictReader(handle))
         self.assertEqual(

@@ -96,16 +96,16 @@ class Config:
 
     # The base directory where all data (images, CSV) is located.
     # Using absolute path ensures we can run the app from anywhere.
-    IMAGE_BASE_DIR = PROJECT_ROOT
+    IMAGE_BASE_DIR = os.environ.get("IMAGE_BASE_DIR", PROJECT_ROOT)
 
     # The full path to the primary CSV file.
     CSV_FILE_PATH = os.path.join(IMAGE_BASE_DIR, "enriched.csv")
     
     # Directory to store timestamped backups.
-    BACKUP_DIR = os.path.join(BASE_DIR, "csv_backups")
+    BACKUP_DIR = os.environ.get("BACKUP_DIR", os.path.join(BASE_DIR, "csv_backups"))
 
     # Instance directory for local data persistence
-    INSTANCE_DIR = os.path.join(BASE_DIR, "instance")
+    INSTANCE_DIR = os.environ.get("INSTANCE_DIR", os.path.join(BASE_DIR, "instance"))
     
     # CSV persistence files
     USERS_CSV_PATH = os.path.join(INSTANCE_DIR, "users.csv")
@@ -123,20 +123,26 @@ class Config:
     CSRF_ENABLED = os.environ.get("CSRF_ENABLED", "true").lower() == "true"
 
     # Slide Digitization Log workbook configuration.
-    SDL_FILE_PATH = os.path.join(BASE_DIR, "logs", "Slide_Digitization_Log.xlsx")
+    SDL_FILE_PATH = os.environ.get(
+        "SDL_FILE_PATH",
+        os.path.join(BASE_DIR, "logs", "Slide_Digitization_Log.xlsx"),
+    )
     SDL_SHEET_NAME = "general"
     SDL_ORGANS = ("BRAIN", "BREAST", "TESTIS", "OTHER", "UNKNOWN", "CYTO")
     SDL_SCANNERS = ("-----", "RSCH1 (SS12797)", "CLIN1 (SS12602)")
-    CARGO_EXECUTABLE = os.environ.get("CARGO_EXE", "")
-    TQ_DIR = os.environ.get("TQ_DIR", "")
+    TQ_EXECUTABLE = os.environ.get("TQ_EXECUTABLE", "tq.exe")
     TQ_HOME_DIR = os.environ.get("TQ_HOME_DIR", str(Path.home() / ".tq"))
     TQ_TRANSFER_LOG_DIR = os.environ.get("TQ_TRANSFER_LOG_DIR", "")
 
 
     # Path to scanner inventories
-    SCANNER_INVENTORIES = "D:\\scanner_inventories"
+    SCANNER_INVENTORIES = os.environ.get(
+        "SCANNER_INVENTORIES", "D:\\scanner_inventories"
+    )
     # Path to batches of new slides to label-check
-    LABEL_CHECK_BATCHES = "D:\\label_check_batches"
+    LABEL_CHECK_BATCHES = os.environ.get(
+        "LABEL_CHECK_BATCHES", "D:\\label_check_batches"
+    )
     COPATH_CLONE = os.environ.get("COPATH_CLONE", "D:\\copath_clone")
 
     # Default password for the initial 'admin' user.
@@ -2827,7 +2833,7 @@ def _start_tq_job(
     global _tq_active_job_id
     _tq_config()
     manifest_path = _tq_write_manifest(slides)
-    command = [Config.CARGO_EXECUTABLE, "run", "--release", "--quiet", "--target", "x86_64-pc-windows-gnu", "--", "pusher", "--paths", str(manifest_path)]
+    command = [Config.TQ_EXECUTABLE, "pusher", "--paths", str(manifest_path)]
     with _tq_state_lock:
         if _tq_active_job_id:
             active = _tq_jobs.get(_tq_active_job_id)
@@ -2838,7 +2844,6 @@ def _start_tq_job(
         try:
             process = subprocess.Popen(
                 command,
-                cwd=Config.TQ_DIR,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
