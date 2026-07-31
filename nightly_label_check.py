@@ -4,6 +4,11 @@ from datetime import datetime
 from pathlib import Path
 import pandas as pd
 
+SRC_DIR = Path(__file__).resolve().parent / "src"
+sys.path.insert(0, str(SRC_DIR))
+
+from container_paths import runtime_path
+
 label_check_batches = Path(
     os.environ.get("LABEL_CHECK_BATCHES", "D:\\label_check_batches")
 )
@@ -42,7 +47,7 @@ for scanner_dir in label_check_batches.iterdir():
     for _, chunk in enumerate(scanner_inventory_reader):
         unique_dirs = chunk['directory'].unique()
         for dir in unique_dirs:
-            dir_path = Path(dir)
+            dir_path = runtime_path(dir)
             dir_date = dir_path.name
             if dir_date > abs_latest_batch:
                 new_date_folders.append(dir_path)
@@ -116,4 +121,3 @@ for scanner_dir in label_check_batches.iterdir():
         print(f"Updated {scanner_log_path}\n")
     except Exception as e:
         print(f"\x1b[31mERROR\x1b[0m -- unable to update log: {e}\n")
-

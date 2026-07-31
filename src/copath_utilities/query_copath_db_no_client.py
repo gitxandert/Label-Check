@@ -1,5 +1,6 @@
 import argparse
 import csv
+import os
 import re
 import sys
 from pathlib import Path
@@ -458,13 +459,20 @@ mrn_query = """
 """
 
 # string to connect to CoPath
-CONN_STR = (
+DEFAULT_CONN_STR = (
     "DRIVER={ODBC Driver 18 for SQL Server};"
     "SERVER=IUHWCPTHDB3980;"
     "DATABASE=COPLIVE;"
     "Trusted_Connection=yes;"
     "TrustServerCertificate=yes;"
 )
+
+
+def connection_string():
+    path = os.environ.get("COPATH_CONNECTION_STRING_FILE", "").strip()
+    if path:
+        return Path(path).read_text(encoding="utf-8").strip()
+    return os.environ.get("COPATH_CONNECTION_STRING", DEFAULT_CONN_STR).strip()
 
 REPORT_FIELDS = [ tt[1] for tt in TEXT_TYPES ]
 
@@ -812,7 +820,7 @@ if __name__ == "__main__":
 
     # connect to database and run query
     try:
-        conn = pyodbc.connect(CONN_STR)
+        conn = pyodbc.connect(connection_string())
         results = pd.read_sql(formatted_query, conn)
     except Exception as e:
         print(f"Error connecting to database: {e}")

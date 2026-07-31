@@ -32,43 +32,42 @@ API traffic is limited per token to five submissions and 60 reads per minute.
 When TLS terminates at one trusted reverse proxy, set
 `API_TRUST_PROXY_HEADERS=true`; otherwise forwarded scheme headers are ignored.
 
-## Windows container
+## Linux container on Docker Desktop
 
-The container is Windows-only. It runs the Flask application and Python pipeline
-on Windows Server Core LTSC 2022 and builds `tq.exe` as a release binary for
-`x86_64-pc-windows-gnu`. No Linux TQ binary is built.
+The `linux/amd64` image runs as a Linux container under Docker Desktop. It contains the Flask
+application, Python pipeline, utilities, and a native Linux `tq` release binary.
+Rust and Python compile in separate stages; the final image contains neither
+Cargo nor GCC.
 
 ### Prerequisites
 
-- A Windows Server host capable of running LTSC 2022 Windows containers.
-- Docker configured for Windows containers.
-- This repository cloned with submodules:
+- Docker Desktop configured for Linux containers.
+- Repository cloned with its pinned TQ submodule:
 
   ```powershell
   git clone --recurse-submodules <label-check-repository-url>
   ```
 
-- A gMSA credential specification available to Docker. The gMSA needs:
-  - integrated-auth access to the CoPath SQL Server;
-  - read access to
-    `\\chp.clarian.org\app\Philips_Slide_Images\GT450_images`;
-  - NTFS access to the configured local bind mounts.
-- IT approval for `tq.exe` in Microsoft Defender. Container layers remain visible
-  to host antivirus. Building or running the image does not bypass quarantine.
-- An external reverse proxy that terminates HTTPS and forwards the original
-  request scheme to port 5000.
+- Windows directories shared with Docker Desktop.
+- The GT450 SMB share mapped to a Windows path Docker Desktop can bind. The
+  example uses `Z:\GT450_images`; change it to the server's working mapping.
+- A dedicated TQ configuration directory containing `config.toml` and a
+  dedicated SSH directory containing `id_ed25519` or `id_rsa`.
+- A one-line CoPath ODBC connection string stored outside this repository. A
+  Linux container cannot inherit the Windows user's integrated login. Use a SQL
+  login approved by IT, or separately configure Kerberos inside the container.
+- An external reverse proxy terminating HTTPS and forwarding the request scheme
+  to port 5000.
 
-Copy `.env.example` to `.env`, replace every placeholder, and create all host
-directories before starting. `TQ_HOME_HOST` must contain `config.toml`.
-`SSH_HOME_HOST` must contain either `id_ed25519` or `id_rsa`; mount only the
-dedicated key needed by TQ. `LABEL_CHECK_STATE_HOST` must contain
-`Slide_Digitization_Log.xlsx` before SDL-backed workflows are used. Grant the
-container gMSA read/write access to the state, batch, CoPath clone, and TQ home
-directories; inventory and SSH mounts need read access only.
+Copy `.env.example` to `.env`, replace all placeholders, and create the host
+directories. `LABEL_CHECK_STATE_HOST` must contain
+`Slide_Digitization_Log.xlsx` before SDL workflows run.
 
-The scanner image share is not a Docker bind mount. Windows Docker does not
-accept a UNC path as a bind source. Inventory paths access the share directly
-using the gMSA network identity.
+Example CoPath secret file content:
+
+```text
+DRIVER={ODBC Driver 18 for SQL Server};SERVER=IUHWCPTHDB3980;DATABASE=COPLIVE;UID=service-user;PWD=secret;TrustServerCertificate=yes;
+```
 
 ### Build and test
 
@@ -78,30 +77,32 @@ docker build --target test --tag label-check:test .
 docker compose build
 ```
 
-The Rust stage uses an isolated MinGW installation with absolute compiler and
-linker paths. It runs:
+TQ builds and tests natively for Linux:
 
-```powershell
-rustup default stable-x86_64-pc-windows-gnu
-cargo build --locked --release --target x86_64-pc-windows-gnu
+```text
+cargo test --locked --release
+cargo build --locked --release
 ```
 
-The Python/runtime stage never receives Rust, Cargo, MinGW, or GCC. EasyOCR is
-CPU-only and its English models are downloaded into the image during build.
-
-Before deployment, obtain the built binary hash and send it to IT with the
-Defender detection record:
+EasyOCR is CPU-only and its English models are baked into the image. Obtain the
+Linux binary hash when needed with:
 
 ```powershell
-docker run --rm --entrypoint powershell.exe label-check:latest `
-  -NoProfile -Command "Get-Content C:\app\bin\tq.exe.sha256"
+docker run --rm --entrypoint sha256sum label-check:latest /app/bin/tq
 ```
 
-Do not deploy until Defender permits that artifact. Each unsigned rebuild has a
-new hash and may require renewed approval. If Defender quarantines the unsigned
-binary during a build on the deployment server, build on an approved Windows
-builder first, record the hash, publish the image to the organization's private
-registry, obtain IT approval, and only then pull it on the deployment server.
+### Paths
+
+Inside the container, Windows resources appear at stable Linux paths:
+
+- GT450 images: `/data/gt450-images`
+- scanner inventories: `/data/scanner-inventories`
+- label-check batches: `/data/label-check-batches`
+- CoPath clone: `/data/copath-clone`
+- persistent application state: `/data/state`
+
+Persisted UNC GT450 paths and `D:\label_check_batches` paths are translated to
+these mounts. New pipeline output records Linux mount paths directly.
 
 ### Run
 
@@ -110,19 +111,18 @@ docker compose up -d
 docker compose ps
 ```
 
-The default `web` command initializes persistent application state idempotently
-and starts Waitress on port 5000. Other applications use the same image:
+The default command initializes persistent state and starts Waitress on port
+5000. Other applications use the same image:
 
 ```powershell
 docker compose run --rm label-check pipeline `
-  --input-dir "\\chp.clarian.org\app\Philips_Slide_Images\GT450_images\SS12797" `
-  --output-dir "D:\label_check_batches\SS12797\2026-07-31" `
+  --input-dir /data/gt450-images/SS12797 `
+  --output-dir /data/label-check-batches/SS12797/2026-07-31 `
   --end-at name --ocr-use-cpu
 
 docker compose run --rm label-check nightly
-docker compose run --rm label-check python C:\app\src\deidentify_anonymize.py --help
+docker compose run --rm label-check python /app/src/deidentify_anonymize.py --help
 ```
 
-Schedule the `nightly` command externally; it performs one cycle and exits.
-Application state, SDL workbook, backups, TQ configuration, and transfer logs
-live on configured host mounts and survive container replacement.
+Schedule `nightly` externally; it performs one cycle and exits. State, SDL,
+backups, TQ configuration, and transfer logs survive container replacement.

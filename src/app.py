@@ -47,6 +47,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import click
+from container_paths import runtime_path
 import renaming
 
 # Flask and its extensions for web framework, user management
@@ -130,7 +131,9 @@ class Config:
     SDL_SHEET_NAME = "general"
     SDL_ORGANS = ("BRAIN", "BREAST", "TESTIS", "OTHER", "UNKNOWN", "CYTO")
     SDL_SCANNERS = ("-----", "RSCH1 (SS12797)", "CLIN1 (SS12602)")
-    TQ_EXECUTABLE = os.environ.get("TQ_EXECUTABLE", "tq.exe")
+    TQ_EXECUTABLE = os.environ.get(
+        "TQ_EXECUTABLE", "tq.exe" if os.name == "nt" else "tq"
+    )
     TQ_HOME_DIR = os.environ.get("TQ_HOME_DIR", str(Path.home() / ".tq"))
     TQ_TRANSFER_LOG_DIR = os.environ.get("TQ_TRANSFER_LOG_DIR", "")
 
@@ -2307,7 +2310,7 @@ def _tq_catalog() -> Tuple[List[Dict[str, str]], List[str]]:
                     f"missing columns: {', '.join(sorted(missing))}"
                 )
             for row in rows:
-                original_path = row["OriginalPath"].strip()
+                original_path = str(runtime_path(row["OriginalPath"].strip()))
                 accession = renaming.row_accession(row)
                 organ = row["Organ"].strip().upper()
                 pid = row["PID"].strip().upper()
@@ -3027,8 +3030,8 @@ def _pipeline_command(values: Dict[str, str]) -> Tuple[Optional[List[str]], List
     if not output_text:
         errors.append("Output directory is required.")
 
-    input_dir = Path(input_text).expanduser().resolve() if input_text else None
-    output_dir = Path(output_text).expanduser().resolve() if output_text else None
+    input_dir = runtime_path(input_text).expanduser().resolve() if input_text else None
+    output_dir = runtime_path(output_text).expanduser().resolve() if output_text else None
     if input_dir is not None and not input_dir.is_dir():
         errors.append("Input directory must be an existing directory on the server.")
     if output_dir is not None and output_dir.exists() and not output_dir.is_dir():
