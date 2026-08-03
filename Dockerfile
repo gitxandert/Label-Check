@@ -54,10 +54,12 @@ RUN python -m pip install --disable-pip-version-check --no-cache-dir --upgrade p
 
 COPY src/ ./src/
 COPY tests/ ./tests/
-COPY container/ ./container/
+COPY --chmod=0755 container/entrypoint.sh ./container/entrypoint.sh
 COPY nightly_label_check.py requirements-test.txt ./
 
-RUN mkdir -p "$EASYOCR_MODEL_DIR" \
+RUN sed -i 's/\r$//' /app/container/entrypoint.sh \
+    && /bin/sh -n /app/container/entrypoint.sh \
+    && mkdir -p "$EASYOCR_MODEL_DIR" \
     && python -c "import easyocr; easyocr.Reader(['en'], gpu=False, model_storage_directory='$EASYOCR_MODEL_DIR')"
 
 
