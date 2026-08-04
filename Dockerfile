@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 ARG RUST_VERSION=1.95
 ARG PYTHON_VERSION=3.12
 
@@ -16,6 +18,8 @@ RUN mkdir -p /tmp/tq-test-home \
 
 
 FROM python:${PYTHON_VERSION}-slim-bookworm AS python-base
+
+ARG PYTORCH_CPU_INDEX_URL=https://download.pytorch.org/whl/cpu
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -37,6 +41,7 @@ RUN apt-get update \
         libopenslide0 \
         libsm6 \
         libxext6 \
+        krb5-user \
         unixodbc \
     && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
         | gpg --dearmor --yes --output /usr/share/keyrings/microsoft-prod.gpg \
@@ -47,25 +52,40 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --disable-pip-version-check --upgrade pip
+
+# EasyOCR is CPU-only in this image. Installing these first from PyTorch's CPU
+# index prevents pip from resolving the much larger CUDA dependency set.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --disable-pip-version-check \
+        --index-url "$PYTORCH_CPU_INDEX_URL" \
+        torch torchvision
+
 COPY requirements.txt ./requirements.txt
-RUN python -m pip install --disable-pip-version-check --no-cache-dir --upgrade pip \
-    && python -m pip install --disable-pip-version-check --no-cache-dir \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --disable-pip-version-check \
         --requirement requirements.txt
 
+RUN mkdir -p "$EASYOCR_MODEL_DIR" \
+    && python -c "import easyocr; easyocr.Reader(['en'], gpu=False, model_storage_directory='$EASYOCR_MODEL_DIR')"
+
+# Source edits should invalidate only these inexpensive layers, not Python
+# dependencies or the downloaded OCR models above.
 COPY src/ ./src/
 COPY tests/ ./tests/
 COPY --chmod=0755 container/entrypoint.sh ./container/entrypoint.sh
 COPY nightly_label_check.py requirements-test.txt ./
 
 RUN sed -i 's/\r$//' /app/container/entrypoint.sh \
-    && /bin/sh -n /app/container/entrypoint.sh \
-    && mkdir -p "$EASYOCR_MODEL_DIR" \
-    && python -c "import easyocr; easyocr.Reader(['en'], gpu=False, model_storage_directory='$EASYOCR_MODEL_DIR')"
+    && /bin/sh -n /app/container/entrypoint.sh
 
 
 FROM python-base AS test
 
-RUN python -m pip install --disable-pip-version-check --no-cache-dir \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --disable-pip-version-check \
         --requirement requirements-test.txt \
     && python -W error::ResourceWarning -m unittest discover \
         --start-directory tests --verbose
@@ -93,6 +113,8 @@ ENV TQ_EXECUTABLE=/app/bin/tq \
     GT450_IMAGES_CONTAINER_ROOT=/data/gt450-images \
     LABEL_CHECK_BATCHES_CONTAINER_ROOT=/data/label-check-batches \
     COPATH_CONNECTION_STRING_FILE=/run/secrets/copath_connection_string \
+    KRB5_CONFIG=/etc/krb5.conf \
+    KRB5CCNAME=/tmp/krb5cc_labelcheck \
     PORT=5000
 
 WORKDIR /app/src

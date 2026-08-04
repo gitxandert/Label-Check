@@ -1,13 +1,13 @@
 import argparse
 import csv
-import os
 import re
 import sys
-from pathlib import Path
 
 import pyodbc
 import pandas as pd
 from striprtf.striprtf import rtf_to_text
+
+from copath_connection import prepared_connection_string
 
 from copath_texttypes import (
     format_text_agg_columns,
@@ -458,22 +458,6 @@ mrn_query = """
   ORDER BY mr.medrec_num, ms.accession_date, ms.specnum_formatted;
 """
 
-# string to connect to CoPath
-DEFAULT_CONN_STR = (
-    "DRIVER={ODBC Driver 18 for SQL Server};"
-    "SERVER=IUHWCPTHDB3980;"
-    "DATABASE=COPLIVE;"
-    "Trusted_Connection=yes;"
-    "TrustServerCertificate=yes;"
-)
-
-
-def connection_string():
-    path = os.environ.get("COPATH_CONNECTION_STRING_FILE", "").strip()
-    if path:
-        return Path(path).read_text(encoding="utf-8").strip()
-    return os.environ.get("COPATH_CONNECTION_STRING", DEFAULT_CONN_STR).strip()
-
 REPORT_FIELDS = [ tt[1] for tt in TEXT_TYPES ]
 
 def parse_field(field):
@@ -820,7 +804,7 @@ if __name__ == "__main__":
 
     # connect to database and run query
     try:
-        conn = pyodbc.connect(connection_string())
+        conn = pyodbc.connect(prepared_connection_string())
         results = pd.read_sql(formatted_query, conn)
     except Exception as e:
         print(f"Error connecting to database: {e}")

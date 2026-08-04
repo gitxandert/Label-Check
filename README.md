@@ -53,9 +53,10 @@ Cargo nor GCC.
   example uses `Z:\GT450_images`; change it to the server's working mapping.
 - A dedicated TQ configuration directory containing `config.toml` and a
   dedicated SSH directory containing `id_ed25519` or `id_rsa`.
-- A one-line CoPath ODBC connection string stored outside this repository. A
-  Linux container cannot inherit the Windows user's integrated login. Use a SQL
-  login approved by IT, or separately configure Kerberos inside the container.
+- A one-line CoPath ODBC connection string stored outside this repository.
+- A Kerberos configuration file for the Windows domain. The Linux container
+  uses a Kerberos ticket to present the interactive user's Windows identity to
+  SQL Server.
 - An external reverse proxy terminating HTTPS and forwarding the request scheme
   to port 5000.
 
@@ -66,7 +67,26 @@ directories. `LABEL_CHECK_STATE_HOST` must contain
 Example CoPath secret file content:
 
 ```text
-DRIVER={ODBC Driver 18 for SQL Server};SERVER=IUHWCPTHDB3980;DATABASE=COPLIVE;UID=service-user;PWD=secret;TrustServerCertificate=yes;
+DRIVER={ODBC Driver 18 for SQL Server};SERVER=sql-server.example.org;DATABASE=COPLIVE;Trusted_Connection=yes;TrustServerCertificate=yes;
+```
+
+Every ODBC property must be separated by a semicolon. Use the SQL Server DNS
+name associated with its `MSSQLSvc` service principal name. The connection
+string does not contain the Windows username or password.
+
+Set `KRB5_CONFIG_HOST` to a domain configuration supplied by IT. A minimal
+DNS-discovered configuration has this shape; replace the example realm and
+domain with the organization's values:
+
+```ini
+[libdefaults]
+    default_realm = EXAMPLE.ORG
+    dns_lookup_realm = false
+    dns_lookup_kdc = true
+
+[domain_realm]
+    .example.org = EXAMPLE.ORG
+    example.org = EXAMPLE.ORG
 ```
 
 ### Build and test
@@ -76,6 +96,11 @@ git submodule update --init --recursive
 docker build --target test --tag label-check:test .
 docker compose build
 ```
+
+The image installs PyTorch from its CPU-only wheel index. BuildKit caches pip
+downloads, Python dependency layers, and the EasyOCR models independently from
+the application source, so normal source edits do not repeat the large OCR
+setup. Keep BuildKit enabled and avoid `--no-cache` unless diagnosing a build.
 
 TQ builds and tests natively for Linux:
 
@@ -110,6 +135,20 @@ these mounts. New pipeline output records Linux mount paths directly.
 docker compose up -d
 docker compose ps
 ```
+
+After the service starts, obtain a Windows Authentication ticket as your
+personal domain account. `kinit` prompts for the normal Windows password; do
+not put that password in `.env`, the ODBC secret, or the command line.
+
+```powershell
+docker compose exec label-check kinit YOUR_USERNAME@YOUR.AD.REALM
+docker compose exec label-check klist
+```
+
+The ticket cache is shared with the web process because both commands and the
+application run as the container's `labelcheck` user. Run `kinit` again after
+the ticket expires or the container is recreated, then retry CoPath preparation
+from the renaming page.
 
 The default command initializes persistent state and starts Waitress on port
 5000. Other applications use the same image:
