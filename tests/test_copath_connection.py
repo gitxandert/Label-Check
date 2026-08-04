@@ -91,6 +91,14 @@ class CoPathConnectionTests(unittest.TestCase):
         ):
             copath_connection.require_windows_ticket(WINDOWS_CONNECTION)
 
+    def test_native_windows_connection_does_not_require_mit_klist(self):
+        with mock.patch("copath_connection.sys.platform", "win32"), mock.patch(
+            "copath_connection.shutil.which"
+        ) as which:
+            copath_connection.require_windows_ticket(WINDOWS_CONNECTION)
+
+        which.assert_not_called()
+
     def test_non_windows_connection_does_not_require_ticket(self):
         connection = (
             "DRIVER={ODBC Driver 18 for SQL Server};"

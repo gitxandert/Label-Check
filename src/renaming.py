@@ -16,6 +16,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from copath_queue import QueueProtocolError, submit_query
+
 
 ORGANS = ("BRAIN", "BREAST", "TESTIS", "OTHER", "UNKNOWN")
 IMAGE_TYPES = ("WSI", "FNA", "XXX")
@@ -345,7 +347,8 @@ def _pid_for(row: Optional[Dict[str, str]], organ: str, clone_rows: Dict[str, Li
     return candidate
 
 
-def default_query(batch_root: Path, accessions: Sequence[str], output_path: Path) -> None:
+def direct_query(batch_root: Path, accessions: Sequence[str], output_path: Path) -> None:
+    """Run the legacy CoPath CLI in this process environment."""
     if not accessions:
         atomic_write(output_path, ["accession_id"], [])
         return
@@ -364,6 +367,44 @@ def default_query(batch_root: Path, accessions: Sequence[str], output_path: Path
             raise RenamingError((result.stdout + result.stderr).strip() or "CoPath query failed")
     finally:
         input_path.unlink(missing_ok=True)
+
+
+def windows_queue_query(
+    _batch_root: Path, accessions: Sequence[str], output_path: Path
+) -> None:
+    """Submit a constrained request to the manually started Windows worker."""
+    if not accessions:
+        atomic_write(output_path, ["accession_id"], [])
+        return
+    queue_root = Path(
+        os.environ.get("COPATH_QUERY_QUEUE", "/data/state/copath-query")
+    )
+    configured_timeout = os.environ.get("COPATH_QUERY_TIMEOUT_SECONDS", "300")
+    try:
+        timeout_seconds = float(configured_timeout)
+    except ValueError as exc:
+        raise RenamingError(
+            "COPATH_QUERY_TIMEOUT_SECONDS must be a number greater than zero"
+        ) from exc
+    try:
+        submit_query(queue_root, list(accessions), output_path, timeout_seconds)
+    except QueueProtocolError as exc:
+        raise RenamingError(str(exc)) from exc
+    except OSError as exc:
+        raise RenamingError(f"The Windows CoPath queue is unavailable: {exc}") from exc
+
+
+def default_query(batch_root: Path, accessions: Sequence[str], output_path: Path) -> None:
+    """Dispatch CoPath work according to the configured query mode."""
+    mode = os.environ.get("COPATH_QUERY_MODE", "direct").strip().lower()
+    if mode == "direct":
+        direct_query(batch_root, accessions, output_path)
+    elif mode == "windows_queue":
+        windows_queue_query(batch_root, accessions, output_path)
+    else:
+        raise RenamingError(
+            "COPATH_QUERY_MODE must be either 'windows_queue' or 'direct'"
+        )
 
 
 def prepare_batch(

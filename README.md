@@ -53,10 +53,11 @@ Cargo nor GCC.
   example uses `Z:\GT450_images`; change it to the server's working mapping.
 - A dedicated TQ configuration directory containing `config.toml` and a
   dedicated SSH directory containing `id_ed25519` or `id_rsa`.
-- A one-line CoPath ODBC connection string stored outside this repository.
-- A Kerberos configuration file for the Windows domain. The Linux container
-  uses a Kerberos ticket to present the interactive user's Windows identity to
-  SQL Server.
+- Python 3.10 or newer and Microsoft ODBC Driver 18 for SQL Server installed on
+  the signed-in Windows workstation for the CoPath worker.
+- A one-line CoPath ODBC connection string stored outside this repository. The
+  Windows worker uses native integrated authentication; it contains no username
+  or password.
 - An external reverse proxy terminating HTTPS and forwarding the request scheme
   to port 5000.
 
@@ -70,24 +71,8 @@ Example CoPath secret file content:
 DRIVER={ODBC Driver 18 for SQL Server};SERVER=sql-server.example.org;DATABASE=COPLIVE;Trusted_Connection=yes;TrustServerCertificate=yes;
 ```
 
-Every ODBC property must be separated by a semicolon. Use the SQL Server DNS
-name associated with its `MSSQLSvc` service principal name. The connection
-string does not contain the Windows username or password.
-
-Set `KRB5_CONFIG_HOST` to a domain configuration supplied by IT. A minimal
-DNS-discovered configuration has this shape; replace the example realm and
-domain with the organization's values:
-
-```ini
-[libdefaults]
-    default_realm = EXAMPLE.ORG
-    dns_lookup_realm = false
-    dns_lookup_kdc = true
-
-[domain_realm]
-    .example.org = EXAMPLE.ORG
-    example.org = EXAMPLE.ORG
-```
+Every ODBC property must be separated by a semicolon. The connection string
+does not contain the Windows username or password.
 
 ### Build and test
 
@@ -129,26 +114,51 @@ Inside the container, Windows resources appear at stable Linux paths:
 Persisted UNC GT450 paths and `D:\label_check_batches` paths are translated to
 these mounts. New pipeline output records Linux mount paths directly.
 
+### Windows CoPath worker
+
+CoPath queries are delegated to a worker that you start after signing into
+Windows. Docker and the worker communicate only through
+`LABEL_CHECK_STATE_HOST\copath-query`; no SQL credentials enter the container.
+The queue contains accessions and report data. Restrict the entire
+`LABEL_CHECK_STATE_HOST` directory to the signed-in Windows account, the Docker
+Desktop service account, and administrators. Do not share it broadly or use a
+world-writable network directory.
+
+Create the worker environment once from the repository root in PowerShell:
+
+```powershell
+py -m venv .venv-copath-worker
+.\.venv-copath-worker\Scripts\python.exe -m pip install --upgrade pip
+.\.venv-copath-worker\Scripts\python.exe -m pip install -r requirements-windows-worker.txt
+```
+
+Start the worker manually after Windows sign-in, before preparing or retrying a
+batch:
+
+```powershell
+.\.venv-copath-worker\Scripts\python.exe src\copath_windows_worker.py `
+  --queue "$env:LABEL_CHECK_STATE_HOST\copath-query" `
+  --connection-string-file "$env:COPATH_CONNECTION_STRING_FILE_HOST"
+```
+
+If those values are stored only in `.env`, substitute their actual Windows
+paths in the command. The worker writes a heartbeat every five seconds, accepts
+only validated accession lists (up to 10,000), and uses the signed-in user's
+native Windows identity through `Trusted_Connection=yes`. Press Ctrl+C for a
+clean shutdown; the heartbeat is removed and the renaming page reports the
+worker offline instead of waiting for the full query timeout.
+
+To verify the SQL identity during integration testing, have a database
+administrator inspect the worker's SQL Server session while a batch query is
+active, or temporarily run the equivalent approved identity query through the
+same ODBC connection. It should show the signed-in personal domain account.
+
 ### Run
 
 ```powershell
 docker compose up -d
 docker compose ps
 ```
-
-After the service starts, obtain a Windows Authentication ticket as your
-personal domain account. `kinit` prompts for the normal Windows password; do
-not put that password in `.env`, the ODBC secret, or the command line.
-
-```powershell
-docker compose exec label-check kinit YOUR_USERNAME@YOUR.AD.REALM
-docker compose exec label-check klist
-```
-
-The ticket cache is shared with the web process because both commands and the
-application run as the container's `labelcheck` user. Run `kinit` again after
-the ticket expires or the container is recreated, then retry CoPath preparation
-from the renaming page.
 
 The default command initializes persistent state and starts Waitress on port
 5000. Other applications use the same image:
@@ -165,3 +175,37 @@ docker compose run --rm label-check python /app/src/deidentify_anonymize.py --he
 
 Schedule `nightly` externally; it performs one cycle and exits. State, SDL,
 backups, TQ configuration, and transfer logs survive container replacement.
+
+### CoPath troubleshooting
+
+- **Worker offline:** confirm the worker console is still running and that both
+  Windows and Docker can access `LABEL_CHECK_STATE_HOST\copath-query`. Check the
+  Windows clock if `worker.json` is present but considered stale.
+- **Query timeout:** the default is 300 seconds. Inspect the worker console and
+  SQL connectivity before increasing `COPATH_QUERY_TIMEOUT_SECONDS`.
+- **ODBC or login failure:** confirm ODBC Driver 18 is installed, the connection
+  file has semicolon-delimited properties including `Trusted_Connection=yes`,
+  and the signed-in Windows account is authorized for CoPath.
+- **Queue permission failure:** restore ACL access for the signed-in user and
+  Docker Desktop. Keep `requests`, `processing`, `results`, `errors`, `work`,
+  and `worker.json` beneath the configured queue root.
+- **Crash recovery:** restart the worker. It returns claims older than ten
+  minutes to the request queue and removes terminal artifacts after 24 hours.
+
+### Optional direct Linux/Kerberos mode
+
+The previous in-container query path remains available as a fallback. Set
+`KRB5_CONFIG_HOST` and `COPATH_CONNECTION_STRING_FILE_HOST`, then merge the
+direct-mode override:
+
+```powershell
+docker compose -f compose.yaml -f compose.direct.yaml up -d
+docker compose -f compose.yaml -f compose.direct.yaml exec label-check `
+  kinit YOUR_USERNAME@YOUR.AD.REALM
+docker compose -f compose.yaml -f compose.direct.yaml exec label-check klist
+```
+
+In direct mode, use the SQL Server DNS name associated with its `MSSQLSvc`
+service principal name. Renew `kinit` after ticket expiry or container
+recreation. The base `docker compose up -d` deployment always uses the Windows
+queue.

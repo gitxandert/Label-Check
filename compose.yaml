@@ -15,8 +15,9 @@ services:
       API_TRUST_PROXY_HEADERS: "true"
       GT450_IMAGES_HOST_PREFIX: ${GT450_IMAGES_HOST_PREFIX:?Set GT450_IMAGES_HOST_PREFIX}
       LABEL_CHECK_BATCHES_HOST_PREFIX: ${LABEL_CHECK_BATCHES_HOST_PREFIX:-D:\label_check_batches}
-      KRB5_CONFIG: /etc/krb5.conf
-      KRB5CCNAME: /tmp/krb5cc_labelcheck
+      COPATH_QUERY_MODE: ${COPATH_QUERY_MODE:-windows_queue}
+      COPATH_QUERY_QUEUE: ${COPATH_QUERY_QUEUE:-/data/state/copath-query}
+      COPATH_QUERY_TIMEOUT_SECONDS: ${COPATH_QUERY_TIMEOUT_SECONDS:-300}
       PORT: "5000"
     ports:
       - "${HOST_PORT:-5000}:5000"
@@ -45,14 +46,4 @@ services:
         source: ${SSH_HOME_HOST:?Set SSH_HOME_HOST}
         target: /home/labelcheck/.ssh
         read_only: true
-      - type: bind
-        source: ${KRB5_CONFIG_HOST:?Set KRB5_CONFIG_HOST to the domain Kerberos configuration file}
-        target: /etc/krb5.conf
-        read_only: true
-    secrets:
-      - copath_connection_string
     restart: unless-stopped
-
-secrets:
-  copath_connection_string:
-    file: ${COPATH_CONNECTION_STRING_FILE_HOST:?Set COPATH_CONNECTION_STRING_FILE_HOST}

@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Dict
 
@@ -97,6 +98,11 @@ def require_windows_ticket(connection: str) -> None:
         "1",
         "sspi",
     }:
+        return
+
+    # On Windows, ODBC Driver 18 uses the signed-in user's native SSPI token.
+    # MIT klist is only a preflight for the Linux/Kerberos direct-mode path.
+    if sys.platform == "win32":
         return
 
     if not shutil.which("klist"):

@@ -112,9 +112,9 @@ ENV TQ_EXECUTABLE=/app/bin/tq \
     TQ_TRANSFER_LOG_DIR=/data/label-check-batches/transfer_logs \
     GT450_IMAGES_CONTAINER_ROOT=/data/gt450-images \
     LABEL_CHECK_BATCHES_CONTAINER_ROOT=/data/label-check-batches \
-    COPATH_CONNECTION_STRING_FILE=/run/secrets/copath_connection_string \
-    KRB5_CONFIG=/etc/krb5.conf \
-    KRB5CCNAME=/tmp/krb5cc_labelcheck \
+    COPATH_QUERY_MODE=windows_queue \
+    COPATH_QUERY_QUEUE=/data/state/copath-query \
+    COPATH_QUERY_TIMEOUT_SECONDS=300 \
     PORT=5000
 
 WORKDIR /app/src
