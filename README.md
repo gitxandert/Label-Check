@@ -49,8 +49,9 @@ Cargo nor GCC.
   ```
 
 - Windows directories shared with Docker Desktop.
-- The GT450 SMB share mapped to a Windows path Docker Desktop can bind. The
-  example uses `Z:\GT450_images`; change it to the server's working mapping.
+- A dedicated, read-only SMB account that can access the GT450 image directory.
+  Docker's Linux VM mounts this share directly; no Windows drive mapping is
+  required.
 - A dedicated TQ configuration directory containing `config.toml` and a
   dedicated SSH directory containing `id_ed25519` or `id_rsa`.
 - Python 3.10 or newer and Microsoft ODBC Driver 18 for SQL Server installed on
@@ -64,6 +65,12 @@ Cargo nor GCC.
 Copy `.env.example` to `.env`, replace all placeholders, and create the host
 directories. `LABEL_CHECK_STATE_HOST` must contain
 `Slide_Digitization_Log.xlsx` before SDL workflows run.
+
+The GT450 CIFS password is stored in the gitignored `.env` file and in local
+Docker volume metadata. Restrict Docker access to trusted administrators and do
+not reuse a personal account. Because CIFS mount options are comma-delimited,
+the dedicated account password must not contain a comma. Quote other special
+characters according to Compose `.env` syntax.
 
 Example CoPath secret file content:
 
@@ -114,6 +121,10 @@ Inside the container, Windows resources appear at stable Linux paths:
 Persisted UNC GT450 paths and `D:\label_check_batches` paths are translated to
 these mounts. New pipeline output records Linux mount paths directly.
 
+The GT450 mount is the named Docker volume `label-check-gt450-images`. It mounts
+`//chp.clarian.org/app/Philips_Slide_Images/GT450_Images` through CIFS with
+read-only permissions. The remaining paths are ordinary Windows bind mounts.
+
 ### Windows CoPath worker
 
 CoPath queries are delegated to a worker that you start after signing into
@@ -160,6 +171,30 @@ docker compose up -d
 docker compose ps
 ```
 
+Verify that the SMB mount contains the expected scanner directories and is
+read-only for the application user:
+
+```powershell
+docker compose exec label-check ls -la /data/gt450-images
+docker inspect $(docker compose ps -q label-check) `
+  --format '{{range .Mounts}}{{if eq .Destination "/data/gt450-images"}}{{println "RW:" .RW "Name:" .Name}}{{end}}{{end}}'
+```
+
+The inspection output must report `RW: false` and
+`Name: label-check-gt450-images`.
+
+Docker volume options are fixed when the volume is created. After changing the
+SMB password or any `GT450_SMB_*` mount setting, recreate only this mount:
+
+```powershell
+docker compose down
+docker volume rm label-check-gt450-images
+docker compose up -d
+```
+
+Removing this Docker volume unmounts the share; it does not delete files from
+the SMB server.
+
 The default command initializes persistent state and starts Waitress on port
 5000. Other applications use the same image:
 
@@ -175,6 +210,14 @@ docker compose run --rm label-check python /app/src/deidentify_anonymize.py --he
 
 Schedule `nightly` externally; it performs one cycle and exits. State, SDL,
 backups, TQ configuration, and transfer logs survive container replacement.
+
+### GT450 troubleshooting
+
+- **GT450 volume fails to mount:** verify `GT450_SMB_SERVER`, the dedicated
+  account credentials and domain, SMB 3.0 connectivity, and access to the
+  `app` share. Docker should fail container startup on a mount error instead of
+  substituting an empty local directory. After changing mount options, remove
+  and recreate `label-check-gt450-images` as described above.
 
 ### CoPath troubleshooting
 
