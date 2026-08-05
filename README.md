@@ -31,6 +31,21 @@ also checked in as `src/openapi.json`.
 API traffic is limited per token to five submissions and 60 reads per minute.
 When TLS terminates at one trusted reverse proxy, set
 `API_TRUST_PROXY_HEADERS=true`; otherwise forwarded scheme headers are ignored.
+The supplied Compose deployment publishes port 5000 on `127.0.0.1` only. A
+reverse proxy on the Docker host must expose HTTPS port 443 to network clients,
+discard client-supplied forwarding headers, and set `X-Forwarded-For` and
+`X-Forwarded-Proto`. Network clients can reach Label-Check through HTTPS, but
+cannot bypass the proxy through plaintext port 5000. For a containerized proxy,
+remove the published application port and connect both services through a
+private Docker network instead.
+
+Pipeline paths are restricted after path translation and symbolic-link
+resolution. `PIPELINE_INPUT_ROOTS` and `PIPELINE_OUTPUT_ROOTS` contain
+platform-path-separator-delimited allowlists. Compose permits input beneath
+`/data/gt450-images` or `/data/label-check-batches` and output beneath
+`/data/label-check-batches`. Worker fields default to a maximum of 8 and
+thumbnail dimensions to 4096 pixels; deployments can lower these limits with
+`PIPELINE_MAX_WORKERS` and `PIPELINE_MAX_THUMBNAIL_DIMENSION`.
 
 ## Linux container on Docker Desktop
 
@@ -72,6 +87,18 @@ directories. `LABEL_CHECK_STATE_HOST` must contain
 `ADMIN_DEFAULT_PASSWORD` at least 12. Missing, weak, legacy-default, or example
 placeholder values stop application initialization. Rotating `SECRET_KEY`
 invalidates existing browser sessions.
+
+New user passwords must contain 12–128 characters. Login failures are stored in
+the application SQLite database and limited over a 15-minute window to five per
+username/client-address pair and ten per username. Successful login clears both
+counters. The limits and window are configurable through the corresponding
+`LOGIN_*` variables in `.env.example`.
+
+Application startup creates runtime directories with mode `0700`, files with
+mode `0600`, and repairs existing instance state before loading it. Symbolic
+links in sensitive instance state are rejected. On Windows bind mounts, NTFS
+ACLs remain the security boundary: restrict `LABEL_CHECK_STATE_HOST` to the
+service account, Docker Desktop service account, and administrators.
 
 Obtain the SFTP server's SHA-256 host-key fingerprint through a trusted
 out-of-band channel. After verifying it, place the corresponding OpenSSH

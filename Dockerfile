@@ -84,6 +84,8 @@ RUN sed -i 's/\r$//' /app/container/entrypoint.sh \
 
 FROM python-base AS test
 
+COPY compose.yaml ./compose.yaml
+
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --disable-pip-version-check \
         --requirement requirements-test.txt \

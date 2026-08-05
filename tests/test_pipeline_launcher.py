@@ -76,10 +76,25 @@ class PipelineLauncherTests(unittest.TestCase):
             app_module.api_store.output_dir,
         )
         root = Path(self.temporary_directory.name)
+        self.original_pipeline_config = {
+            "PIPELINE_INPUT_ROOTS": app_module.app.config.get("PIPELINE_INPUT_ROOTS"),
+            "PIPELINE_OUTPUT_ROOTS": app_module.app.config.get("PIPELINE_OUTPUT_ROOTS"),
+            "PIPELINE_MAX_WORKERS": app_module.app.config.get("PIPELINE_MAX_WORKERS"),
+            "PIPELINE_MAX_THUMBNAIL_DIMENSION": app_module.app.config.get(
+                "PIPELINE_MAX_THUMBNAIL_DIMENSION"
+            ),
+        }
         app_module.api_store.configure(
             str(root / "api.sqlite3"), str(root / "pipeline-output")
         )
-        app_module.app.config.update(TESTING=True, SECRET_KEY="test-secret")
+        app_module.app.config.update(
+            TESTING=True,
+            SECRET_KEY="test-secret",
+            PIPELINE_INPUT_ROOTS=(tempfile.gettempdir(),),
+            PIPELINE_OUTPUT_ROOTS=(tempfile.gettempdir(),),
+            PIPELINE_MAX_WORKERS=8,
+            PIPELINE_MAX_THUMBNAIL_DIMENSION=4096,
+        )
         with app_module._pipeline_jobs_lock:
             app_module._pipeline_jobs.clear()
             app_module._pipeline_active_job_id = None
@@ -89,6 +104,7 @@ class PipelineLauncherTests(unittest.TestCase):
             app_module._pipeline_jobs.clear()
             app_module._pipeline_active_job_id = None
         app_module.api_store.configure(*self.original_store)
+        app_module.app.config.update(self.original_pipeline_config)
         self.temporary_directory.cleanup()
 
     def test_form_defaults_and_command(self):
@@ -132,6 +148,51 @@ class PipelineLauncherTests(unittest.TestCase):
         self.assertTrue(any("slide_mapping.csv" in error for error in errors))
         self.assertEqual([], resolved_errors)
         self.assertIsNotNone(command)
+
+    def test_pipeline_rejects_resource_values_above_limits(self):
+        root = Path(self.temporary_directory.name)
+        input_dir = root / "bounded-input"
+        input_dir.mkdir()
+        values = app_module._pipeline_form_values()
+        values.update(
+            {
+                "input_dir": str(input_dir),
+                "output_dir": str(root / "bounded-output"),
+                "macro_workers": "9",
+                "thumbnail_width": "4097",
+            }
+        )
+
+        command, errors = app_module._pipeline_command(values)
+
+        self.assertIsNone(command)
+        self.assertTrue(any("must not exceed 8" in error for error in errors))
+        self.assertTrue(any("must not exceed 4096" in error for error in errors))
+
+    def test_pipeline_rejects_paths_outside_allowlists_and_symlink_escape(self):
+        root = Path(self.temporary_directory.name)
+        allowed = root / "allowed"
+        outside = root / "outside"
+        allowed.mkdir()
+        outside.mkdir()
+        app_module.app.config.update(
+            PIPELINE_INPUT_ROOTS=(str(allowed),),
+            PIPELINE_OUTPUT_ROOTS=(str(allowed),),
+        )
+        values = app_module._pipeline_form_values()
+        values.update({"input_dir": str(outside), "output_dir": str(outside / "out")})
+
+        _command, outside_errors = app_module._pipeline_command(values)
+
+        self.assertTrue(any("outside" in error.lower() for error in outside_errors))
+        symlink = allowed / "escape"
+        try:
+            symlink.symlink_to(outside, target_is_directory=True)
+        except OSError:
+            self.skipTest("Directory symlinks are unavailable")
+        values.update({"input_dir": str(symlink), "output_dir": str(symlink / "out")})
+        _command, symlink_errors = app_module._pipeline_command(values)
+        self.assertTrue(any("outside" in error.lower() for error in symlink_errors))
 
     def test_reader_merges_output_and_marks_success(self):
         process = FakeProcess(b"line one\nline two\n", return_code=0)

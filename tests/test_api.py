@@ -48,6 +48,10 @@ class PipelineAPITests(unittest.TestCase):
             API_SUBMIT_RATE_LIMIT=100,
             API_READ_RATE_LIMIT=100,
             API_RATE_WINDOW_SECONDS=60,
+            PIPELINE_INPUT_ROOTS=(str(self.root),),
+            PIPELINE_OUTPUT_ROOTS=(str(self.root),),
+            PIPELINE_MAX_WORKERS=8,
+            PIPELINE_MAX_THUMBNAIL_DIMENSION=4096,
         )
         self.client = app_module.app.test_client()
         self.run_token, self.run_record = app_module.api_store.create_token(
@@ -136,6 +140,14 @@ class PipelineAPITests(unittest.TestCase):
         self.assertEqual(422, unknown.status_code)
         self.assertEqual("application/problem+json", unknown.content_type)
 
+        over_limit = self.client.post(
+            "/api/v1/pipeline/jobs",
+            json={**self.payload(), "ocr_workers": 9},
+            headers=self.headers(key="over-limit"),
+        )
+        self.assertEqual(422, over_limit.status_code)
+        self.assertIn("must not exceed 8", over_limit.get_json()["detail"])
+
     def test_idempotency_key_rejects_a_different_payload(self):
         with mock.patch.object(app_module.subprocess, "Popen", return_value=FakeProcess()), mock.patch.object(
             app_module.threading, "Thread", return_value=mock.Mock()
@@ -193,6 +205,9 @@ class PipelineAPITests(unittest.TestCase):
         self.assertEqual("3.1.0", contract["openapi"])
         self.assertIn("/pipeline/jobs", contract["paths"])
         self.assertIn("bearerAuth", contract["components"]["securitySchemes"])
+        properties = contract["components"]["schemas"]["PipelineRequest"]["properties"]
+        self.assertEqual(8, properties["ocr_workers"]["maximum"])
+        self.assertEqual(4096, properties["thumbnail_width"]["maximum"])
 
     def test_bearer_auth_scope_revocation_and_request_ids(self):
         missing = self.client.get("/api/v1/openapi.json")

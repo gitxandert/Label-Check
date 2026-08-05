@@ -88,20 +88,20 @@
         "additionalProperties": false,
         "required": ["input_dir", "output_dir"],
         "properties": {
-          "input_dir": {"type": "string"},
-          "output_dir": {"type": "string"},
+          "input_dir": {"type": "string", "description": "Existing server directory beneath a configured pipeline input root."},
+          "output_dir": {"type": "string", "description": "Server directory beneath a configured pipeline output root."},
           "start_from": {"type": "integer", "enum": [1, 2, 3], "default": 1},
           "end_at": {"type": "integer", "enum": [1, 2, 3], "default": 3},
           "input_mode": {"type": "string", "enum": ["auto", "slides", "images"], "default": "auto"},
-          "macro_workers": {"type": "integer", "minimum": 1, "default": 4},
+          "macro_workers": {"type": "integer", "minimum": 1, "maximum": 8, "default": 4},
           "macro_extensions": {"type": "array", "items": {"type": "string"}, "default": ["svs"]},
           "macro_image_extensions": {"type": "array", "items": {"type": "string"}, "default": ["png", "jpg", "jpeg", "tif", "tiff", "bmp"]},
-          "thumbnail_width": {"type": "integer", "minimum": 1, "default": 300},
-          "thumbnail_height": {"type": "integer", "minimum": 1, "default": 300},
-          "ocr_workers": {"type": "integer", "minimum": 1, "default": 4},
+          "thumbnail_width": {"type": "integer", "minimum": 1, "maximum": 4096, "default": 300},
+          "thumbnail_height": {"type": "integer", "minimum": 1, "maximum": 4096, "default": 300},
+          "ocr_workers": {"type": "integer", "minimum": 1, "maximum": 8, "default": 4},
           "ocr_use_cpu": {"type": "boolean", "default": false},
           "naming_accession_pattern": {"type": "string"},
-          "naming_workers": {"type": "integer", "minimum": 1, "default": 4}
+          "naming_workers": {"type": "integer", "minimum": 1, "maximum": 8, "default": 4}
         }
       },
       "PipelineJob": {

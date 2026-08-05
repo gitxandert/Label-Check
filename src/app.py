@@ -79,6 +79,20 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
+
+PRIVATE_DIRECTORY_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+os.umask(0o077)
+
+
+def _environment_paths(name: str) -> Tuple[str, ...]:
+    return tuple(
+        item.strip()
+        for item in os.environ.get(name, "").split(os.pathsep)
+        if item.strip()
+    )
+
+
 # ==============================================================================
 # 2. CONFIGURATION
 # ==============================================================================
@@ -121,6 +135,20 @@ class Config:
     API_OUTPUT_DEFAULT_LIMIT = 16 * 1024
     API_OUTPUT_MAX_LIMIT = 64 * 1024
     CSRF_ENABLED = os.environ.get("CSRF_ENABLED", "true").lower() == "true"
+    PIPELINE_INPUT_ROOTS = _environment_paths("PIPELINE_INPUT_ROOTS")
+    PIPELINE_OUTPUT_ROOTS = _environment_paths("PIPELINE_OUTPUT_ROOTS")
+    PIPELINE_MAX_WORKERS = int(os.environ.get("PIPELINE_MAX_WORKERS", "8"))
+    PIPELINE_MAX_THUMBNAIL_DIMENSION = int(
+        os.environ.get("PIPELINE_MAX_THUMBNAIL_DIMENSION", "4096")
+    )
+    LOGIN_PAIR_ATTEMPT_LIMIT = int(os.environ.get("LOGIN_PAIR_ATTEMPT_LIMIT", "5"))
+    LOGIN_ACCOUNT_ATTEMPT_LIMIT = int(
+        os.environ.get("LOGIN_ACCOUNT_ATTEMPT_LIMIT", "10")
+    )
+    LOGIN_RATE_WINDOW_SECONDS = int(
+        os.environ.get("LOGIN_RATE_WINDOW_SECONDS", "900")
+    )
+    APP_LOG_DIR = os.environ.get("APP_LOG_DIR", os.path.join(BASE_DIR, "logs"))
 
     # Slide Digitization Log workbook configuration.
     SDL_FILE_PATH = os.environ.get(
@@ -156,15 +184,73 @@ class Config:
     LEASE_DURATION_SECONDS = 300  # 5 minutes
 
 
+def _make_private_directory(path: Union[str, Path]) -> Path:
+    directory = Path(path)
+    if directory.is_symlink():
+        raise RuntimeError(f"Sensitive runtime directory cannot be a symbolic link: {directory}")
+    directory.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIRECTORY_MODE)
+    os.chmod(directory, PRIVATE_DIRECTORY_MODE)
+    return directory
+
+
+def _verify_private_mode(path: Path, expected_mode: int) -> None:
+    if os.name == "nt":
+        return
+    actual_mode = stat.S_IMODE(path.stat().st_mode)
+    if actual_mode & 0o077 or actual_mode != expected_mode:
+        raise RuntimeError(
+            f"Sensitive runtime path has insecure permissions: {path} ({actual_mode:o})"
+        )
+
+
+def harden_runtime_permissions(
+    instance_dir: Union[str, Path], log_dir: Union[str, Path]
+) -> None:
+    """Create and repair private application state without following symlinks."""
+    instance = _make_private_directory(instance_dir)
+    logs = _make_private_directory(log_dir)
+
+    for root, directories, files in os.walk(instance, followlinks=False):
+        root_path = Path(root)
+        if root_path.is_symlink():
+            raise RuntimeError(
+                f"Sensitive runtime directory cannot be a symbolic link: {root_path}"
+            )
+        os.chmod(root_path, PRIVATE_DIRECTORY_MODE)
+        _verify_private_mode(root_path, PRIVATE_DIRECTORY_MODE)
+        for name in directories:
+            child = root_path / name
+            if child.is_symlink():
+                raise RuntimeError(
+                    f"Sensitive runtime path cannot be a symbolic link: {child}"
+                )
+        for name in files:
+            child = root_path / name
+            if child.is_symlink():
+                raise RuntimeError(
+                    f"Sensitive runtime path cannot be a symbolic link: {child}"
+                )
+            os.chmod(child, PRIVATE_FILE_MODE)
+            _verify_private_mode(child, PRIVATE_FILE_MODE)
+
+    for child in logs.glob("app.log*"):
+        if child.is_symlink():
+            raise RuntimeError(f"Log file cannot be a symbolic link: {child}")
+        if child.is_file():
+            os.chmod(child, PRIVATE_FILE_MODE)
+            _verify_private_mode(child, PRIVATE_FILE_MODE)
+    _verify_private_mode(logs, PRIVATE_DIRECTORY_MODE)
+
+
 # ==============================================================================
 # 3. LOGGING SETUP
 # ==============================================================================
 def setup_logging(app: Flask) -> None:
     """Configures comprehensive logging for the application."""
-    if not os.path.exists("logs"):
-        os.mkdir("logs")
-
-    file_handler = RotatingFileHandler("logs/app.log", maxBytes=102400, backupCount=10)
+    log_dir = _make_private_directory(app.config["APP_LOG_DIR"])
+    log_path = log_dir / "app.log"
+    file_handler = RotatingFileHandler(log_path, maxBytes=102400, backupCount=10)
+    os.chmod(log_path, PRIVATE_FILE_MODE)
     file_handler.setFormatter(
         logging.Formatter(
             "%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]"
@@ -188,14 +274,13 @@ def setup_logging(app: Flask) -> None:
 # 4. APPLICATION & EXTENSIONS INITIALIZATION
 # ==============================================================================
 base_dir = os.path.abspath(os.path.dirname(__file__))
-instance_path = os.path.join(base_dir, "instance")
 template_dir = os.path.join(base_dir, "templates")
 
-app = Flask(__name__, template_folder=template_dir, instance_path=instance_path)
+app = Flask(__name__, template_folder=template_dir, instance_path=Config.INSTANCE_DIR)
 app.config.from_object(Config)
 if app.config["API_TRUST_PROXY_HEADERS"]:
-    app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1)
-os.makedirs(app.instance_path, exist_ok=True)
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+harden_runtime_permissions(app.config["INSTANCE_DIR"], app.config["APP_LOG_DIR"])
 
 setup_logging(app)
 
@@ -245,6 +330,20 @@ _INSECURE_ADMIN_PASSWORDS = {
     "change_this_password",
     "replace-before-first-start",
 }
+MIN_PASSWORD_LENGTH = 12
+MAX_PASSWORD_LENGTH = 128
+
+
+def password_policy_error(password: Any) -> Optional[str]:
+    if not isinstance(password, str):
+        return "Password must be text."
+    if len(password) < MIN_PASSWORD_LENGTH:
+        return f"Password must contain at least {MIN_PASSWORD_LENGTH} characters."
+    if len(password) > MAX_PASSWORD_LENGTH:
+        return f"Password must contain at most {MAX_PASSWORD_LENGTH} characters."
+    if password in _INSECURE_ADMIN_PASSWORDS:
+        return "Password must not use a documented placeholder."
+    return None
 
 
 def validate_security_config(configuration: Optional[Dict[str, Any]] = None) -> None:
@@ -260,12 +359,25 @@ def validate_security_config(configuration: Optional[Dict[str, Any]] = None) -> 
     elif secret_key in _INSECURE_SECRET_KEYS:
         errors.append("SECRET_KEY must not use a documented placeholder or legacy default")
 
-    if not isinstance(admin_password, str) or len(admin_password) < 12:
-        errors.append("ADMIN_DEFAULT_PASSWORD must contain at least 12 characters")
-    elif admin_password in _INSECURE_ADMIN_PASSWORDS:
-        errors.append(
-            "ADMIN_DEFAULT_PASSWORD must not use a documented placeholder or legacy default"
-        )
+    password_error = password_policy_error(admin_password)
+    if password_error:
+        errors.append(f"ADMIN_DEFAULT_PASSWORD: {password_error}")
+
+    for key in ("PIPELINE_INPUT_ROOTS", "PIPELINE_OUTPUT_ROOTS"):
+        roots = configuration.get(key)
+        if not roots:
+            errors.append(f"{key} must contain at least one directory")
+
+    for key in (
+        "PIPELINE_MAX_WORKERS",
+        "PIPELINE_MAX_THUMBNAIL_DIMENSION",
+        "LOGIN_PAIR_ATTEMPT_LIMIT",
+        "LOGIN_ACCOUNT_ATTEMPT_LIMIT",
+        "LOGIN_RATE_WINDOW_SECONDS",
+    ):
+        value = configuration.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"{key} must be a positive integer")
 
     if errors:
         raise SecurityConfigurationError("; ".join(errors))
@@ -314,8 +426,13 @@ class APIStore:
         with self._init_lock:
             if self._initialized_path == self.db_path:
                 return
-            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-            Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+            database_path = Path(self.db_path)
+            if database_path.is_symlink():
+                raise RuntimeError(
+                    f"Sensitive runtime database cannot be a symbolic link: {database_path}"
+                )
+            database_directory = _make_private_directory(database_path.parent)
+            output_directory = _make_private_directory(self.output_dir)
             connection = sqlite3.connect(self.db_path, timeout=30)
             try:
                 connection.executescript(
@@ -357,11 +474,22 @@ class APIStore:
                         request_count INTEGER NOT NULL,
                         PRIMARY KEY(token_id, bucket)
                     );
+                    CREATE TABLE IF NOT EXISTS login_rate_limits (
+                        scope TEXT NOT NULL,
+                        identifier_hash TEXT NOT NULL,
+                        window_start INTEGER NOT NULL,
+                        request_count INTEGER NOT NULL,
+                        PRIMARY KEY(scope, identifier_hash)
+                    );
                     """
                 )
                 connection.commit()
             finally:
                 connection.close()
+            os.chmod(database_path, PRIVATE_FILE_MODE)
+            _verify_private_mode(database_directory, PRIVATE_DIRECTORY_MODE)
+            _verify_private_mode(output_directory, PRIVATE_DIRECTORY_MODE)
+            _verify_private_mode(database_path, PRIVATE_FILE_MODE)
             self._initialized_path = self.db_path
 
     def create_token(
@@ -478,6 +606,79 @@ class APIStore:
                 )
         return allowed, max(0, limit - count), window_start + window - now
 
+    @staticmethod
+    def _login_limit_keys(username: str, client_address: str) -> Dict[str, str]:
+        normalized_username = username.casefold()
+        return {
+            "pair": hashlib.sha256(
+                f"{normalized_username}\0{client_address}".encode("utf-8")
+            ).hexdigest(),
+            "account": hashlib.sha256(normalized_username.encode("utf-8")).hexdigest(),
+        }
+
+    def login_rate_limit(
+        self,
+        username: str,
+        client_address: str,
+        pair_limit: int,
+        account_limit: int,
+        window: int,
+    ) -> Tuple[bool, int]:
+        now = int(time.time())
+        window_start = now - (now % window)
+        retry_after = window_start + window - now
+        keys = self._login_limit_keys(username, client_address)
+        limits = {"pair": pair_limit, "account": account_limit}
+        with self.connection() as connection:
+            for scope, identifier_hash in keys.items():
+                row = connection.execute(
+                    """SELECT window_start, request_count FROM login_rate_limits
+                       WHERE scope=? AND identifier_hash=?""",
+                    (scope, identifier_hash),
+                ).fetchone()
+                if (
+                    row is not None
+                    and row["window_start"] == window_start
+                    and row["request_count"] >= limits[scope]
+                ):
+                    return False, retry_after
+        return True, retry_after
+
+    def record_login_failure(
+        self, username: str, client_address: str, window: int
+    ) -> None:
+        now = int(time.time())
+        window_start = now - (now % window)
+        keys = self._login_limit_keys(username, client_address)
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM login_rate_limits WHERE window_start < ?",
+                (window_start,),
+            )
+            for scope, identifier_hash in keys.items():
+                connection.execute(
+                    """INSERT INTO login_rate_limits
+                       (scope, identifier_hash, window_start, request_count)
+                       VALUES (?, ?, ?, 1)
+                       ON CONFLICT(scope, identifier_hash) DO UPDATE SET
+                         window_start=excluded.window_start,
+                         request_count=CASE
+                           WHEN login_rate_limits.window_start=excluded.window_start
+                           THEN login_rate_limits.request_count + 1
+                           ELSE 1
+                         END""",
+                    (scope, identifier_hash, window_start),
+                )
+
+    def clear_login_failures(self, username: str, client_address: str) -> None:
+        keys = self._login_limit_keys(username, client_address)
+        with self.connection() as connection:
+            connection.executemany(
+                "DELETE FROM login_rate_limits WHERE scope=? AND identifier_hash=?",
+                keys.items(),
+            )
+
     def find_idempotent(self, token_id: str, key: str) -> Optional[sqlite3.Row]:
         with self.connection() as connection:
             return connection.execute(
@@ -497,7 +698,10 @@ class APIStore:
     ) -> str:
         self._ensure_schema()
         output_path = str(Path(self.output_dir) / f"{job_id}.log")
-        Path(output_path).touch(exist_ok=False)
+        descriptor = os.open(
+            output_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, PRIVATE_FILE_MODE
+        )
+        os.close(descriptor)
         try:
             with self.connection() as connection:
                 connection.execute(
@@ -651,7 +855,10 @@ class CSVManager:
 
     def _ensure_file(self):
         if not os.path.exists(self.filepath):
-            with open(self.filepath, 'w', newline='', encoding='utf-8') as f:
+            descriptor = os.open(
+                self.filepath, os.O_WRONLY | os.O_CREAT | os.O_EXCL, PRIVATE_FILE_MODE
+            )
+            with os.fdopen(descriptor, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.DictWriter(f, fieldnames=self.fieldnames)
                 writer.writeheader()
 
@@ -675,8 +882,9 @@ class CSVManager:
                     writer = csv.DictWriter(f, fieldnames=self.fieldnames)
                     writer.writeheader()
                     writer.writerows(data)
-                
+                os.chmod(temp_path, PRIVATE_FILE_MODE)
                 os.replace(temp_path, self.filepath)
+                os.chmod(self.filepath, PRIVATE_FILE_MODE)
             except Exception as e:
                 app.logger.error(f"Error writing {self.filepath}: {e}")
                 if os.path.exists(temp_path):
@@ -3035,16 +3243,39 @@ def _pipeline_form_values(source=None) -> Dict[str, str]:
 
 
 def _positive_pipeline_integer(
-    values: Dict[str, str], field: str, label: str, errors: List[str]
+    values: Dict[str, str],
+    field: str,
+    label: str,
+    errors: List[str],
+    maximum: int,
 ) -> Optional[int]:
     try:
         value = int(values[field])
         if value <= 0:
             raise ValueError
+        if value > maximum:
+            errors.append(f"{label} must not exceed {maximum}.")
         return value
     except (TypeError, ValueError):
         errors.append(f"{label} must be a positive whole number.")
         return None
+
+
+def _pipeline_allowed_roots(config_key: str) -> List[Path]:
+    configured = app.config.get(config_key, ())
+    if isinstance(configured, str):
+        configured = [item for item in configured.split(os.pathsep) if item]
+    return [runtime_path(str(item)).expanduser().resolve() for item in configured]
+
+
+def _pipeline_path_is_allowed(candidate: Path, roots: List[Path]) -> bool:
+    for root in roots:
+        try:
+            candidate.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
 
 
 def _pipeline_extensions(value: str, label: str, errors: List[str]) -> List[str]:
@@ -3067,10 +3298,28 @@ def _pipeline_command(values: Dict[str, str]) -> Tuple[Optional[List[str]], List
 
     input_dir = runtime_path(input_text).expanduser().resolve() if input_text else None
     output_dir = runtime_path(output_text).expanduser().resolve() if output_text else None
+    input_roots = _pipeline_allowed_roots("PIPELINE_INPUT_ROOTS")
+    output_roots = _pipeline_allowed_roots("PIPELINE_OUTPUT_ROOTS")
+    if not input_roots:
+        errors.append("Pipeline input roots are not configured.")
+    elif any(not root.is_dir() for root in input_roots):
+        errors.append("Every configured pipeline input root must be an existing directory.")
+    if not output_roots:
+        errors.append("Pipeline output roots are not configured.")
+    elif any(not root.is_dir() for root in output_roots):
+        errors.append("Every configured pipeline output root must be an existing directory.")
     if input_dir is not None and not input_dir.is_dir():
         errors.append("Input directory must be an existing directory on the server.")
+    elif input_dir is not None and input_roots and not _pipeline_path_is_allowed(
+        input_dir, input_roots
+    ):
+        errors.append("Input directory is outside the configured pipeline input roots.")
     if output_dir is not None and output_dir.exists() and not output_dir.is_dir():
         errors.append("Output directory points to a file, not a directory.")
+    elif output_dir is not None and output_roots and not _pipeline_path_is_allowed(
+        output_dir, output_roots
+    ):
+        errors.append("Output directory is outside the configured pipeline output roots.")
 
     try:
         start_stage = int(values["start_from"])
@@ -3084,19 +3333,24 @@ def _pipeline_command(values: Dict[str, str]) -> Tuple[Optional[List[str]], List
         errors.append("Choose valid starting and ending stages.")
 
     macro_workers = _positive_pipeline_integer(
-        values, "macro_workers", "Get macro workers", errors
+        values, "macro_workers", "Get macro workers", errors,
+        app.config["PIPELINE_MAX_WORKERS"],
     )
     thumbnail_width = _positive_pipeline_integer(
-        values, "thumbnail_width", "Thumbnail width", errors
+        values, "thumbnail_width", "Thumbnail width", errors,
+        app.config["PIPELINE_MAX_THUMBNAIL_DIMENSION"],
     )
     thumbnail_height = _positive_pipeline_integer(
-        values, "thumbnail_height", "Thumbnail height", errors
+        values, "thumbnail_height", "Thumbnail height", errors,
+        app.config["PIPELINE_MAX_THUMBNAIL_DIMENSION"],
     )
     ocr_workers = _positive_pipeline_integer(
-        values, "ocr_workers", "Dual OCR workers", errors
+        values, "ocr_workers", "Dual OCR workers", errors,
+        app.config["PIPELINE_MAX_WORKERS"],
     )
     naming_workers = _positive_pipeline_integer(
-        values, "naming_workers", "Name files workers", errors
+        values, "naming_workers", "Name files workers", errors,
+        app.config["PIPELINE_MAX_WORKERS"],
     )
     macro_extensions = _pipeline_extensions(
         values["macro_extensions"], "Slide extensions", errors
@@ -3495,14 +3749,42 @@ def login():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        # Use UserManager
+        client_address = request.remote_addr or "unknown"
+        limit_arguments = (
+            username,
+            client_address,
+            app.config["LOGIN_PAIR_ATTEMPT_LIMIT"],
+            app.config["LOGIN_ACCOUNT_ATTEMPT_LIMIT"],
+            app.config["LOGIN_RATE_WINDOW_SECONDS"],
+        )
+        allowed, retry_after = api_store.login_rate_limit(*limit_arguments)
+        if not allowed:
+            flash("Too many login attempts. Try again later.", "error")
+            return (
+                render_template("login.html", messages=flash_messages()),
+                429,
+                {"Retry-After": str(retry_after)},
+            )
+
         user = user_manager.get(username)
-        
-        if user and user.verify_password(password):
+        password_is_bounded = len(password) <= MAX_PASSWORD_LENGTH
+        if user and password_is_bounded and user.verify_password(password):
+            api_store.clear_login_failures(username, client_address)
             login_user(user)
             app.logger.info(f"User '{username}' logged in successfully.")
             return redirect(request.args.get("next") or url_for("index"))
-        
+
+        api_store.record_login_failure(
+            username, client_address, app.config["LOGIN_RATE_WINDOW_SECONDS"]
+        )
+        allowed, retry_after = api_store.login_rate_limit(*limit_arguments)
+        if not allowed:
+            flash("Too many login attempts. Try again later.", "error")
+            return (
+                render_template("login.html", messages=flash_messages()),
+                429,
+                {"Retry-After": str(retry_after)},
+            )
         flash("Invalid username or password.", "error")
         
     return render_template("login.html", messages=flash_messages())
@@ -3534,10 +3816,14 @@ def add_user():
         return redirect(url_for("index"))
         
     username = request.form.get("username", "").strip()
-    password = request.form.get("password", "").strip()
+    password = request.form.get("password", "")
     
-    if not username or not password:
-        flash("Username and password are required.", "error")
+    if not username:
+        flash("Username is required.", "error")
+        return redirect(url_for("users_management"))
+    password_error = password_policy_error(password)
+    if password_error:
+        flash(password_error, "error")
         return redirect(url_for("users_management"))
         
     if user_manager.get(username):
@@ -5185,7 +5471,15 @@ def api_openapi_document():
     contract_path = Path(__file__).resolve().with_name("openapi.json")
     try:
         with contract_path.open("r", encoding="utf-8") as contract_file:
-            return jsonify(json.load(contract_file))
+            contract = json.load(contract_file)
+        properties = contract["components"]["schemas"]["PipelineRequest"]["properties"]
+        for field in ("macro_workers", "ocr_workers", "naming_workers"):
+            properties[field]["maximum"] = app.config["PIPELINE_MAX_WORKERS"]
+        for field in ("thumbnail_width", "thumbnail_height"):
+            properties[field]["maximum"] = app.config[
+                "PIPELINE_MAX_THUMBNAIL_DIMENSION"
+            ]
+        return jsonify(contract)
     except (OSError, json.JSONDecodeError):
         app.logger.exception("OpenAPI contract is unavailable")
         return _api_problem(500, "contract_unavailable", "Contract unavailable", "The OpenAPI contract could not be loaded.")
