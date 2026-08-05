@@ -4,8 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Label Check</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <style>
+    <style nonce="{{ csp_nonce() }}">
         :root {
             --primary-color: #007bff;
             --primary-dark: #0056b3;
@@ -24,7 +23,7 @@
             margin: 0;
             background: var(--light-bg);
             color: var(--text-color);
-            font-family: 'Inter', sans-serif;
+            font-family: system-ui, sans-serif;
         }
 
         .header {

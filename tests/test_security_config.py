@@ -1,4 +1,5 @@
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -14,6 +15,19 @@ import app as app_module
 
 
 class SecurityConfigurationTests(unittest.TestCase):
+    def setUp(self):
+        self._original_app_test_config = {
+            "TESTING": app_module.app.config.get("TESTING"),
+            "SECRET_KEY": app_module.app.config.get("SECRET_KEY"),
+        }
+        app_module.app.config.update(
+            TESTING=True,
+            SECRET_KEY="security-tests-secret-key",
+        )
+
+    def tearDown(self):
+        app_module.app.config.update(self._original_app_test_config)
+
     def valid_config(self):
         return {
             "SECRET_KEY": "s" * 32,
@@ -244,6 +258,105 @@ class SecurityConfigurationTests(unittest.TestCase):
                 app_module.app.config.update(original_config)
                 app_module.user_manager.users = original_users
                 app_module.api_store.configure(*original_store)
+
+    def test_login_redirect_accepts_only_root_relative_application_paths(self):
+        original_users = app_module.user_manager.users.copy()
+        user = app_module.User("redirect-user", "")
+        user.set_password("valid-password-123")
+        app_module.user_manager.users[user.id] = user
+        try:
+            cases = (
+                ("/qc?batch=case-1#slide", "/qc?batch=case-1#slide"),
+                ("https://attacker.example/phish", "/"),
+                ("//attacker.example/phish", "/"),
+                ("javascript:alert(1)", "/"),
+                ("/\\attacker.example/phish", "/"),
+                ("/safe\nLocation: https://attacker.example", "/"),
+            )
+            for supplied, expected in cases:
+                with self.subTest(next=supplied):
+                    response = app_module.app.test_client().post(
+                        "/login",
+                        data={
+                            "username": user.id,
+                            "password": "valid-password-123",
+                            "next": supplied,
+                        },
+                    )
+                    self.assertEqual(302, response.status_code)
+                    self.assertEqual(expected, response.headers["Location"])
+        finally:
+            app_module.user_manager.users = original_users
+
+    def test_login_form_preserves_only_safe_next_value(self):
+        safe_response = app_module.app.test_client().get("/login?next=/qc%3Fbatch%3Done")
+        unsafe_response = app_module.app.test_client().get(
+            "/login?next=https://attacker.example"
+        )
+
+        self.assertIn(b'name="next" value="/qc?batch=one"', safe_response.data)
+        self.assertNotIn(b'name="next"', unsafe_response.data)
+
+    def test_browser_security_headers_and_csp_nonces(self):
+        response = app_module.app.test_client().get(
+            "/login", base_url="https://label-check.example"
+        )
+
+        policy = response.headers["Content-Security-Policy"]
+        nonce_match = re.search(r"script-src 'self' 'nonce-([^']+)'", policy)
+        self.assertIsNotNone(nonce_match)
+        nonce = nonce_match.group(1)
+        self.assertIn(f"style-src 'self' 'nonce-{nonce}'", policy)
+        self.assertIn(f'<style nonce="{nonce}">'.encode(), response.data)
+        self.assertEqual("DENY", response.headers["X-Frame-Options"])
+        self.assertEqual("nosniff", response.headers["X-Content-Type-Options"])
+        self.assertEqual(
+            "strict-origin-when-cross-origin", response.headers["Referrer-Policy"]
+        )
+        self.assertEqual(
+            "max-age=31536000", response.headers["Strict-Transport-Security"]
+        )
+
+        plain_response = app_module.app.test_client().get("/missing")
+        self.assertNotIn("Strict-Transport-Security", plain_response.headers)
+        self.assertIn("Content-Security-Policy", plain_response.headers)
+
+    def test_session_cookie_is_secure_by_default_with_development_override(self):
+        original_users = app_module.user_manager.users.copy()
+        original_secure = app_module.app.config["SESSION_COOKIE_SECURE"]
+        user = app_module.User("cookie-user", "")
+        user.set_password("valid-password-123")
+        app_module.user_manager.users[user.id] = user
+        try:
+            secure_response = app_module.app.test_client().post(
+                "/login",
+                data={"username": user.id, "password": "valid-password-123"},
+                base_url="https://label-check.example",
+            )
+            secure_cookie = secure_response.headers["Set-Cookie"]
+            self.assertIn("Secure", secure_cookie)
+            self.assertIn("HttpOnly", secure_cookie)
+            self.assertIn("SameSite=Lax", secure_cookie)
+
+            app_module.app.config["SESSION_COOKIE_SECURE"] = False
+            development_response = app_module.app.test_client().post(
+                "/login",
+                data={"username": user.id, "password": "valid-password-123"},
+            )
+            self.assertNotIn("; Secure", development_response.headers["Set-Cookie"])
+        finally:
+            app_module.app.config["SESSION_COOKIE_SECURE"] = original_secure
+            app_module.user_manager.users = original_users
+
+    def test_templates_do_not_contain_csp_bypasses_or_external_fonts(self):
+        for template in (SRC_DIR / "templates").glob("*.html"):
+            contents = template.read_text(encoding="utf-8")
+            with self.subTest(template=template.name):
+                self.assertNotIn("fonts.googleapis.com", contents)
+                self.assertNotRegex(contents, r"\sstyle=")
+                self.assertNotRegex(contents, r"\son(?:click|change|load)=")
+                self.assertNotRegex(contents, r"<script(?! nonce=)")
+                self.assertNotRegex(contents, r"<style(?! nonce=)")
 
     def test_login_account_limit_combines_failures_across_addresses(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

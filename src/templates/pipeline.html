@@ -4,8 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Run Label-Check</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <style>
+    <style nonce="{{ csp_nonce() }}">
         :root {
             --primary: #007bff;
             --primary-dark: #0056b3;
@@ -18,7 +17,7 @@
             --danger: #c82333;
         }
         * { box-sizing: border-box; }
-        body { margin: 0; min-height: 100vh; background: var(--background); color: var(--text); font-family: Inter, sans-serif; }
+        body { margin: 0; min-height: 100vh; background: var(--background); color: var(--text); font-family: system-ui, sans-serif; }
         .header { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 15px 30px; color: white; background: linear-gradient(90deg, var(--primary), var(--primary-dark)); }
         .header h1 { margin: 0; font-size: 1.55rem; }
         .header nav { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
@@ -196,7 +195,7 @@
         {% endif %}
     </main>
 
-    <script>
+    <script nonce="{{ csp_nonce() }}">
         const startSelect = document.getElementById('start_from');
         const endSelect = document.getElementById('end_at');
         function updateStageRange() {

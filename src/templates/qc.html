@@ -4,8 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SVS Slide QC</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <style>
+    <style nonce="{{ csp_nonce() }}">
         :root {
             --primary-color: #007bff;
             --primary-dark: #0056b3;
@@ -29,7 +28,7 @@
 
         /* --- Modernized Look & Feel --- */
         body {
-            font-family: 'Inter', sans-serif;
+            font-family: system-ui, sans-serif;
             background-color: var(--light-bg);
             margin: 0;
             display: flex;
@@ -385,6 +384,11 @@
             line-height: 1.5;
             text-align: center;
         }
+        .queue-info.complete { border-left: 5px solid var(--success-color); }
+        .queue-info.warning { border-left: 5px solid var(--warning-color); }
+        .queue-detail { font-size: 0.85rem; color: var(--secondary-color); }
+        .form-actions .release-button { background-color: var(--warning-color); }
+        .error-message { color: var(--danger-color); font-weight: bold; margin-top: 15px; }
 
         .queue-info span {
             color: var(--primary-color);
@@ -556,16 +560,16 @@
                 </div>
 
                 {% if lease_info and lease_info.leased_by_id == current_user.id %}
-                    <div class="queue-info" style="border-left: 5px solid var(--success-color);">
+                    <div class="queue-info complete">
                         <p>
                             You have leased item with Accession ID: <b>{{ row.AccessionID }}</b>.
                         </p>
-                        <p style="font-size: 0.85rem; color: var(--secondary-color);">
+                        <p class="queue-detail">
                             This lease will expire in approximately {{ (lease_info.leased_at + timedelta(seconds=config.LEASE_DURATION_SECONDS) - datetime.utcnow()).seconds // 60 }} minutes.
                         </p>
                     </div>
                 {% elif lease_info %}
-                    <div class="queue-info" style="border-left: 5px solid var(--warning-color);">
+                    <div class="queue-info warning">
                         <p>
                             Item with Accession ID: <b>{{ row.AccessionID }}</b> is currently leased by <b>{{ lease_info.leased_by.id }}</b>.
                         </p>
@@ -621,7 +625,7 @@
                     <div class="form-actions">
                         {% if lease_info.leased_by_id == current_user.id %}
                             <button type="submit" name="action" value="next" class="nav-btn">Save and Next</button>
-                            <button type="submit" formaction="{{ url_for('release_lease') }}" formmethod="POST" class="nav-btn" style="background-color: var(--warning-color);">Release Lease</button>
+                            <button type="submit" formaction="{{ url_for('release_lease') }}" formmethod="POST" class="nav-btn release-button">Release Lease</button>
                         {% else %}
                              <a href="{{ url_for('qc', batch=batch_id) }}" class="nav-btn">Get Next Available Item</a>
                         {% endif %}
@@ -648,7 +652,7 @@
                 <div class="no-data-message">
                     <p>No data loaded or available.</p>
                     {% if error_message %}
-                        <p style="color: var(--danger-color); font-weight: bold; margin-top: 15px;">{{ error_message }}</p>
+                        <p class="error-message">{{ error_message }}</p>
                     {% endif %}
                 </div>
             {% endif %}
@@ -675,7 +679,7 @@
             </div>
         </div>
     </div>
-    <script>
+    <script nonce="{{ csp_nonce() }}">
         document.addEventListener('DOMContentLoaded', function() {
             const completeCheckbox = document.getElementById('complete');
             const nextButton = document.querySelector('button[name="action"][value="next"]');

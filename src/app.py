@@ -45,6 +45,7 @@ from collections import Counter, defaultdict
 from logging.handlers import RotatingFileHandler
 from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlsplit
 
 import click
 from container_paths import runtime_path
@@ -135,6 +136,11 @@ class Config:
     API_OUTPUT_DEFAULT_LIMIT = 16 * 1024
     API_OUTPUT_MAX_LIMIT = 64 * 1024
     CSRF_ENABLED = os.environ.get("CSRF_ENABLED", "true").lower() == "true"
+    SESSION_COOKIE_SECURE = (
+        os.environ.get("SESSION_COOKIE_SECURE", "true").strip().lower() != "false"
+    )
+    SESSION_COOKIE_HTTPONLY = True
+    SESSION_COOKIE_SAMESITE = "Lax"
     PIPELINE_INPUT_ROOTS = _environment_paths("PIPELINE_INPUT_ROOTS")
     PIPELINE_OUTPUT_ROOTS = _environment_paths("PIPELINE_OUTPUT_ROOTS")
     PIPELINE_MAX_WORKERS = int(os.environ.get("PIPELINE_MAX_WORKERS", "8"))
@@ -3565,6 +3571,33 @@ def csrf_token() -> str:
 app.jinja_env.globals["csrf_token"] = csrf_token
 
 
+def csp_nonce() -> str:
+    """Return the per-request nonce used by inline application assets."""
+    nonce = getattr(g, "csp_nonce", None)
+    if nonce is None:
+        nonce = secrets.token_urlsafe(16)
+        g.csp_nonce = nonce
+    return nonce
+
+
+app.jinja_env.globals["csp_nonce"] = csp_nonce
+
+
+def safe_login_redirect(value: Optional[str]) -> Optional[str]:
+    """Accept only root-relative paths on this application."""
+    if not value or not value.startswith("/") or value.startswith("//"):
+        return None
+    if "\\" in value or any(ord(character) < 0x20 for character in value):
+        return None
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return None
+    if parsed.scheme or parsed.netloc:
+        return None
+    return value
+
+
 def admin_required(view):
     """Require an authenticated administrator for a browser route."""
     @functools.wraps(view)
@@ -3649,7 +3682,28 @@ def _api_job_document(record: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @app.after_request
-def api_response_metadata(response):
+def response_security_metadata(response):
+    nonce = csp_nonce()
+    response.headers["Content-Security-Policy"] = "; ".join(
+        (
+            "default-src 'self'",
+            f"script-src 'self' 'nonce-{nonce}'",
+            f"style-src 'self' 'nonce-{nonce}'",
+            "img-src 'self' data:",
+            "font-src 'self'",
+            "connect-src 'self'",
+            "object-src 'none'",
+            "base-uri 'self'",
+            "frame-ancestors 'none'",
+            "form-action 'self'",
+        )
+    )
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    if request.is_secure:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000"
+
     if request.path.startswith("/api/v1/"):
         request_id = getattr(g, "request_id", uuid.uuid4().hex)
         response.headers["X-Request-ID"] = request_id
@@ -3702,6 +3756,7 @@ def api_internal_error(error):
 # ==============================================================================
 @app.before_request
 def before_request_handler():
+    g.csp_nonce = secrets.token_urlsafe(16)
     if not app.testing:
         try:
             validate_security_config()
@@ -3745,6 +3800,10 @@ def before_request_handler():
 def login():
     if current_user.is_authenticated:
         return redirect(url_for("index"))
+
+    next_url = safe_login_redirect(
+        request.form.get("next") or request.args.get("next")
+    )
     
     if request.method == "POST":
         username = request.form.get("username", "").strip()
@@ -3761,7 +3820,9 @@ def login():
         if not allowed:
             flash("Too many login attempts. Try again later.", "error")
             return (
-                render_template("login.html", messages=flash_messages()),
+                render_template(
+                    "login.html", messages=flash_messages(), next_url=next_url
+                ),
                 429,
                 {"Retry-After": str(retry_after)},
             )
@@ -3772,7 +3833,7 @@ def login():
             api_store.clear_login_failures(username, client_address)
             login_user(user)
             app.logger.info(f"User '{username}' logged in successfully.")
-            return redirect(request.args.get("next") or url_for("index"))
+            return redirect(next_url or url_for("index"))
 
         api_store.record_login_failure(
             username, client_address, app.config["LOGIN_RATE_WINDOW_SECONDS"]
@@ -3781,13 +3842,19 @@ def login():
         if not allowed:
             flash("Too many login attempts. Try again later.", "error")
             return (
-                render_template("login.html", messages=flash_messages()),
+                render_template(
+                    "login.html", messages=flash_messages(), next_url=next_url
+                ),
                 429,
                 {"Retry-After": str(retry_after)},
             )
         flash("Invalid username or password.", "error")
         
-    return render_template("login.html", messages=flash_messages())
+    return render_template(
+        "login.html",
+        messages=flash_messages(),
+        next_url=next_url,
+    )
 
 
 @app.route("/logout")

@@ -12,7 +12,7 @@
     <div class="cell"><select name="image_type">{% for value in ['WSI','FNA','XXX'] %}<option {% if group.shared.ImageType==value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
     <div class="cell"><select name="samp_acq_type">{% for value in ['RE','BP','XX'] %}<option {% if group.shared.SampAcqType==value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
     <div class="cell">{% if group.report %}<button class="report-toggle secondary" type="button" aria-expanded="false" aria-controls="reports-{{ group_key }}">View</button>{% else %}<button class="secondary" type="button" disabled>No report</button>{% endif %}</div>
-    <div class="cell approval-state">{% if group.approved %}<strong style="color:var(--success)">Approved</strong>{% else %}<span>Pending</span>{% endif %}</div>
+    <div class="cell approval-state">{% if group.approved %}<strong>Approved</strong>{% else %}<span>Pending</span>{% endif %}</div>
     <div class="cell actions">
         <button class="success approve-button" type="submit" {% if job_state.status in ('preparing','retrying') %}disabled{% endif %}>Approve</button>
         <button class="secondary retry-button" type="submit" formaction="{{ url_for('renaming_retry', batch_id=context.id) }}" {% if job_state.status in ('preparing','retrying') %}disabled{% endif %}>Retry</button>

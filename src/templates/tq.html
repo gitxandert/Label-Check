@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>TQ Transfers - Label Check</title>
-    <style>
+    <style nonce="{{ csp_nonce() }}">
         :root { --primary:#007bff; --primary-dark:#0056b3; --bg:#f7f9fb; --text:#27313d; --muted:#687482; --border:#dce2e8; --success:#218838; --danger:#b42318; }
         * { box-sizing:border-box; }
         body { margin:0; min-height:100vh; background:var(--bg); color:var(--text); font-family:Arial,sans-serif; }
@@ -25,6 +25,9 @@
         button.danger { background:var(--danger); }
         button:disabled { opacity:.55; cursor:not-allowed; }
         .actions { display:flex; align-items:center; flex-wrap:wrap; gap:10px; margin-top:16px; }
+        .destination-fields { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+        .review-actions { margin:0 0 15px; }
+        .review-filter { flex:1 1 360px; }
         .messages { padding:0; list-style:none; }
         .messages li,.notice { margin-bottom:10px; padding:11px 14px; border:1px solid #ffe69c; border-radius:7px; background:#fff3cd; }
         .messages .error,.notice.error { border-color:#f1aeb5; background:#f8d7da; }
@@ -131,7 +134,7 @@
                 </div>
                 <div class="filter-control" data-fields="AccessionDate">
                     <span class="field-label">Accession date</span>
-                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+                    <div class="destination-fields">
                         <input type="date" name="start_date" value="{{ start_date }}" aria-label="Start date">
                         <input type="date" name="end_date" value="{{ end_date }}" aria-label="End date">
                     </div>
@@ -168,8 +171,8 @@
         {% if selected_slides %}
         <form id="transfer-form" method="POST" action="{{ url_for('tq_transfer') }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            <div class="actions" style="margin:0 0 15px">
-                <div class="field" style="flex:1 1 360px">
+            <div class="actions review-actions">
+                <div class="field review-filter">
                     <label for="destination-prefix">Destination prefix</label>
                     <input id="destination-prefix" placeholder="destination" autocomplete="off">
                 </div>
@@ -290,7 +293,7 @@
     </section>
     {% endif %}
 </main>
-<script>
+<script nonce="{{ csp_nonce() }}">
 const csrfToken = {{ csrf_token()|tojson }};
 const filterSelect = document.getElementById('filter');
 const filterValue = document.getElementById('filter-value');

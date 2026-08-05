@@ -19,8 +19,6 @@ RUN mkdir -p /tmp/tq-test-home \
 
 FROM python:${PYTHON_VERSION}-slim-bookworm AS python-base
 
-ARG PYTORCH_CPU_INDEX_URL=https://download.pytorch.org/whl/cpu
-
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -56,16 +54,10 @@ WORKDIR /app
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --disable-pip-version-check --upgrade pip
 
-# EasyOCR is CPU-only in this image. Installing these first from PyTorch's CPU
-# index prevents pip from resolving the much larger CUDA dependency set.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python -m pip install --disable-pip-version-check \
-        --index-url "$PYTORCH_CPU_INDEX_URL" \
-        torch torchvision
-
 COPY requirements.txt ./requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --disable-pip-version-check \
+        --require-hashes \
         --requirement requirements.txt
 
 RUN mkdir -p "$EASYOCR_MODEL_DIR" \
@@ -76,7 +68,7 @@ RUN mkdir -p "$EASYOCR_MODEL_DIR" \
 COPY src/ ./src/
 COPY tests/ ./tests/
 COPY --chmod=0755 container/entrypoint.sh ./container/entrypoint.sh
-COPY nightly_label_check.py requirements-test.txt ./
+COPY nightly_label_check.py requirements-test.txt requirements-windows-worker.txt ./
 
 RUN sed -i 's/\r$//' /app/container/entrypoint.sh \
     && /bin/sh -n /app/container/entrypoint.sh
@@ -88,7 +80,9 @@ COPY compose.yaml ./compose.yaml
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --disable-pip-version-check \
+        --require-hashes \
         --requirement requirements-test.txt \
+    && python -m pip check \
     && python -W error::ResourceWarning -m unittest discover \
         --start-directory tests --verbose
 

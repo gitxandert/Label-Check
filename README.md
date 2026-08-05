@@ -88,6 +88,12 @@ directories. `LABEL_CHECK_STATE_HOST` must contain
 placeholder values stop application initialization. Rotating `SECRET_KEY`
 invalidates existing browser sessions.
 
+Browser sessions use `Secure`, `HttpOnly`, and `SameSite=Lax` cookies. Compose
+forces `SESSION_COOKIE_SECURE=true`. Set it to `false` only for local development
+served directly over plain HTTP; never use that override for a network-facing
+deployment. HSTS and the remaining browser security headers are emitted by the
+application when the trusted proxy reports an HTTPS request.
+
 New user passwords must contain 12–128 characters. Login failures are stored in
 the application SQLite database and limited over a 15-minute window to five per
 username/client-address pair and ten per username. Successful login clears both
@@ -183,7 +189,8 @@ Create the worker environment once from the repository root in PowerShell:
 ```powershell
 py -m venv .venv-copath-worker
 .\.venv-copath-worker\Scripts\python.exe -m pip install --upgrade pip
-.\.venv-copath-worker\Scripts\python.exe -m pip install -r requirements-windows-worker.txt
+.\.venv-copath-worker\Scripts\python.exe -m pip install --require-hashes -r requirements-windows-worker.txt
+.\.venv-copath-worker\Scripts\python.exe -m pip check
 ```
 
 Start the worker manually after Windows sign-in, before preparing or retrying a
@@ -194,6 +201,29 @@ batch:
   --queue "$env:LABEL_CHECK_STATE_HOST\copath-query" `
   --connection-string-file "$env:COPATH_CONNECTION_STRING_FILE_HOST"
 ```
+
+### Python dependency locks
+
+The `.in` files contain direct dependencies. The corresponding `.txt` files are
+generated locks with exact versions and SHA-256 hashes; edit only the inputs.
+Regenerate Linux locks in a clean Python 3.12 environment:
+
+```bash
+python -m pip install uv==0.8.15
+uv pip compile --python-version 3.12 --python-platform x86_64-unknown-linux-gnu --torch-backend cpu --index https://download.pytorch.org/whl/cpu --generate-hashes --emit-index-url --output-file requirements.txt requirements.in
+uv pip compile --python-version 3.12 --python-platform x86_64-unknown-linux-gnu --generate-hashes --emit-index-url --output-file requirements-test.txt requirements-test.in
+```
+
+Regenerate the worker lock on Windows with Python 3.12:
+
+```powershell
+py -3.12 -m pip install uv==0.8.15
+py -3.12 -m uv pip compile --python-version 3.12 --python-platform x86_64-pc-windows-msvc --generate-hashes --emit-index-url --output-file requirements-windows-worker.txt requirements-windows-worker.in
+```
+
+Review all version changes, commit inputs and generated locks together, then run
+the unit tests and Docker test target. Install locks only with
+`--require-hashes`; `pip check` must report no broken requirements.
 
 If those values are stored only in `.env`, substitute their actual Windows
 paths in the command. The worker writes a heartbeat every five seconds, accepts

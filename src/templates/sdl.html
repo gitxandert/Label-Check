@@ -4,8 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Slide Digitization Log</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <style>
+    <style nonce="{{ csp_nonce() }}">
         :root {
             --primary: #007bff;
             --primary-dark: #0056b3;
@@ -25,7 +24,7 @@
             margin: 0;
             background: var(--light);
             color: var(--text);
-            font-family: 'Inter', sans-serif;
+            font-family: system-ui, sans-serif;
         }
 
         .header {
@@ -288,12 +287,11 @@
                         <button type="submit">{{ 'Save changes' if edit_row else 'Add entry' }}</button>
                         {% if edit_row %}
                             <button
-                                class="danger"
+                                class="danger confirm-delete"
                                 type="submit"
                                 name="delete"
                                 value="1"
                                 formnovalidate
-                                onclick="return confirm('Delete this Slide Digitization Log row? This cannot be undone.');"
                             >Delete</button>
                             <a class="button-link secondary" href="{{ url_for('sdl') }}">Cancel</a>
                         {% endif %}
@@ -416,10 +414,15 @@
             </section>
         {% endif %}
     </main>
-    <script>
+    <script nonce="{{ csp_nonce() }}">
         let tableSearchTimer;
         let tableSearchRequest;
         const tableControls = document.getElementById('sdl-table-controls');
+        document.querySelector('.confirm-delete')?.addEventListener('click', (event) => {
+            if (!window.confirm('Delete this Slide Digitization Log row? This cannot be undone.')) {
+                event.preventDefault();
+            }
+        });
 
         async function updateTable(targetUrl) {
             tableSearchRequest?.abort();
