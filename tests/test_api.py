@@ -42,7 +42,8 @@ class PipelineAPITests(unittest.TestCase):
         app_module.user_manager.users[self.admin.id] = self.admin
         app_module.app.config.update(
             TESTING=True,
-            SECRET_KEY="api-test-secret",
+            SECRET_KEY="api-test-secret-0123456789abcdef",
+            ADMIN_DEFAULT_PASSWORD="api-test-admin-password",
             API_REQUIRE_HTTPS=True,
             API_SUBMIT_RATE_LIMIT=100,
             API_READ_RATE_LIMIT=100,

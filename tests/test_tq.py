@@ -150,11 +150,18 @@ class TQTransferTests(unittest.TestCase):
 
         self.old_users = app_module.user_manager.users.copy()
         self.user = app_module.User("tq-user", "", False)
+        self.admin = app_module.User("tq-admin", "", is_admin=True)
         app_module.user_manager.users[self.user.id] = self.user
+        app_module.user_manager.users[self.admin.id] = self.admin
         app_module.app.config.update(TESTING=True, SECRET_KEY="tq-test")
         self.client = app_module.app.test_client()
         with self.client.session_transaction() as session:
             session["_user_id"] = self.user.id
+            session["_fresh"] = True
+
+    def login_as(self, user):
+        with self.client.session_transaction() as session:
+            session["_user_id"] = user.id
             session["_fresh"] = True
 
     def tearDown(self):
@@ -392,9 +399,29 @@ class TQTransferTests(unittest.TestCase):
         self.assertIn(b"2026-07-24", logs_response.data)
         self.assertIn(b"transfer.log", date_response.data)
         self.assertIn(b"transfer complete", file_response.data)
-        self.assertIn(b"Edit Config", root_response.data)
+        self.assertNotIn(b"Edit Config", root_response.data)
+
+        self.login_as(self.admin)
+        admin_response = self.client.get("/tq/logs")
+        self.assertIn(b"Edit Config", admin_response.data)
+
+    def test_config_editor_rejects_non_admin_without_changing_file(self):
+        original = (self.tq_home / "config.toml").read_text(encoding="utf-8")
+
+        get_response = self.client.get("/tq/config")
+        post_response = self.client.post(
+            "/tq/config", data={"config_text": 'username = "attacker"\n'}
+        )
+
+        self.assertEqual(403, get_response.status_code)
+        self.assertEqual(403, post_response.status_code)
+        self.assertEqual(
+            original,
+            (self.tq_home / "config.toml").read_text(encoding="utf-8"),
+        )
 
     def test_config_editor_validates_and_atomically_saves_toml(self):
+        self.login_as(self.admin)
         valid = (
             'username = "new-user"\n'
             'ftp_addr = "new.example"\n'

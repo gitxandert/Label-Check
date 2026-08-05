@@ -14,6 +14,7 @@ fi
 
 case "$command_name" in
     web)
+        python -m flask --app app.py validate-security
         python -m flask --app app.py init-db
         exec python -m waitress --host=0.0.0.0 --port="$PORT" app:app
         ;;

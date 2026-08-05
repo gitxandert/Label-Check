@@ -53,6 +53,7 @@ import renaming
 # Flask and its extensions for web framework, user management
 from flask import (
     Flask,
+    abort,
     flash,
     get_flashed_messages,
     g,
@@ -85,9 +86,7 @@ class Config:
     """Central configuration class for the Flask application."""
 
     # A secret key is required for session management and security.
-    SECRET_KEY = os.environ.get(
-        "SECRET_KEY", "a-super-secret-key-that-you-should-change"
-    )
+    SECRET_KEY = os.environ.get("SECRET_KEY")
 
     # --- Path Configuration ---
     # Robustly determine the project root directory.
@@ -149,9 +148,7 @@ class Config:
     COPATH_CLONE = os.environ.get("COPATH_CLONE", "D:\\copath_clone")
 
     # Default password for the initial 'admin' user.
-    ADMIN_DEFAULT_PASSWORD = os.environ.get(
-        "ADMIN_DEFAULT_PASSWORD", "change_this_password"
-    )
+    ADMIN_DEFAULT_PASSWORD = os.environ.get("ADMIN_DEFAULT_PASSWORD")
 
     # --- Queue Settings ---
     # The duration (in seconds) a user can hold a "lease" on a queue item before it's
@@ -234,6 +231,44 @@ class InventoryReadError(Exception):
 
 class TQError(Exception):
     pass
+
+
+class SecurityConfigurationError(Exception):
+    pass
+
+
+_INSECURE_SECRET_KEYS = {
+    "a-super-secret-key-that-you-should-change",
+    "replace-with-a-long-random-value",
+}
+_INSECURE_ADMIN_PASSWORDS = {
+    "change_this_password",
+    "replace-before-first-start",
+}
+
+
+def validate_security_config(configuration: Optional[Dict[str, Any]] = None) -> None:
+    """Reject missing, weak, or documented-placeholder production credentials."""
+    if configuration is None:
+        configuration = app.config
+    errors = []
+    secret_key = configuration.get("SECRET_KEY")
+    admin_password = configuration.get("ADMIN_DEFAULT_PASSWORD")
+
+    if not isinstance(secret_key, str) or len(secret_key) < 32:
+        errors.append("SECRET_KEY must contain at least 32 characters")
+    elif secret_key in _INSECURE_SECRET_KEYS:
+        errors.append("SECRET_KEY must not use a documented placeholder or legacy default")
+
+    if not isinstance(admin_password, str) or len(admin_password) < 12:
+        errors.append("ADMIN_DEFAULT_PASSWORD must contain at least 12 characters")
+    elif admin_password in _INSECURE_ADMIN_PASSWORDS:
+        errors.append(
+            "ADMIN_DEFAULT_PASSWORD must not use a documented placeholder or legacy default"
+        )
+
+    if errors:
+        raise SecurityConfigurationError("; ".join(errors))
 
 
 def _utcnow() -> datetime.datetime:
@@ -3276,6 +3311,18 @@ def csrf_token() -> str:
 app.jinja_env.globals["csrf_token"] = csrf_token
 
 
+def admin_required(view):
+    """Require an authenticated administrator for a browser route."""
+    @functools.wraps(view)
+    @login_required
+    def wrapped(*args, **kwargs):
+        if not current_user.is_admin:
+            abort(403)
+        return view(*args, **kwargs)
+
+    return wrapped
+
+
 def _api_problem(status: int, code: str, title: str, detail: str):
     response = jsonify(
         {
@@ -3401,6 +3448,13 @@ def api_internal_error(error):
 # ==============================================================================
 @app.before_request
 def before_request_handler():
+    if not app.testing:
+        try:
+            validate_security_config()
+        except SecurityConfigurationError as exc:
+            app.logger.critical("Invalid security configuration: %s", exc)
+            return "Server security configuration is invalid.", 500
+
     if request.path.startswith("/api/v1/"):
         supplied_request_id = request.headers.get("X-Request-ID", "")
         g.request_id = (
@@ -3787,7 +3841,7 @@ def tq_logs():
 
 
 @app.route("/tq/config", methods=["GET", "POST"])
-@login_required
+@admin_required
 def tq_edit_config():
     config_path = Path(Config.TQ_HOME_DIR).expanduser() / "config.toml"
     if request.method == "POST":
@@ -3795,6 +3849,9 @@ def tq_edit_config():
         try:
             _save_tq_config(contents)
         except (TQError, OSError) as exc:
+            app.logger.warning(
+                "TQ_CONFIG_UPDATE user_id=%s status=failed", current_user.id
+            )
             flash(str(exc), "error")
             return render_template(
                 "tq_config.html",
@@ -3802,6 +3859,9 @@ def tq_edit_config():
                 config_text=contents,
                 messages=flash_messages(),
             )
+        app.logger.info(
+            "TQ_CONFIG_UPDATE user_id=%s status=succeeded", current_user.id
+        )
         flash("config.toml was saved successfully.", "success")
         return redirect(url_for("tq_edit_config"))
 
@@ -5134,6 +5194,16 @@ def api_openapi_document():
 # ==============================================================================
 # 12. CLI COMMANDS
 # ==============================================================================
+@app.cli.command("validate-security")
+def validate_security_command():
+    """Validate required production credentials without printing their values."""
+    try:
+        validate_security_config()
+    except SecurityConfigurationError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo("Security configuration is valid.")
+
+
 @app.cli.group("api-token")
 def api_token_cli():
     """Manage scoped personal access tokens for the pipeline API."""
@@ -5203,12 +5273,16 @@ def rotate_api_token(token_id: str, expires_days: int):
 @app.cli.command("init-db")
 @with_appcontext
 def init_db_command():
+    try:
+        validate_security_config()
+    except SecurityConfigurationError as exc:
+        raise click.ClickException(str(exc)) from exc
     print("--- Initializing App Persistence (CSV) ---")
     
     # Init Users
     if not user_manager.get("admin"):
         u = User(id="admin", password_hash="", is_admin=True)
-        u.set_password(Config.ADMIN_DEFAULT_PASSWORD)
+        u.set_password(app.config["ADMIN_DEFAULT_PASSWORD"])
         user_manager.add(u)
         print(f"Created default 'admin' user in {Config.USERS_CSV_PATH}")
     else:
@@ -5223,4 +5297,9 @@ def init_db_command():
 
 
 if __name__ == "__main__":
+    try:
+        validate_security_config()
+    except SecurityConfigurationError as exc:
+        print(f"Invalid security configuration: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
     app.run(debug=True, host="0.0.0.0")

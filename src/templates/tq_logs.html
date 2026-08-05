@@ -37,7 +37,7 @@
             <li>{% if not loop.last %}<a href="{{ url_for('tq_logs', path=crumb.path) }}">{{ crumb.name }}</a>{% else %}<span>{{ crumb.name }}</span>{% endif %}</li>
             {% endfor %}
         </ol>
-        <a class="button-link" href="{{ url_for('tq_edit_config') }}">Edit Config</a>
+        {% if current_user.is_admin %}<a class="button-link" href="{{ url_for('tq_edit_config') }}">Edit Config</a>{% endif %}
     </div>
     <div class="layout">
         <aside class="card">

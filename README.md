@@ -53,7 +53,9 @@ Cargo nor GCC.
   Docker's Linux VM mounts this share directly; no Windows drive mapping is
   required.
 - A dedicated TQ configuration directory containing `config.toml` and a
-  dedicated SSH directory containing `id_ed25519` or `id_rsa`.
+  dedicated SSH directory containing `id_ed25519` or `id_rsa` plus a
+  `known_hosts` file with the approved SFTP server host key. TQ rejects unknown
+  or changed server keys; it never learns them automatically.
 - Python 3.10 or newer and Microsoft ODBC Driver 18 for SQL Server installed on
   the signed-in Windows workstation for the CoPath worker.
 - A one-line CoPath ODBC connection string stored outside this repository. The
@@ -65,6 +67,20 @@ Cargo nor GCC.
 Copy `.env.example` to `.env`, replace all placeholders, and create the host
 directories. `LABEL_CHECK_STATE_HOST` must contain
 `Slide_Digitization_Log.xlsx` before SDL workflows run.
+
+`SECRET_KEY` must contain at least 32 characters and
+`ADMIN_DEFAULT_PASSWORD` at least 12. Missing, weak, legacy-default, or example
+placeholder values stop application initialization. Rotating `SECRET_KEY`
+invalidates existing browser sessions.
+
+Obtain the SFTP server's SHA-256 host-key fingerprint through a trusted
+out-of-band channel. After verifying it, place the corresponding OpenSSH
+`known_hosts` entry in `${SSH_HOME_HOST}\known_hosts`. `ssh-keyscan` output must
+not be trusted until its fingerprint has been independently verified.
+
+Only Label-Check administrators can view or edit the global TQ connection
+configuration. Authenticated operators can continue transferring approved
+slides through that administrator-managed destination.
 
 The GT450 CIFS password is stored in the gitignored `.env` file and in local
 Docker volume metadata. Restrict Docker access to trusted administrators and do
