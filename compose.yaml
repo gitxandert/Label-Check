@@ -54,5 +54,5 @@ volumes:
     driver: local
     driver_opts:
       type: cifs
-      device: "//${GT450_SMB_SERVER:-chp.clarian.org}/app"
-      o: "addr=${GT450_SMB_SERVER:-chp.clarian.org},username=${GT450_SMB_USERNAME:?Set GT450_SMB_USERNAME},password=${GT450_SMB_PASSWORD:?Set GT450_SMB_PASSWORD},domain=${GT450_SMB_DOMAIN:?Set GT450_SMB_DOMAIN},vers=${GT450_SMB_VERSION:-3.0},prefixpath=Philips_Slide_Images/GT450_Images,ro,uid=10001,gid=10001,file_mode=0444,dir_mode=0555"
+      device: "//${GT450_SMB_SERVER:?Set GT450_SMB_SERVER}/${GT450_SMB_SHARE:?Set GT450_SMB_SHARE}/${GT450_SMB_SUBDIR:-GT450_Images}"
+      o: "addr=${GT450_SMB_ADDRESS:?Set GT450_SMB_ADDRESS},username=${GT450_SMB_USERNAME:?SetGT450_SMB_USERNAME},password=${GT450_SMB_PASSWORD:?Set GT450_SMB_PASSWORD},domain=${GT450_SMB_DOMAIN:?SetGT450_SMB_DOMAIN},vers=${GT450_SMB_VERSION:-3.1.1},sec=ntlmssp,ro,uid=10001,gid=10001,file_mode=0444,dir_mode=0555,nosharesock"
