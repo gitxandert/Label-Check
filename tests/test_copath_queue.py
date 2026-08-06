@@ -171,6 +171,29 @@ class QueueClientTests(unittest.TestCase):
             )
         thread.join()
 
+    def test_patient_history_scope_accepts_valid_associated_accessions(self):
+        def respond(request_path):
+            payload = copath_queue.read_json(request_path)
+            result = self.paths["results"] / f"{payload['request_id']}.csv"
+            with result.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["accession_id", "mrn"])
+                writer.writeheader()
+                writer.writerows([
+                    {"accession_id": "NP25-100", "mrn": "MRN1"},
+                    {"accession_id": "SP20-5", "mrn": "MRN1"},
+                ])
+
+        thread = self.run_responder(respond)
+        copath_queue.submit_query(
+            self.root, ["NP25-100"], self.output, 2,
+            poll_interval=0.005, scope="patient_history",
+        )
+        thread.join()
+        _, rows = copath_queue.validate_result_csv(
+            self.output, ["NP25-100"], "patient_history"
+        )
+        self.assertEqual({"NP25-100", "SP20-5"}, {row["accession_id"] for row in rows})
+
     def test_timeout_cancels_unclaimed_request(self):
         with self.assertRaisesRegex(copath_queue.QueueProtocolError, "Timed out"):
             copath_queue.submit_query(

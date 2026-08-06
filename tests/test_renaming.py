@@ -84,8 +84,10 @@ class RenamingDataTests(unittest.TestCase):
 
         renaming.finalize_batch(self.batch, self.clone)
 
-        _, index_rows = renaming.read_csv(self.clone / "all_accessions.csv")
-        self.assertEqual([{"AccessionID": "NP25-100", "Organ": "UNKNOWN"}], index_rows)
+        _, index_rows = renaming.read_csv(self.clone / "all_iuh_identifiers.csv")
+        self.assertIn({
+            "AccessionID": "NP25-100", "Organ": "UNKNOWN", "MRN": "", "PID": "AAAAAA",
+        }, index_rows)
         unknown_path = self.clone / "UNKNOWN" / "copath_data.csv"
         self.assertTrue(unknown_path.exists())
         headers, unknown_rows = renaming.read_csv(unknown_path)
@@ -98,13 +100,90 @@ class RenamingDataTests(unittest.TestCase):
         accession_org, rows_by_organ, headers_by_organ = renaming._clone_rows(empty_clone)
 
         self.assertEqual({}, accession_org)
-        index_headers, index_rows = renaming.read_csv(empty_clone / "all_accessions.csv")
-        self.assertEqual(["AccessionID", "Organ"], index_headers)
+        index_headers, index_rows = renaming.read_csv(empty_clone / "all_iuh_identifiers.csv")
+        self.assertEqual(list(renaming.IDENTIFIER_FIELDS), index_headers)
         self.assertEqual([], index_rows)
         for organ in renaming.ORGANS:
             self.assertEqual([], rows_by_organ[organ])
             self.assertEqual(list(renaming.COPATH_FIELDS), headers_by_organ[organ])
             self.assertTrue((empty_clone / organ / "copath_data.csv").is_file())
+
+    def test_legacy_identifier_index_is_merged_and_recoverably_retired(self):
+        renaming.initialize_clone(self.clone)
+
+        self.assertFalse((self.clone / "all_accessions.csv").exists())
+        self.assertTrue(
+            (self.clone / "migration_backups" / "identifier_indexes" / "all_accessions.csv").exists()
+        )
+        fields, rows = renaming.read_csv(self.clone / "all_iuh_identifiers.csv")
+        self.assertEqual(list(renaming.IDENTIFIER_FIELDS), fields)
+        self.assertIn({
+            "AccessionID": "NP24-1", "Organ": "BRAIN", "MRN": "MRN1", "PID": "AAAAAZ",
+        }, rows)
+
+    def test_longitudinal_history_is_staged_logged_and_committed_after_approval(self):
+        def initial(_batch, accessions, output):
+            self.assertEqual(["NP25-100"], list(accessions))
+            write_csv(output, ["accession_id", "mrn", "accession_date", "sample_acquisition_type", "report"], [{
+                "accession_id": "NP25-100", "mrn": "MRN2", "accession_date": "2025-03-04",
+                "sample_acquisition_type": "Brain resection", "report": "Seed",
+            }])
+
+        def history(_batch, accessions, output):
+            self.assertEqual(["NP25-100"], list(accessions))
+            write_csv(output, ["accession_id", "mrn", "accession_date", "sample_acquisition_type", "report"], [
+                {"accession_id": "NP25-100", "mrn": "MRN2", "accession_date": "2025-03-04", "sample_acquisition_type": "Brain resection", "report": "Seed"},
+                {"accession_id": "SP20-5", "mrn": "MRN2", "accession_date": "2020-01-02", "sample_acquisition_type": "Breast biopsy", "report": "History"},
+            ])
+
+        renaming.prepare_batch(self.batch, self.clone, self.batch_base, initial)
+        self.assertEqual("pending", renaming.read_history_job(self.batch)["status"])
+        renaming.stage_longitudinal_history(
+            self.batch, self.clone, self.batch_base, history
+        )
+        _, staged = renaming.read_csv(self.batch / "pending_CoPath_history.csv")
+        breast = next(row for row in staged if row["accession_id"] == "SP20-5")
+        self.assertEqual(("BREAST", "BP", "20200102"), (
+            breast["organ"], breast["_sampacqtype"], breast["_accdate"],
+        ))
+        _, log = renaming.read_csv(self.batch / "copath_longitudinal_jobs.csv")
+        self.assertEqual("NONE", log[0]["Error"])
+
+        _, mapping = renaming.read_csv(self.batch / "name_mapping.csv")
+        for row in mapping:
+            row["Approved"] = "True"
+        renaming.atomic_write(self.batch / "name_mapping.csv", renaming.MAPPING_FIELDS, mapping)
+        renaming.finalize_batch(self.batch, self.clone)
+
+        _, identifiers = renaming.read_csv(self.clone / "all_iuh_identifiers.csv")
+        self.assertEqual({"NP25-100", "SP20-5", "NP24-1"}, {
+            row["AccessionID"] for row in identifiers
+        })
+        self.assertEqual("committed", renaming.read_history_job(self.batch)["status"])
+
+    def test_longitudinal_log_records_error_then_retry(self):
+        def initial(_batch, _accessions, output):
+            write_csv(output, ["accession_id", "mrn"], [{
+                "accession_id": "NP25-100", "mrn": "MRN2",
+            }])
+
+        renaming.prepare_batch(self.batch, self.clone, self.batch_base, initial)
+        with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+            renaming.stage_longitudinal_history(
+                self.batch, self.clone, self.batch_base,
+                lambda *_args: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+            )
+        _, failed = renaming.read_csv(self.batch / "copath_longitudinal_jobs.csv")
+        self.assertEqual("ERROR: database unavailable", failed[0]["Error"])
+
+        def retry(_batch, _accessions, output):
+            write_csv(output, ["accession_id", "mrn"], [{
+                "accession_id": "NP25-100", "mrn": "MRN2",
+            }])
+
+        renaming.stage_longitudinal_history(self.batch, self.clone, self.batch_base, retry)
+        _, retried = renaming.read_csv(self.batch / "copath_longitudinal_jobs.csv")
+        self.assertEqual("RETRY", retried[0]["Error"])
 
     def test_update_group_rejects_stale_signature_and_merges_to_target(self):
         rows = []
@@ -343,7 +422,7 @@ class RenamingPageTests(unittest.TestCase):
 
         self.assertEqual(302, response.status_code)
         self.assertEqual("QC,Renamed\nTrue,True\n", (self.batch / "completed_stages.csv").read_text())
-        _, index_rows = renaming.read_csv(self.clone / "all_accessions.csv")
+        _, index_rows = renaming.read_csv(self.clone / "all_iuh_identifiers.csv")
         self.assertEqual("NP25-100", index_rows[0]["AccessionID"])
         _, clone_rows = renaming.read_csv(self.clone / "BRAIN" / "copath_data.csv")
         self.assertEqual("AAAAAA", clone_rows[0]["PID"])

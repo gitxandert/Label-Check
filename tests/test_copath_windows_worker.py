@@ -68,6 +68,31 @@ class WorkerTests(unittest.TestCase):
         )
         self.assertFalse((self.worker.paths["work"] / first).exists())
 
+    def test_patient_history_scope_reaches_runner_and_allows_associated_rows(self):
+        observed = []
+        def runner(accessions, output, _work_dir, scope):
+            observed.append((list(accessions), scope))
+            with output.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["accession_id", "mrn"])
+                writer.writeheader()
+                writer.writerows([
+                    {"accession_id": "NP25-100", "mrn": "MRN1"},
+                    {"accession_id": "SP20-5", "mrn": "MRN1"},
+                ])
+        worker = copath_windows_worker.CoPathWindowsWorker(
+            self.root, self.connection_file, runner
+        )
+        request_id = "8" * 32
+        copath_queue.atomic_write_json(worker.paths["requests"] / f"{request_id}.json", {
+            "version": copath_queue.PROTOCOL_VERSION,
+            "request_id": request_id,
+            "created_at": copath_queue.format_utc(copath_queue.utc_now()),
+            "accessions": ["NP25-100"],
+            "scope": "patient_history",
+        })
+        self.assertTrue(worker.run_once())
+        self.assertEqual([(["NP25-100"], "patient_history")], observed)
+
     def test_invalid_request_publishes_safe_error(self):
         request_id = "3" * 32
         self.publish(request_id, ["../secret"])

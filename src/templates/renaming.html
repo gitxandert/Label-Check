@@ -61,6 +61,19 @@
         {% for warning in discovery_warnings %}<li>{{ warning }}</li>{% endfor %}
     </ul>
 
+    {% if history_failures %}
+    <div class="notice">
+        <strong>Longitudinal CoPath jobs needing attention</strong>
+        {% for batch, history in history_failures %}
+        <div>{{ batch.display_name }}: {{ history.get('error', 'Unknown error') }}
+            <form class="inline-form" method="post" action="{{ url_for('renaming_history_retry', batch_id=batch.id) }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">Retry history</button>
+            </form>
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+
     {% if not context %}
         <h2>Choose a QC-complete batch</h2>
         {% if batches %}
@@ -76,6 +89,9 @@
         {% else %}<p class="empty">No QC-complete batches are waiting for renaming.</p>{% endif %}
     {% else %}
         <div class="toolbar"><h2>{{ context.display_name }}</h2><span class="state" id="job-state">{{ job_state.status|default('ready')|title }}</span></div>
+        {% if history_job is defined and history_job.status in ('pending','running','staged') %}
+            <div class="notice">Longitudinal CoPath history: {{ history_job.status|title }}. Renaming may continue.</div>
+        {% endif %}
         {% if job_state.status in ('preparing','retrying') %}
             <div class="notice">CoPath {{ job_state.status }} is running. This page will refresh when it finishes.</div>
         {% elif job_state.status == 'failed' %}

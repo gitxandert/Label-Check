@@ -238,6 +238,29 @@ acc_query = """
   ) ap;
 """
 
+# Patient-history queries use verified accession IDs as seeds, then expand to every
+# specimen for the same CoPath patient/client pair. Keeping the rest of acc_query
+# identical ensures exact and longitudinal exports have the same columns.
+_EXACT_MATCH_SQL = """  FROM c_specimen s
+  JOIN #input_accessions i
+      ON i.numwheel_id = s.numwheel_id
+     AND i.specnum_year = s.specnum_year
+     AND i.specnum_num = s.specnum_num;"""
+_HISTORY_MATCH_SQL = """  FROM c_specimen seed
+  JOIN #input_accessions i
+      ON i.numwheel_id = seed.numwheel_id
+     AND i.specnum_year = seed.specnum_year
+     AND i.specnum_num = seed.specnum_num
+  JOIN c_specimen s
+      ON s.patdemog_id = seed.patdemog_id
+     AND (
+          s.client_id = seed.client_id
+          OR (s.client_id IS NULL AND seed.client_id IS NULL)
+     );"""
+patient_history_query = acc_query.replace(_EXACT_MATCH_SQL, _HISTORY_MATCH_SQL, 1)
+if patient_history_query == acc_query:
+    raise RuntimeError("could not construct patient-history CoPath query")
+
 mrn_query = """
   SET NOCOUNT ON;
   DROP TABLE IF EXISTS #input_ids;
@@ -690,6 +713,8 @@ def format_query(insert_statements, id_type):
             return format_report_query(acc_query, insert_statements)
         case 'mrn':
             return format_report_query(mrn_query, insert_statements)
+        case 'history':
+            return format_report_query(patient_history_query, insert_statements)
 
 
 def build_query_output(ids, id_type, batch_size, separate_queries):
@@ -709,10 +734,10 @@ def build_query_output(ids, id_type, batch_size, separate_queries):
     return "\n\n".join(query_blocks)
 
 
-def build_accession_query_output(accessions, batch_size, separate_queries):
+def build_accession_query_output(accessions, batch_size, separate_queries, id_type='accession'):
     if not separate_queries:
         insert_statements = format_accession_insert_statements(accessions, batch_size)
-        return format_query(insert_statements, 'accession')
+        return format_query(insert_statements, id_type)
 
     query_blocks = []
     accession_chunks = chunk_ids(accessions, batch_size)
@@ -720,7 +745,7 @@ def build_accession_query_output(accessions, batch_size, separate_queries):
 
     for idx, chunk in enumerate(accession_chunks, start=1):
         insert_statement = format_accession_insert_statement(chunk)
-        query_block = format_query(insert_statement, 'accession')
+        query_block = format_query(insert_statement, id_type)
         query_blocks.append(f"-- Batch {idx} of {total_chunks}\n{query_block}")
 
     return "\n\n".join(query_blocks)
@@ -737,7 +762,7 @@ if __name__ == "__main__":
     parser.add_argument(
             "-i", "--id_type",
             help="The type of patient identifier to search by ('accession' or 'mrn')",
-            choices=['accession', 'mrn'],
+            choices=['accession', 'mrn', 'history'],
             required=True
     )
     parser.add_argument(
@@ -776,7 +801,7 @@ if __name__ == "__main__":
 
     try:
         normalized_ids = normalize_ids(ids)
-        if args.id_type == 'accession':
+        if args.id_type in ('accession', 'history'):
             valid_accessions, invalid_accessions = split_valid_invalid_accessions(normalized_ids)
             invalid_accessions_csv = write_invalid_accessions_csv(invalid_accessions)
             if not valid_accessions:
@@ -785,6 +810,7 @@ if __name__ == "__main__":
                 valid_accessions,
                 batch_size,
                 args.separate_queries,
+                args.id_type,
             )
         else:
             formatted_query = build_query_output(

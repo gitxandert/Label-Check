@@ -184,6 +184,19 @@ The queue contains accessions and report data. Restrict the entire
 Desktop service account, and administrators. Do not share it broadly or use a
 world-writable network directory.
 
+Renaming uses two CoPath query scopes. Exact-accession requests run first and
+make the batch available for review. When an exact result identifies an MRN not
+yet present in `/data/copath-clone/all_iuh_identifiers.csv`, a lower-priority
+longitudinal request retrieves that patient's other accessions in the
+background. Results remain in the batch as `pending_CoPath_history.csv` until
+all batch PIDs are approved. Each batch records longitudinal outcomes in
+`copath_longitudinal_jobs.csv` with `AccessionID`, `MRN`, and `Error` columns;
+errors are `NONE`, `RETRY`, or `ERROR: <details>`.
+
+The clone identifier index has columns `AccessionID`, `Organ`, `MRN`, and
+`PID`. PID identity is scoped to `(MRN, Organ)`. Legacy `all_accessions.csv`
+data is migrated into this unified index using the organ CoPath files.
+
 Create the worker environment once from the repository root in PowerShell:
 
 ```powershell

@@ -44,7 +44,7 @@ import uuid
 from collections import Counter, defaultdict
 from logging.handlers import RotatingFileHandler
 from pathlib import Path, PureWindowsPath
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from urllib.parse import urlsplit
 
 import click
@@ -1381,6 +1381,8 @@ batch_contexts_lock = threading.Lock()
 _renaming_jobs: Dict[str, Dict[str, Any]] = {}
 _renaming_jobs_lock = threading.Lock()
 _renaming_clone_lock = threading.Lock()
+_longitudinal_active: set = set()
+_longitudinal_lock = threading.Lock()
 
 
 def _batch_id(root: Path) -> str:
@@ -1493,6 +1495,48 @@ def _renaming_job_state(batch_id: str) -> Dict[str, Any]:
         return dict(_renaming_jobs.get(batch_id, {"status": "idle", "error": ""}))
 
 
+def _start_longitudinal_job(context: BatchContext, *, force: bool = False) -> bool:
+    try:
+        job = renaming.read_history_job(context.root)
+    except renaming.RenamingError:
+        app.logger.exception("Invalid longitudinal job for batch %s", context.id)
+        return False
+    status = str(job.get("status", "not_needed"))
+    if status not in ({"failed", "pending", "running"} if force else {"pending", "running"}):
+        return False
+    with _longitudinal_lock:
+        if context.id in _longitudinal_active:
+            return False
+        _longitudinal_active.add(context.id)
+
+    def worker() -> None:
+        try:
+            renaming.stage_longitudinal_history(
+                context.root,
+                Path(Config.COPATH_CLONE),
+                Path(Config.LABEL_CHECK_BATCHES),
+            )
+            mapping_path = context.root / "name_mapping.csv"
+            if mapping_path.exists():
+                _, rows = renaming.read_csv(mapping_path)
+                if rows and all(renaming.parse_bool(row["Approved"]) for row in rows):
+                    with _renaming_clone_lock:
+                        renaming.finalize_batch(context.root, Path(Config.COPATH_CLONE))
+        except Exception:
+            app.logger.exception("Longitudinal CoPath job failed for batch %s", context.id)
+        finally:
+            with _longitudinal_lock:
+                _longitudinal_active.discard(context.id)
+
+    threading.Thread(target=worker, daemon=True).start()
+    return True
+
+
+def _resume_longitudinal_jobs(batches: Sequence[BatchContext]) -> None:
+    for context in batches:
+        _start_longitudinal_job(context)
+
+
 def _start_renaming_job(
     context: BatchContext,
     *,
@@ -1540,6 +1584,8 @@ def _start_renaming_job(
             state = {"status": "failed", "error": str(exc)}
         with _renaming_jobs_lock:
             _renaming_jobs[context.id] = state
+        if state["status"] == "ready":
+            _start_longitudinal_job(context)
 
     threading.Thread(target=worker, daemon=True).start()
     return True
@@ -2104,7 +2150,8 @@ def _post_qc_sdl_rows(
             mapping_organs[accession] = organ
 
     clone_organs: Dict[str, str] = {}
-    clone_index = Path(Config.COPATH_CLONE) / "all_accessions.csv"
+    renaming.initialize_clone(Path(Config.COPATH_CLONE))
+    clone_index = Path(Config.COPATH_CLONE) / "all_iuh_identifiers.csv"
     if clone_index.exists():
         _, clone_rows = renaming.read_csv(clone_index)
         clone_organs = {
@@ -4242,7 +4289,20 @@ def tq_edit_config():
 @app.route("/renaming", methods=["GET"])
 @login_required
 def renaming_page():
-    batches, discovery_warnings = _renaming_batches()
+    all_batches, discovery_warnings = discover_batches()
+    _resume_longitudinal_jobs(all_batches)
+    batches = [
+        batch for batch in all_batches
+        if batch.completed_stages["QC"] and not batch.completed_stages["Renamed"]
+    ]
+    history_failures = []
+    for batch in all_batches:
+        try:
+            history = renaming.read_history_job(batch.root)
+        except renaming.RenamingError as exc:
+            history = {"status": "failed", "error": str(exc)}
+        if history.get("status") == "failed":
+            history_failures.append((batch, history))
     if request.args.get("choose") == "1":
         session.pop("renaming_batch_id", None)
     requested = request.args.get("batch") or session.get("renaming_batch_id")
@@ -4260,6 +4320,7 @@ def renaming_page():
             discovery_warnings=discovery_warnings,
             messages=flash_messages(),
             job_states={batch.id: _renaming_job_state(batch.id) for batch in batches},
+            history_failures=history_failures,
         )
 
     session["renaming_batch_id"] = context.id
@@ -4279,10 +4340,12 @@ def renaming_page():
     except renaming.RenamingError as exc:
         flash(str(exc), "error")
         groups, signature = [], ""
+    history_job = renaming.read_history_job(context.root)
     return render_template(
         "renaming.html", batches=batches, context=context, groups=groups,
         signature=signature, discovery_warnings=discovery_warnings,
         messages=flash_messages(), job_state=_renaming_job_state(context.id),
+        history_job=history_job, history_failures=history_failures,
     )
 
 
@@ -4294,7 +4357,22 @@ def renaming_status(batch_id: str):
         return jsonify({"status": "unavailable", "error": "Batch not found."}), 404
     state = _renaming_job_state(batch_id)
     state["ready"] = (context.root / "name_mapping.csv").exists()
+    state["history"] = renaming.read_history_job(context.root)
     return jsonify(state)
+
+
+@app.route("/renaming/history/retry/<batch_id>", methods=["POST"])
+@login_required
+def renaming_history_retry(batch_id: str):
+    batches, _ = discover_batches()
+    context = next((batch for batch in batches if batch.id == batch_id), None)
+    if context is None or not context.completed_stages["QC"]:
+        flash("Batch history job is unavailable.", "warning")
+    elif _start_longitudinal_job(context, force=True):
+        flash("Longitudinal CoPath retry started.", "info")
+    else:
+        flash("Longitudinal CoPath job is already running or has no work.", "warning")
+    return redirect(url_for("renaming_page", batch=batch_id))
 
 
 @app.route("/renaming/prepare/<batch_id>", methods=["POST"])
@@ -4408,6 +4486,20 @@ def renaming_approve(batch_id: str):
             )
             if pid_error:
                 raise renaming.RenamingError(pid_error)
+            if mrn:
+                for other in current_rows:
+                    other_accession = renaming.row_accession(other)
+                    if other_accession == old_accession:
+                        continue
+                    other_mrn = reports.get(other_accession, {}).get("mrn", "").strip()
+                    if (
+                        other_mrn == mrn
+                        and other.get("Organ", "").strip().upper() == values["Organ"]
+                        and other.get("PID", "").strip().upper() != values["PID"]
+                    ):
+                        raise renaming.RenamingError(
+                            f"MRN {mrn} must use one PID within {values['Organ']}"
+                        )
         slide_values: Dict[str, Dict[str, str]] = {}
         try:
             slide_count = int(request.form.get("slide_count", "0"))

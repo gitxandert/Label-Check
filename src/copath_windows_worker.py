@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import inspect
 import os
 import shutil
 import subprocess
@@ -43,7 +44,7 @@ class WorkerJobError(RuntimeError):
         self.safe_message = safe_message
 
 
-QueryRunner = Callable[[Sequence[str], Path, Path], None]
+QueryRunner = Callable[..., None]
 
 
 def _remove_work_path(path: Path) -> None:
@@ -104,7 +105,10 @@ class CoPathWindowsWorker:
         except (FileNotFoundError, QueueProtocolError, OSError):
             pass
 
-    def _run_query_cli(self, accessions: Sequence[str], output_path: Path, work_dir: Path) -> None:
+    def _run_query_cli(
+        self, accessions: Sequence[str], output_path: Path, work_dir: Path,
+        scope: str = "exact_accession",
+    ) -> None:
         input_path = work_dir / "accessions.csv"
         with input_path.open("x", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=["AccessionID"])
@@ -115,7 +119,8 @@ class CoPathWindowsWorker:
         environment["COPATH_CONNECTION_STRING_FILE"] = str(self.connection_string_file)
         result = subprocess.run(
             [
-                sys.executable, str(script), str(input_path), "-i", "accession",
+                sys.executable, str(script), str(input_path), "-i",
+                "history" if scope == "patient_history" else "accession",
                 "-c", "AccessionID", "-o", str(output_path),
             ],
             cwd=work_dir,
@@ -198,7 +203,7 @@ class CoPathWindowsWorker:
         work_dir = self.paths["work"] / request_id
         try:
             payload = read_json(claimed)
-            _, created_at, accessions = validate_request(payload, request_id)
+            _, created_at, accessions, scope = validate_request(payload, request_id)
             if (created_at - utc_now()).total_seconds() > FUTURE_CLOCK_SKEW_SECONDS:
                 raise WorkerJobError("invalid_request", "The request creation time is invalid.")
             if (
@@ -210,9 +215,12 @@ class CoPathWindowsWorker:
                 _remove_work_path(work_dir)
             work_dir.mkdir()
             output_path = work_dir / "result.csv"
-            self.query_runner(accessions, output_path, work_dir)
+            if len(inspect.signature(self.query_runner).parameters) >= 4:
+                self.query_runner(accessions, output_path, work_dir, scope)
+            else:
+                self.query_runner(accessions, output_path, work_dir)
             try:
-                validate_result_csv(output_path, accessions)
+                validate_result_csv(output_path, accessions, scope)
             except QueueProtocolError as exc:
                 raise WorkerJobError(
                     "invalid_result", "The CoPath query returned an invalid result."
@@ -235,7 +243,14 @@ class CoPathWindowsWorker:
                 _remove_work_path(work_dir)
 
     def claim_one(self) -> Optional[Path]:
-        for request in sorted(self.paths["requests"].glob("*.json")):
+        requests = list(self.paths["requests"].glob("*.json"))
+        def priority(path: Path) -> tuple:
+            try:
+                payload = read_json(path)
+                return (payload.get("scope") == "patient_history", payload.get("created_at", ""), path.name)
+            except Exception:
+                return (False, "", path.name)
+        for request in sorted(requests, key=priority):
             if not REQUEST_ID_PATTERN.fullmatch(request.stem) or request.is_symlink():
                 continue
             claimed = self.paths["processing"] / request.name
