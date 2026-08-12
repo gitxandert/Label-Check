@@ -31,13 +31,10 @@ also checked in as `src/openapi.json`.
 API traffic is limited per token to five submissions and 60 reads per minute.
 When TLS terminates at one trusted reverse proxy, set
 `API_TRUST_PROXY_HEADERS=true`; otherwise forwarded scheme headers are ignored.
-The supplied Compose deployment publishes port 5000 on `127.0.0.1` only. A
-reverse proxy on the Docker host must expose HTTPS port 443 to network clients,
-discard client-supplied forwarding headers, and set `X-Forwarded-For` and
-`X-Forwarded-Proto`. Network clients can reach Label-Check through HTTPS, but
-cannot bypass the proxy through plaintext port 5000. For a containerized proxy,
-remove the published application port and connect both services through a
-private Docker network instead.
+The supplied Compose deployment runs Caddy as that proxy and publishes only
+HTTPS port 443. Caddy sets the forwarding headers, while application port 5000
+remains private to the Compose network. Network clients therefore cannot bypass
+the proxy over plaintext HTTP.
 
 Pipeline paths are restricted after path translation and symbolic-link
 resolution. `PIPELINE_INPUT_ROOTS` and `PIPELINE_OUTPUT_ROOTS` contain
@@ -76,8 +73,10 @@ Cargo nor GCC.
 - A one-line CoPath ODBC connection string stored outside this repository. The
   Windows worker uses native integrated authentication; it contains no username
   or password.
-- An external reverse proxy terminating HTTPS and forwarding the request scheme
-  to port 5000.
+- A stable machine hostname that coworkers' devices can resolve on the
+  organization network.
+- Inbound TCP port 443 permitted by the Windows firewall and organization
+  network policy.
 
 Copy `.env.example` to `.env`, replace all placeholders, and create the host
 directories. `LABEL_CHECK_STATE_HOST` must contain
@@ -93,6 +92,12 @@ forces `SESSION_COOKIE_SECURE=true`. Set it to `false` only for local developmen
 served directly over plain HTTP; never use that override for a network-facing
 deployment. HSTS and the remaining browser security headers are emitted by the
 application when the trusted proxy reports an HTTPS request.
+
+Compose uses Caddy's internal certificate authority because the organization
+does not supply the deployment certificate. Each authorized client must trust
+the generated root certificate before using the app. Protect and back up the
+`label-check-caddy-data` volume: it contains the local CA private key. Deleting
+that volume creates a new CA and requires every client to trust the replacement.
 
 New user passwords must contain 12–128 characters. Login failures are stored in
 the application SQLite database and limited over a 15-minute window to five per
@@ -256,6 +261,46 @@ same ODBC connection. It should show the signed-in personal domain account.
 docker compose up -d
 docker compose ps
 ```
+
+Set `LABEL_CHECK_HOSTNAME` in `.env` to the machine's existing network hostname.
+After the first startup, export Caddy's root CA certificate to the current
+user's Downloads directory:
+
+```powershell
+docker compose cp caddy:/data/caddy/pki/authorities/local/root.crt `
+  "$env:USERPROFILE\Downloads\label-check-local-ca.crt"
+```
+
+On the host and each authorized coworker's Windows device, import
+`label-check-local-ca.crt` into **Trusted Root Certification Authorities** for
+the current user. Treat the certificate as trusted software and distribute it
+through an authenticated channel. Do not distribute anything else from the
+Caddy data volume, especially `root.key`.
+
+```powershell
+Import-Certificate `
+  -FilePath "$env:USERPROFILE\Downloads\label-check-local-ca.crt" `
+  -CertStoreLocation Cert:\CurrentUser\Root
+```
+
+Restart the browser after importing the certificate. If a browser uses its own
+certificate store, import the same root certificate there as well.
+
+Confirm that the hostname resolves to the Docker host and that HTTPS is
+reachable, then open the app:
+
+```powershell
+$labelCheckHostname = "replace-with-configured-hostname"
+Resolve-DnsName $labelCheckHostname
+Test-NetConnection $labelCheckHostname -Port 443
+Start-Process "https://$labelCheckHostname"
+```
+
+Use the exact hostname configured in `LABEL_CHECK_HOSTNAME`; an IP address or a
+different alias will fail certificate validation. Port 80 is intentionally not
+published, so include `https://` in the URL. If name resolution or inbound port
+443 is blocked, ask IT to add the hostname/firewall allowance. Application port
+5000 should remain unreachable from the host and other network devices.
 
 Verify that the SMB mount contains the expected scanner directories and is
 read-only for the application user:

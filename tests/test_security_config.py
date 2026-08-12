@@ -44,10 +44,29 @@ class SecurityConfigurationTests(unittest.TestCase):
     def test_valid_credentials_are_accepted(self):
         app_module.validate_security_config(self.valid_config())
 
-    def test_compose_exposes_application_only_on_loopback(self):
+    def test_compose_exposes_only_https_proxy(self):
         compose = (SRC_DIR.parent / "compose.yaml").read_text(encoding="utf-8")
-        self.assertIn('"127.0.0.1:${HOST_PORT:-5000}:5000"', compose)
-        self.assertNotIn('- "${HOST_PORT:-5000}:5000"', compose)
+        caddyfile = (SRC_DIR.parent / "container" / "caddy" / "Caddyfile").read_text(
+            encoding="utf-8"
+        )
+        label_check_service = compose.split("  label-check:", 1)[1].split(
+            "\n  caddy:", 1
+        )[0]
+        caddy_service = compose.split("  caddy:", 1)[1].split("\nvolumes:", 1)[0]
+
+        self.assertNotIn('"127.0.0.1:${HOST_PORT:-5000}:5000"', compose)
+        self.assertNotIn("ports:", label_check_service)
+        self.assertIn('expose:\n      - "5000"', label_check_service)
+        self.assertIn('- "443:443"', caddy_service)
+        self.assertIn(
+            "LABEL_CHECK_HOSTNAME: ${LABEL_CHECK_HOSTNAME:?Set LABEL_CHECK_HOSTNAME}",
+            caddy_service,
+        )
+        self.assertIn("condition: service_healthy", compose)
+        self.assertIn("label-check-caddy-data", compose)
+        self.assertIn("https://{$LABEL_CHECK_HOSTNAME}", caddyfile)
+        self.assertIn("tls internal", caddyfile)
+        self.assertIn("reverse_proxy label-check:5000", caddyfile)
 
     def test_missing_and_short_credentials_are_rejected_without_values(self):
         cases = [

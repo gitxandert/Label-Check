@@ -27,8 +27,8 @@ services:
       COPATH_QUERY_QUEUE: ${COPATH_QUERY_QUEUE:-/data/state/copath-query}
       COPATH_QUERY_TIMEOUT_SECONDS: ${COPATH_QUERY_TIMEOUT_SECONDS:-300}
       PORT: "5000"
-    ports:
-      - "127.0.0.1:${HOST_PORT:-5000}:5000"
+    expose:
+      - "5000"
     volumes:
       - type: volume
         source: gt450-images
@@ -56,7 +56,33 @@ services:
         read_only: true
     restart: unless-stopped
 
+  caddy:
+    image: caddy:2.11.4-alpine
+    environment:
+      LABEL_CHECK_HOSTNAME: ${LABEL_CHECK_HOSTNAME:?Set LABEL_CHECK_HOSTNAME}
+    depends_on:
+      label-check:
+        condition: service_healthy
+    ports:
+      - "443:443"
+    volumes:
+      - type: bind
+        source: ./container/caddy
+        target: /etc/caddy
+        read_only: true
+      - type: volume
+        source: caddy-data
+        target: /data
+      - type: volume
+        source: caddy-config
+        target: /config
+    restart: unless-stopped
+
 volumes:
+  caddy-data:
+    name: label-check-caddy-data
+  caddy-config:
+    name: label-check-caddy-config
   gt450-images:
     name: label-check-gt450-images
     driver: local
