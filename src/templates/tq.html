@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TQ Transfers - Label Check</title>
+    <title>Transfers - Label Check</title>
     <style nonce="{{ csp_nonce() }}">
         :root { --primary:#007bff; --primary-dark:#0056b3; --bg:#f7f9fb; --text:#27313d; --muted:#687482; --border:#dce2e8; --success:#218838; --danger:#b42318; }
         * { box-sizing:border-box; }
@@ -67,7 +67,7 @@
 </head>
 <body>
 <header>
-    <h1>TQ Transfers</h1>
+    <h1>Transfers</h1>
     <nav>
         <a href="{{ url_for('index') }}">Home</a>
         <a href="{{ url_for('tq_logs') }}">Show Logs</a>
@@ -173,10 +173,10 @@
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <div class="actions review-actions">
                 <div class="field review-filter">
-                    <label for="destination-prefix">Destination prefix</label>
-                    <input id="destination-prefix" placeholder="destination" autocomplete="off">
+                    <label for="destination-dir">Batch destination directory</label>
+                    <input id="destination-dir" name="destination_dir" value="{{ destination_dir }}" required placeholder="destination" autocomplete="off">
+                    <span class="muted">Slides stage together in D:\image_staging\&lt;destination&gt; before deidentification and upload.</span>
                 </div>
-                <button id="apply-prefix" type="button">Apply to all</button>
             </div>
             <div class="table-wrap">
                 <table class="review-table">
@@ -187,8 +187,7 @@
                         <td><code>{{ slide.original_path }}</code></td>
                         <td>
                             <div class="destination">
-                                <input class="prefix-input" name="prefix_{{ slide.id }}" data-slide-id="{{ slide.id }}" value="{{ prefixes.get(slide.id, '') }}" required placeholder="destination">
-                                <span class="suffix">/{{ slide.organ }}/{{ slide.pid }}</span>
+                                <code><span class="destination-dir-preview">{{ destination_dir or 'destination' }}</span>/{{ slide.organ }}/{{ slide.pid }}</code>
                             </div>
                         </td>
                         <td><code>{{ slide.destination_name }}</code></td>
@@ -288,7 +287,7 @@
             <h2>Transfer output</h2>
             <span id="job-status" class="status {{ job.status }}">{{ job.status }}</span>
         </div>
-        <pre id="console" aria-label="TQ transfer output"></pre>
+        <pre id="console" aria-label="Transfer output"></pre>
         {% if job.log_path %}<p class="muted">Transfer log: <code>{{ job.log_path }}</code></p>{% endif %}
     </section>
     {% endif %}
@@ -378,23 +377,19 @@ document.getElementById('review-form')?.addEventListener('submit', () => {
 });
 updateAllParents();
 
-const applyPrefix = document.getElementById('apply-prefix');
-function savePrefixes() {
-    const prefixes = Object.fromEntries(Array.from(document.querySelectorAll('.prefix-input')).map(
-        (input) => [input.dataset.slideId,input.value]
-    ));
+const destinationDir = document.getElementById('destination-dir');
+function saveDestinationDir() {
+    const value = destinationDir.value;
+    document.querySelectorAll('.destination-dir-preview').forEach((preview) => {
+        preview.textContent = value || 'destination';
+    });
     fetch({{ url_for('tq_save_draft')|tojson }}, {
         method:'POST',
         headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken},
-        body:JSON.stringify({prefixes,phase:'review'})
+        body:JSON.stringify({destination_dir:value,phase:'review'})
     }).catch(() => {});
 }
-applyPrefix?.addEventListener('click', () => {
-    const value = document.getElementById('destination-prefix').value;
-    document.querySelectorAll('.prefix-input').forEach((input) => { input.value = value; });
-    savePrefixes();
-});
-document.querySelectorAll('.prefix-input').forEach((input) => input.addEventListener('change', savePrefixes));
+destinationDir?.addEventListener('input', saveDestinationDir);
 
 {% if job %}
 const consoleElement = document.getElementById('console');

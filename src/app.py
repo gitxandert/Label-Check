@@ -2578,11 +2578,11 @@ def _tq_windows_safe_component(value: str) -> bool:
 
 
 def _tq_staging_path(slide: Dict[str, str]) -> Path:
-    destination_dir = slide.get("destination_dir", "")
-    parts = destination_dir.split("/")
+    staging_dir = slide.get("staging_dir", "")
+    parts = staging_dir.split("/")
     if (
-        not destination_dir
-        or "\\" in destination_dir
+        not staging_dir
+        or "\\" in staging_dir
         or any(not part or part in {".", ".."} for part in parts)
         or any(not _tq_windows_safe_component(part) for part in parts)
     ):
@@ -2619,13 +2619,17 @@ def _tq_staging_path(slide: Dict[str, str]) -> Path:
 
 def _tq_prepare_staging_paths(slides: List[Dict[str, str]]) -> None:
     seen = set()
+    staging_directories = set()
     for slide in slides:
         target = _tq_staging_path(slide)
         normalized = str(target).casefold()
         if normalized in seen:
             raise TQError(f"Duplicate staging destination: {target}")
         seen.add(normalized)
+        staging_directories.add(str(target.parent).casefold())
         slide["staged_path"] = str(target)
+    if len(staging_directories) != 1:
+        raise TQError("All selected slides must use one staging batch directory.")
 
 
 def _tq_transfer_log_root() -> Path:
@@ -3228,6 +3232,20 @@ def _tq_download_slides(job: TQJob) -> None:
             job.result_errors[slide["original_path"]] = message
             raise TQError(message) from exc
 
+    staging_directory = Path(job.slides[0]["staged_path"]).parent
+    selected_paths = {
+        Path(slide["staged_path"]).resolve() for slide in job.slides
+    }
+    unexpected = sorted(
+        path for path in staging_directory.rglob("*.svs")
+        if path.resolve() not in selected_paths
+    )
+    if unexpected:
+        raise TQError(
+            "Staging batch folder contains an unselected slide: "
+            f"{_tq_staging_display_path(unexpected[0])}"
+        )
+
 
 def _tq_temporary_csv(prefix: str) -> Path:
     directory = Path(Config.INSTANCE_DIR) / "tq_manifests"
@@ -3253,26 +3271,20 @@ def _tq_stream_process_output(job: TQJob, process: subprocess.Popen) -> None:
 
 
 def _tq_deidentify_slides(job: TQJob) -> None:
-    input_list = _tq_temporary_csv("deidentify-input-")
     output_log = _tq_temporary_csv("deidentify-results-")
     try:
-        with input_list.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=("file_path",))
-            writer.writeheader()
-            writer.writerows(
-                {"file_path": slide["staged_path"]} for slide in job.slides
-            )
+        staging_directory = Path(job.slides[0]["staged_path"]).parent
         _tq_append_output(
             job,
             f"All {len(job.slides)} selected slide(s) downloaded.\n"
-            "Starting deidentify_anonymize.py.\n",
+            "Starting deidentify_anonymize.py on "
+            f"{_tq_staging_display_path(staging_directory)}.\n",
         )
         command = [
             sys.executable,
             "-u",
             str(Path(deidentify_anonymize.__file__).resolve()),
-            "--input-list",
-            str(input_list),
+            str(staging_directory),
             "--output-log",
             str(output_log),
         ]
@@ -3302,7 +3314,6 @@ def _tq_deidentify_slides(job: TQJob) -> None:
             )
         _tq_append_output(job, "deidentify_anonymize.py completed successfully.\n")
     finally:
-        input_list.unlink(missing_ok=True)
         output_log.unlink(missing_ok=True)
 
 
@@ -4274,11 +4285,12 @@ def tq_page():
     owner_id = str(current_user.id)
     with _tq_state_lock:
         draft = _tq_drafts.setdefault(
-            owner_id, {"selected_ids": set(), "prefixes": {}, "phase": "select"}
+            owner_id,
+            {"selected_ids": set(), "destination_dir": "", "phase": "select"},
         )
         draft_snapshot = {
             "selected_ids": set(draft["selected_ids"]),
-            "prefixes": dict(draft["prefixes"]),
+            "destination_dir": str(draft.get("destination_dir", "")),
             "phase": draft["phase"],
         }
     catalog_by_id = {slide["id"]: slide for slide in all_slides}
@@ -4307,7 +4319,7 @@ def tq_page():
         filter_error=filter_error,
         selected_ids=draft_snapshot["selected_ids"],
         selected_slides=selected_slides,
-        prefixes=draft_snapshot["prefixes"],
+        destination_dir=draft_snapshot["destination_dir"],
         review=review,
         job=job,
         discovery_warnings=discovery_warnings,
@@ -4329,7 +4341,7 @@ def tq_review():
     with _tq_state_lock:
         draft = _tq_drafts.setdefault(
             str(current_user.id),
-            {"selected_ids": set(), "prefixes": {}, "phase": "select"},
+            {"selected_ids": set(), "destination_dir": "", "phase": "select"},
         )
         draft["selected_ids"] = selected_ids
         draft["phase"] = "review"
@@ -4343,12 +4355,12 @@ def tq_save_draft():
     if not isinstance(payload, dict):
         return jsonify({"success": False, "message": "Invalid draft request."}), 400
     selected_ids = payload.get("selected_ids")
-    prefixes = payload.get("prefixes")
+    destination_dir = payload.get("destination_dir")
     phase = payload.get("phase")
     with _tq_state_lock:
         draft = _tq_drafts.setdefault(
             str(current_user.id),
-            {"selected_ids": set(), "prefixes": {}, "phase": "select"},
+            {"selected_ids": set(), "destination_dir": "", "phase": "select"},
         )
         if selected_ids is not None:
             if not isinstance(selected_ids, list) or any(
@@ -4360,17 +4372,12 @@ def tq_save_draft():
                     {"success": False, "message": "Invalid slide selection."}
                 ), 400
             draft["selected_ids"] = set(selected_ids)
-        if prefixes is not None:
-            if not isinstance(prefixes, dict) or any(
-                not isinstance(key, str) or not isinstance(value, str)
-                for key, value in prefixes.items()
-            ):
+        if destination_dir is not None:
+            if not isinstance(destination_dir, str):
                 return jsonify(
                     {"success": False, "message": "Invalid destination draft."}
                 ), 400
-            draft["prefixes"].update(
-                {key: value[:500] for key, value in prefixes.items()}
-            )
+            draft["destination_dir"] = destination_dir[:500]
         if phase in {"select", "review"}:
             draft["phase"] = phase
     return jsonify({"success": True})
@@ -4402,18 +4409,18 @@ def tq_transfer():
     if not selected:
         flash("The transfer draft no longer contains any available slides.", "error")
         return redirect(url_for("tq_page"))
-    prefixes: Dict[str, str] = {}
+    destination_value = request.form.get("destination_dir", "")
     try:
+        staging_dir = _tq_safe_prefix(destination_value)
         for slide in selected:
-            prefix = request.form.get(f"prefix_{slide['id']}", "")
-            prefixes[slide["id"]] = _tq_safe_prefix(prefix)
-            slide["destination_dir"] = _tq_destination_dir(prefix, slide)
+            slide["staging_dir"] = staging_dir
+            slide["destination_dir"] = _tq_destination_dir(staging_dir, slide)
         job = _start_tq_job(owner_id, selected, all_slides)
     except TQError as exc:
         flash(str(exc), "error")
         with _tq_state_lock:
             if draft:
-                draft["prefixes"].update(prefixes)
+                draft["destination_dir"] = destination_value[:500]
                 draft["phase"] = "review"
         return redirect(url_for("tq_page", view="review"))
     session["tq_job_id"] = job.id

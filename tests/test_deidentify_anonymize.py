@@ -14,26 +14,20 @@ sys.path.insert(0, str(SRC_DIR))
 import deidentify_anonymize
 
 
-class DeidentifyInputListTests(unittest.TestCase):
-    def test_input_list_processes_exact_files_and_returns_failure(self):
+class DeidentifyFolderTests(unittest.TestCase):
+    def test_folder_processes_all_slides_and_returns_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             first = root / "first.svs"
             second = root / "second.svs"
-            input_list = root / "input.csv"
             output_log = root / "results.csv"
-            with input_list.open("w", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(handle, fieldnames=("file_path",))
-                writer.writeheader()
-                writer.writerows(
-                    ({"file_path": str(first)}, {"file_path": str(second)})
-                )
+            first.touch()
+            second.touch()
 
             output = io.StringIO()
             arguments = [
                 "deidentify_anonymize.py",
-                "--input-list",
-                str(input_list),
+                str(root),
                 "--output-log",
                 str(output_log),
             ]

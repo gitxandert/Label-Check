@@ -208,7 +208,7 @@ class TQTransferTests(unittest.TestCase):
         response = self.client.get("/tq?filter=PID&filter_value=AAAAAA")
 
         self.assertEqual(200, response.status_code)
-        self.assertIn(b"TQ Transfers", response.data)
+        self.assertIn(b"Transfers", response.data)
         self.assertIn(b"Review Transfer", response.data)
         self.assertIn(b"AAAAAA", response.data)
 
@@ -262,7 +262,7 @@ class TQTransferTests(unittest.TestCase):
         ) as start:
             response = self.client.post(
                 "/tq/transfer",
-                data={f"prefix_{slides[0]['id']}": "destination"},
+                data={"destination_dir": "destination"},
             )
 
         self.assertEqual(302, response.status_code)
@@ -272,6 +272,7 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual(
             "destination/BRAIN/AAAAAA", launched[0]["destination_dir"]
         )
+        self.assertEqual("destination", launched[0]["staging_dir"])
         with self.client.session_transaction() as session:
             self.assertEqual("job-id", session["tq_job_id"])
 
@@ -352,6 +353,7 @@ class TQTransferTests(unittest.TestCase):
         selected[0]["destination_dir"] = app_module._tq_destination_dir(
             "destination", selected[0]
         )
+        selected[0]["staging_dir"] = "destination"
         reader = mock.Mock()
         with mock.patch.object(
             app_module.threading, "Thread", return_value=reader
@@ -362,8 +364,6 @@ class TQTransferTests(unittest.TestCase):
             str(
                 Path(app_module.Config.IMAGE_STAGING_ROOT)
                 / "destination"
-                / "BRAIN"
-                / "AAAAAA"
                 / selected[0]["destination_name"]
             ),
             selected[0]["staged_path"],
@@ -382,6 +382,7 @@ class TQTransferTests(unittest.TestCase):
         slide["destination_dir"] = app_module._tq_destination_dir(
             "StudyA", slide
         )
+        slide["staging_dir"] = "StudyA"
         app_module._tq_prepare_staging_paths([slide])
         job = app_module.TQJob(
             "stage-success", self.user.id, None, [slide], [slide]
@@ -392,9 +393,8 @@ class TQTransferTests(unittest.TestCase):
             self.assertNotIn("shell", kwargs)
             self.assertNotIn("cwd", kwargs)
             if "deidentify_anonymize.py" in command[2]:
-                input_list = Path(command[command.index("--input-list") + 1])
-                with input_list.open("r", newline="", encoding="utf-8") as handle:
-                    staged_path = next(csv.DictReader(handle))["file_path"]
+                staging_directory = Path(command[3])
+                staged_path = str(next(staging_directory.glob("*.svs")))
                 self.assertEqual(
                     b"identifiable-slide", Path(staged_path).read_bytes()
                 )
@@ -460,6 +460,7 @@ class TQTransferTests(unittest.TestCase):
             slide["destination_dir"] = app_module._tq_destination_dir(
                 "StudyA", slide
             )
+            slide["staging_dir"] = "StudyA"
         app_module._tq_prepare_staging_paths(slides)
         job = app_module.TQJob(
             "stage-failure", self.user.id, None, slides, slides
@@ -497,11 +498,12 @@ class TQTransferTests(unittest.TestCase):
         slides = [dict(slide) for slide in self.catalog()]
         for slide in slides:
             slide["destination_dir"] = "StudyA/BRAIN/AAAAAA"
+            slide["staging_dir"] = "StudyA"
             slide["destination_name"] = "same.svs"
         with self.assertRaisesRegex(app_module.TQError, "Duplicate"):
             app_module._tq_prepare_staging_paths(slides)
 
-        slides[0]["destination_dir"] = "../outside"
+        slides[0]["staging_dir"] = "../outside"
         with self.assertRaisesRegex(app_module.TQError, "cannot be used"):
             app_module._tq_staging_path(slides[0])
 
