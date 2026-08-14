@@ -49,6 +49,7 @@ from urllib.parse import urlsplit
 
 import click
 from container_paths import runtime_path
+import deidentify_anonymize
 import renaming
 
 # Flask and its extensions for web framework, user management
@@ -169,6 +170,10 @@ class Config:
     )
     TQ_HOME_DIR = os.environ.get("TQ_HOME_DIR", str(Path.home() / ".tq"))
     TQ_TRANSFER_LOG_DIR = os.environ.get("TQ_TRANSFER_LOG_DIR", "")
+    IMAGE_STAGING_ROOT = os.environ.get(
+        "IMAGE_STAGING_ROOT",
+        r"D:\image_staging" if os.name == "nt" else "/data/image-staging",
+    )
 
 
     # Path to scanner inventories
@@ -2512,10 +2517,10 @@ class TQJob:
         self,
         job_id: str,
         owner_id: str,
-        process: subprocess.Popen,
+        process: Optional[subprocess.Popen],
         slides: List[Dict[str, str]],
         all_slides: List[Dict[str, str]],
-        manifest_path: Path,
+        manifest_path: Optional[Path] = None,
     ):
         self.id = job_id
         self.owner_id = owner_id
@@ -2530,6 +2535,84 @@ class TQJob:
         self.result_errors: Dict[str, str] = {}
         self.started_at = datetime.datetime.now().astimezone()
         self.log_path: Optional[Path] = None
+
+
+def _tq_append_output(job: TQJob, message: str) -> None:
+    with _tq_state_lock:
+        job.output += message
+
+
+def _tq_staging_root() -> Path:
+    return Path(Config.IMAGE_STAGING_ROOT).expanduser().resolve()
+
+
+def _tq_windows_safe_component(value: str) -> bool:
+    reserved = {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{number}" for number in range(1, 10)),
+        *(f"LPT{number}" for number in range(1, 10)),
+    }
+    stem = value.split(".", 1)[0].upper()
+    return (
+        not any(character in value for character in '<>:"|?*')
+        and not any(ord(character) < 32 for character in value)
+        and not value.endswith((" ", "."))
+        and stem not in reserved
+    )
+
+
+def _tq_staging_path(slide: Dict[str, str]) -> Path:
+    destination_dir = slide.get("destination_dir", "")
+    parts = destination_dir.split("/")
+    if (
+        not destination_dir
+        or "\\" in destination_dir
+        or any(not part or part in {".", ".."} for part in parts)
+        or any(not _tq_windows_safe_component(part) for part in parts)
+    ):
+        raise TQError("Destination directory cannot be used for staging.")
+
+    destination_name = slide.get("destination_name", "")
+    if (
+        not destination_name
+        or destination_name in {".", ".."}
+        or Path(destination_name).name != destination_name
+        or any(separator in destination_name for separator in ("/", "\\"))
+        or Path(destination_name).suffix.casefold() != ".svs"
+        or not _tq_windows_safe_component(destination_name)
+    ):
+        raise TQError("Destination name must be one .svs filename.")
+
+    root = _tq_staging_root()
+    target = root.joinpath(*parts, destination_name)
+    resolved = target.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise TQError("Staging path is outside the configured staging root.") from exc
+
+    current = root
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            raise TQError(f"Staging path cannot contain a symbolic link: {current}")
+    if target.is_symlink():
+        raise TQError(f"Staging file cannot be a symbolic link: {target}")
+    return target
+
+
+def _tq_prepare_staging_paths(slides: List[Dict[str, str]]) -> None:
+    seen = set()
+    for slide in slides:
+        target = _tq_staging_path(slide)
+        normalized = str(target).casefold()
+        if normalized in seen:
+            raise TQError(f"Duplicate staging destination: {target}")
+        seen.add(normalized)
+        slide["staged_path"] = str(target)
 
 
 def _tq_transfer_log_root() -> Path:
@@ -2907,8 +2990,11 @@ def _tq_write_manifest(slides: List[Dict[str, str]]) -> Path:
             writer.writeheader()
             writer.writerows(
                 {
-                    key: slide[key]
-                    for key in ("original_path", "destination_dir", "destination_name")
+                    "original_path": slide.get(
+                        "staged_path", slide["original_path"]
+                    ),
+                    "destination_dir": slide["destination_dir"],
+                    "destination_name": slide["destination_name"],
                 }
                 for slide in slides
             )
@@ -3034,11 +3120,15 @@ def _tq_parse_result_line(job: TQJob, line: str) -> None:
         return
     if not isinstance(result, dict) or "original_path" not in result:
         return
-    original_path = result.get("original_path")
+    reported_path = result.get("original_path")
     success = result.get("success")
     error = result.get("error")
-    expected = {slide["original_path"] for slide in job.slides}
-    if isinstance(original_path, str) and original_path in expected:
+    expected = {
+        slide.get("staged_path", slide["original_path"]): slide["original_path"]
+        for slide in job.slides
+    }
+    original_path = expected.get(reported_path) if isinstance(reported_path, str) else None
+    if original_path is not None:
         if original_path in job.results or original_path in job.result_errors:
             job.results.pop(original_path, None)
             job.result_errors[original_path] = (
@@ -3053,8 +3143,7 @@ def _tq_parse_result_line(job: TQJob, line: str) -> None:
             )
             return
     if (
-        not isinstance(original_path, str)
-        or original_path not in expected
+        original_path is None
         or not isinstance(success, bool)
         or (not success and not isinstance(error, str))
     ):
@@ -3065,11 +3154,115 @@ def _tq_parse_result_line(job: TQJob, line: str) -> None:
     }
 
 
+def _tq_prune_empty_staging_directories(path: Path) -> None:
+    root = _tq_staging_root()
+    current = path.parent
+    while current != root:
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        current = current.parent
+
+
+def _tq_cleanup_successful_staging(job: TQJob) -> None:
+    for slide in job.slides:
+        result = job.results.get(slide["original_path"])
+        staged_value = slide.get("staged_path")
+        if not staged_value or not result or not result["success"]:
+            continue
+        staged_path = Path(staged_value)
+        try:
+            staged_path.unlink(missing_ok=True)
+            _tq_prune_empty_staging_directories(staged_path)
+            _tq_append_output(job, f"\nRemoved staged file {staged_path}.\n")
+        except OSError as exc:
+            app.logger.warning("Could not remove staged slide %s: %s", staged_path, exc)
+            _tq_append_output(
+                job, f"\nUploaded successfully, but staged file could not be removed: {exc}\n"
+            )
+
+
+def _tq_stage_and_deidentify(job: TQJob) -> None:
+    for index, slide in enumerate(job.slides, start=1):
+        source = Path(slide["original_path"])
+        target = Path(slide["staged_path"])
+        try:
+            if not source.is_file():
+                raise TQError(f"Source slide is not a regular file: {source}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _tq_staging_path(slide)
+            temporary = target.with_name(
+                f".{target.stem}.{uuid.uuid4().hex}.copying{target.suffix}"
+            )
+            _tq_append_output(
+                job,
+                f"[{index}/{len(job.slides)}] Staging {source} as {target}.\n",
+            )
+            try:
+                shutil.copy2(source, temporary)
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+            _tq_append_output(job, f"[{index}/{len(job.slides)}] Deidentifying {target}.\n")
+            if deidentify_anonymize.anonymize_slide(str(target)) != 0:
+                raise TQError(f"Deidentification failed for {target}")
+        except Exception as exc:
+            message = f"Staging/deidentification failed: {exc}"
+            job.result_errors[slide["original_path"]] = message
+            raise TQError(message) from exc
+
+
+def _tq_fail_before_upload(job: TQJob, error: Exception) -> None:
+    for slide in job.slides:
+        job.result_errors.setdefault(
+            slide["original_path"],
+            f"Upload not started: {error}",
+        )
+    _tq_append_output(job, f"\nTransfer stopped before upload: {error}\n")
+    try:
+        job.log_path = _tq_write_transfer_log(job)
+    except Exception:
+        app.logger.exception("Could not write failed TQ staging log")
+    job.status = "failed"
+
+
+def _run_tq_job(job: TQJob) -> None:
+    global _tq_active_job_id
+    try:
+        _tq_stage_and_deidentify(job)
+        _tq_append_output(job, "All selected slides deidentified. Starting TQ upload.\n")
+        job.manifest_path = _tq_write_manifest(job.slides)
+        command = [
+            Config.TQ_EXECUTABLE,
+            "pusher",
+            "--paths",
+            str(job.manifest_path),
+        ]
+        job.process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+        )
+    except Exception as exc:
+        _tq_fail_before_upload(job, exc)
+        with _tq_state_lock:
+            if _tq_active_job_id == job.id:
+                _tq_active_job_id = None
+        return
+    _read_tq_output(job)
+
+
 def _read_tq_output(job: TQJob) -> None:
     global _tq_active_job_id
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     pending = ""
     try:
+        if job.process is None:
+            raise TQError("The TQ process was not started.")
         if job.process.stdout is not None:
             while True:
                 chunk = job.process.stdout.read(4096)
@@ -3089,6 +3282,7 @@ def _read_tq_output(job: TQJob) -> None:
         if trailing:
             _tq_parse_result_line(job, trailing.strip())
         job.return_code = job.process.wait()
+        _tq_cleanup_successful_staging(job)
         job.log_path = _tq_write_transfer_log(job)
         try:
             updated_rows = _tq_update_sdl_push_status(job.all_slides)
@@ -3116,9 +3310,10 @@ def _read_tq_output(job: TQJob) -> None:
         with _tq_state_lock:
             job.output += f"\nLauncher error: {exc}\n"
         job.status = "failed"
-        job.return_code = job.process.poll()
+        job.return_code = job.process.poll() if job.process else None
     finally:
-        job.manifest_path.unlink(missing_ok=True)
+        if job.manifest_path is not None:
+            job.manifest_path.unlink(missing_ok=True)
         with _tq_state_lock:
             if _tq_active_job_id == job.id:
                 _tq_active_job_id = None
@@ -3131,37 +3326,23 @@ def _start_tq_job(
 ) -> TQJob:
     global _tq_active_job_id
     _tq_config()
-    manifest_path = _tq_write_manifest(slides)
-    command = [Config.TQ_EXECUTABLE, "pusher", "--paths", str(manifest_path)]
+    _tq_prepare_staging_paths(slides)
     with _tq_state_lock:
         if _tq_active_job_id:
             active = _tq_jobs.get(_tq_active_job_id)
             if active and active.status == "running":
-                manifest_path.unlink(missing_ok=True)
                 raise TQError("Another transfer is already running.")
             _tq_active_job_id = None
-        try:
-            process = subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=0,
-            )
-        except OSError as exc:
-            manifest_path.unlink(missing_ok=True)
-            raise TQError(f"The TQ process could not be started: {exc}") from exc
         job = TQJob(
             uuid.uuid4().hex,
             owner_id,
-            process,
+            None,
             slides,
             all_slides,
-            manifest_path,
         )
         _tq_jobs[job.id] = job
         _tq_active_job_id = job.id
-    threading.Thread(target=_read_tq_output, args=(job,), daemon=True).start()
+    threading.Thread(target=_run_tq_job, args=(job,), daemon=True).start()
     return job
 
 

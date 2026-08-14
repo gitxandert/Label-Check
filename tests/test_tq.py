@@ -135,6 +135,7 @@ class TQTransferTests(unittest.TestCase):
             "TQ_HOME_DIR": app_module.Config.TQ_HOME_DIR,
             "TQ_TRANSFER_LOG_DIR": app_module.Config.TQ_TRANSFER_LOG_DIR,
             "TQ_EXECUTABLE": app_module.Config.TQ_EXECUTABLE,
+            "IMAGE_STAGING_ROOT": app_module.Config.IMAGE_STAGING_ROOT,
         }
         app_module.Config.LABEL_CHECK_BATCHES = str(self.batch_base)
         app_module.Config.INSTANCE_DIR = str(self.root / "instance")
@@ -142,6 +143,7 @@ class TQTransferTests(unittest.TestCase):
         app_module.Config.TQ_HOME_DIR = str(self.tq_home)
         app_module.Config.TQ_TRANSFER_LOG_DIR = str(self.batch_base / "transfer_logs")
         app_module.Config.TQ_EXECUTABLE = "tq"
+        app_module.Config.IMAGE_STAGING_ROOT = str(self.root / "image_staging")
         app_module.batch_contexts.clear()
         with app_module._tq_state_lock:
             app_module._tq_drafts.clear()
@@ -340,7 +342,7 @@ class TQTransferTests(unittest.TestCase):
         )
         workbook.close()
 
-    def test_launcher_uses_manifest_and_never_uses_shell(self):
+    def test_launcher_schedules_staging_worker(self):
         slides = self.catalog()
         selected = [dict(slides[0])]
         selected[0]["destination_dir"] = app_module._tq_destination_dir(
@@ -348,24 +350,120 @@ class TQTransferTests(unittest.TestCase):
         )
         reader = mock.Mock()
         with mock.patch.object(
-            app_module.subprocess, "Popen", return_value=FakeProcess()
-        ) as popen, mock.patch.object(
             app_module.threading, "Thread", return_value=reader
-        ):
+        ) as thread:
             job = app_module._start_tq_job(self.user.id, selected, slides)
 
-        command = popen.call_args.args[0]
-        self.assertEqual(["tq", "pusher", "--paths"], command[:3])
-        self.assertNotIn("shell", popen.call_args.kwargs)
-        self.assertNotIn("cwd", popen.call_args.kwargs)
-        with Path(command[3]).open("r", newline="", encoding="utf-8") as handle:
-            manifest_rows = list(csv.DictReader(handle))
         self.assertEqual(
-            ["original_path", "destination_dir", "destination_name"],
-            list(manifest_rows[0]),
+            str(
+                Path(app_module.Config.IMAGE_STAGING_ROOT)
+                / "destination"
+                / "BRAIN"
+                / "AAAAAA"
+                / selected[0]["destination_name"]
+            ),
+            selected[0]["staged_path"],
         )
         self.assertEqual("running", job.status)
+        self.assertIs(app_module._run_tq_job, thread.call_args.kwargs["target"])
+        self.assertEqual((job,), thread.call_args.kwargs["args"])
         reader.start.assert_called_once_with()
+
+    def test_worker_stages_deidentifies_then_uploads_and_cleans_success(self):
+        slide = dict(self.catalog()[0])
+        source = self.root / "gt450" / "source.svs"
+        source.parent.mkdir()
+        source.write_bytes(b"identifiable-slide")
+        slide["original_path"] = str(source)
+        slide["destination_dir"] = app_module._tq_destination_dir(
+            "StudyA", slide
+        )
+        app_module._tq_prepare_staging_paths([slide])
+        job = app_module.TQJob(
+            "stage-success", self.user.id, None, [slide], [slide]
+        )
+        captured = {}
+
+        def anonymize(path):
+            self.assertEqual(b"identifiable-slide", Path(path).read_bytes())
+            Path(path).write_bytes(b"deidentified-slide")
+            return 0
+
+        def launch(command, **kwargs):
+            self.assertEqual(["tq", "pusher", "--paths"], command[:3])
+            self.assertNotIn("shell", kwargs)
+            self.assertNotIn("cwd", kwargs)
+            with Path(command[3]).open("r", newline="", encoding="utf-8") as handle:
+                captured["manifest"] = list(csv.DictReader(handle))
+            staged_path = captured["manifest"][0]["original_path"]
+            self.assertEqual(b"deidentified-slide", Path(staged_path).read_bytes())
+            output = (
+                app_module.json.dumps(
+                    {"original_path": staged_path, "success": True, "error": None}
+                )
+                + "\n"
+            ).encode()
+            return FakeProcess(output)
+
+        with mock.patch.object(
+            app_module.deidentify_anonymize,
+            "anonymize_slide",
+            side_effect=anonymize,
+        ), mock.patch.object(
+            app_module.subprocess, "Popen", side_effect=launch
+        ):
+            app_module._run_tq_job(job)
+
+        manifest_row = captured["manifest"][0]
+        self.assertEqual(slide["staged_path"], manifest_row["original_path"])
+        self.assertEqual("StudyA/BRAIN/AAAAAA", manifest_row["destination_dir"])
+        self.assertEqual("succeeded", job.status)
+        self.assertFalse(Path(slide["staged_path"]).exists())
+        with job.log_path.open("r", newline="", encoding="utf-8") as handle:
+            log_row = next(csv.DictReader(handle))
+        self.assertEqual(str(source), log_row["original_path"])
+        self.assertEqual("SUCCESS", log_row["status"])
+
+    def test_deidentification_failure_prevents_every_upload_and_keeps_staging(self):
+        slides = [dict(slide) for slide in self.catalog()]
+        for index, slide in enumerate(slides, start=1):
+            source = self.root / "gt450" / f"source-{index}.svs"
+            source.parent.mkdir(exist_ok=True)
+            source.write_bytes(f"slide-{index}".encode())
+            slide["original_path"] = str(source)
+            slide["destination_dir"] = app_module._tq_destination_dir(
+                "StudyA", slide
+            )
+        app_module._tq_prepare_staging_paths(slides)
+        job = app_module.TQJob(
+            "stage-failure", self.user.id, None, slides, slides
+        )
+
+        with mock.patch.object(
+            app_module.deidentify_anonymize,
+            "anonymize_slide",
+            side_effect=[0, 1],
+        ), mock.patch.object(app_module.subprocess, "Popen") as popen:
+            app_module._run_tq_job(job)
+
+        self.assertEqual("failed", job.status)
+        popen.assert_not_called()
+        self.assertTrue(Path(slides[0]["staged_path"]).exists())
+        self.assertTrue(Path(slides[1]["staged_path"]).exists())
+        self.assertIn("Deidentification failed", job.output)
+        self.assertIsNotNone(job.log_path)
+
+    def test_staging_rejects_duplicate_and_unsafe_destinations(self):
+        slides = [dict(slide) for slide in self.catalog()]
+        for slide in slides:
+            slide["destination_dir"] = "StudyA/BRAIN/AAAAAA"
+            slide["destination_name"] = "same.svs"
+        with self.assertRaisesRegex(app_module.TQError, "Duplicate"):
+            app_module._tq_prepare_staging_paths(slides)
+
+        slides[0]["destination_dir"] = "../outside"
+        with self.assertRaisesRegex(app_module.TQError, "cannot be used"):
+            app_module._tq_staging_path(slides[0])
 
     def test_log_browser_rejects_symlink_escape(self):
         outside = self.root / "outside.log"

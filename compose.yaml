@@ -23,6 +23,7 @@ services:
       LOGIN_RATE_WINDOW_SECONDS: ${LOGIN_RATE_WINDOW_SECONDS:-900}
       GT450_IMAGES_HOST_PREFIX: ${GT450_IMAGES_HOST_PREFIX:?Set GT450_IMAGES_HOST_PREFIX}
       LABEL_CHECK_BATCHES_HOST_PREFIX: ${LABEL_CHECK_BATCHES_HOST_PREFIX:-D:\label_check_batches}
+      IMAGE_STAGING_ROOT: /data/image-staging
       COPATH_QUERY_MODE: ${COPATH_QUERY_MODE:-windows_queue}
       COPATH_QUERY_QUEUE: ${COPATH_QUERY_QUEUE:-/data/state/copath-query}
       COPATH_QUERY_TIMEOUT_SECONDS: ${COPATH_QUERY_TIMEOUT_SECONDS:-300}
@@ -41,6 +42,9 @@ services:
       - type: bind
         source: ${LABEL_CHECK_BATCHES_HOST:?Set LABEL_CHECK_BATCHES_HOST}
         target: /data/label-check-batches
+      - type: bind
+        source: ${IMAGE_STAGING_HOST:?Set IMAGE_STAGING_HOST}
+        target: /data/image-staging
       - type: bind
         source: ${COPATH_CLONE_HOST:?Set COPATH_CLONE_HOST}
         target: /data/copath-clone

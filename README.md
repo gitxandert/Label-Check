@@ -169,6 +169,7 @@ Inside the container, Windows resources appear at stable Linux paths:
 - GT450 images: `/data/gt450-images`
 - scanner inventories: `/data/scanner-inventories`
 - label-check batches: `/data/label-check-batches`
+- deidentified transfer staging: `/data/image-staging`
 - CoPath clone: `/data/copath-clone`
 - persistent application state: `/data/state`
 
@@ -178,6 +179,16 @@ these mounts. New pipeline output records Linux mount paths directly.
 The GT450 mount is the named Docker volume `label-check-gt450-images`. It mounts
 `//chp.clarian.org/app/Philips_Slide_Images/GT450_Images` through CIFS with
 read-only permissions. The remaining paths are ordinary Windows bind mounts.
+
+Create and share `IMAGE_STAGING_HOST` (normally `D:\image_staging`) with Docker
+Desktop. Before each TQ upload, Label-Check copies selected GT450 slides to
+`<IMAGE_STAGING_HOST>\<destination directory>\<renamed slide>.svs`, removes the
+identifying label and macro from those copies, then gives only the staged paths
+to TQ. A staging or deidentification failure prevents the whole selection from
+uploading. Files confirmed successful by TQ are removed; failed files remain for
+diagnosis and are replaced from GT450 on retry. Size this directory for the
+largest transfer selection and restrict it to the workstation operators and
+Docker Desktop service account.
 
 ### Windows CoPath worker
 

@@ -105,6 +105,7 @@ ENV TQ_EXECUTABLE=/app/bin/tq \
     BACKUP_DIR=/data/state/csv_backups \
     SCANNER_INVENTORIES=/data/scanner-inventories \
     LABEL_CHECK_BATCHES=/data/label-check-batches \
+    IMAGE_STAGING_ROOT=/data/image-staging \
     COPATH_CLONE=/data/copath-clone \
     TQ_TRANSFER_LOG_DIR=/data/label-check-batches/transfer_logs \
     GT450_IMAGES_CONTAINER_ROOT=/data/gt450-images \
