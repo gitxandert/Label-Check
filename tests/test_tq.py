@@ -378,6 +378,7 @@ class TQTransferTests(unittest.TestCase):
         source = self.root / "gt450" / "source.svs"
         source.parent.mkdir()
         source.write_bytes(b"identifiable-slide")
+        source.chmod(0o444)
         slide["original_path"] = str(source)
         slide["destination_dir"] = app_module._tq_destination_dir(
             "StudyA", slide

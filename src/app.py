@@ -3218,7 +3218,9 @@ def _tq_download_slides(job: TQJob) -> None:
                 f"{_tq_staging_display_path(target)}.\n",
             )
             try:
-                shutil.copy2(source, temporary)
+                # Do not preserve GT450 mode bits. Scanner files can be read-only,
+                # while deidentify_anonymize.py must reopen staged copies with r+b.
+                shutil.copyfile(source, temporary)
                 os.replace(temporary, target)
             finally:
                 temporary.unlink(missing_ok=True)
