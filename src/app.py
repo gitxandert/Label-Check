@@ -174,6 +174,9 @@ class Config:
         "IMAGE_STAGING_ROOT",
         r"D:\image_staging" if os.name == "nt" else "/data/image-staging",
     )
+    IMAGE_STAGING_HOST_DISPLAY = os.environ.get(
+        "IMAGE_STAGING_HOST_DISPLAY", IMAGE_STAGING_ROOT
+    )
 
 
     # Path to scanner inventories
@@ -2546,6 +2549,16 @@ def _tq_staging_root() -> Path:
     return Path(Config.IMAGE_STAGING_ROOT).expanduser().resolve()
 
 
+def _tq_staging_display_path(path: Path) -> str:
+    try:
+        relative = path.relative_to(_tq_staging_root())
+    except ValueError:
+        return str(path)
+    if re.match(r"^[A-Za-z]:[\\/]", Config.IMAGE_STAGING_HOST_DISPLAY):
+        return str(PureWindowsPath(Config.IMAGE_STAGING_HOST_DISPLAY).joinpath(*relative.parts))
+    return str(Path(Config.IMAGE_STAGING_HOST_DISPLAY).joinpath(*relative.parts))
+
+
 def _tq_windows_safe_component(value: str) -> bool:
     reserved = {
         "CON",
@@ -3183,7 +3196,7 @@ def _tq_cleanup_successful_staging(job: TQJob) -> None:
             )
 
 
-def _tq_stage_and_deidentify(job: TQJob) -> None:
+def _tq_download_slides(job: TQJob) -> None:
     for index, slide in enumerate(job.slides, start=1):
         source = Path(slide["original_path"])
         target = Path(slide["staged_path"])
@@ -3197,21 +3210,100 @@ def _tq_stage_and_deidentify(job: TQJob) -> None:
             )
             _tq_append_output(
                 job,
-                f"[{index}/{len(job.slides)}] Staging {source} as {target}.\n",
+                f"[{index}/{len(job.slides)}] Downloading {source} to "
+                f"{_tq_staging_display_path(target)}.\n",
             )
             try:
                 shutil.copy2(source, temporary)
                 os.replace(temporary, target)
             finally:
                 temporary.unlink(missing_ok=True)
-
-            _tq_append_output(job, f"[{index}/{len(job.slides)}] Deidentifying {target}.\n")
-            if deidentify_anonymize.anonymize_slide(str(target)) != 0:
-                raise TQError(f"Deidentification failed for {target}")
+            _tq_append_output(
+                job,
+                f"[{index}/{len(job.slides)}] Downloaded "
+                f"{_tq_staging_display_path(target)}.\n",
+            )
         except Exception as exc:
-            message = f"Staging/deidentification failed: {exc}"
+            message = f"Staging failed: {exc}"
             job.result_errors[slide["original_path"]] = message
             raise TQError(message) from exc
+
+
+def _tq_temporary_csv(prefix: str) -> Path:
+    directory = Path(Config.INSTANCE_DIR) / "tq_manifests"
+    directory.mkdir(parents=True, exist_ok=True)
+    descriptor, path_value = tempfile.mkstemp(
+        prefix=prefix, suffix=".csv", dir=directory
+    )
+    os.close(descriptor)
+    return Path(path_value)
+
+
+def _tq_stream_process_output(job: TQJob, process: subprocess.Popen) -> None:
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    if process.stdout is not None:
+        while True:
+            chunk = process.stdout.read(4096)
+            if not chunk:
+                break
+            _tq_append_output(job, decoder.decode(chunk))
+    trailing = decoder.decode(b"", final=True)
+    if trailing:
+        _tq_append_output(job, trailing)
+
+
+def _tq_deidentify_slides(job: TQJob) -> None:
+    input_list = _tq_temporary_csv("deidentify-input-")
+    output_log = _tq_temporary_csv("deidentify-results-")
+    try:
+        with input_list.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=("file_path",))
+            writer.writeheader()
+            writer.writerows(
+                {"file_path": slide["staged_path"]} for slide in job.slides
+            )
+        _tq_append_output(
+            job,
+            f"All {len(job.slides)} selected slide(s) downloaded.\n"
+            "Starting deidentify_anonymize.py.\n",
+        )
+        command = [
+            sys.executable,
+            "-u",
+            str(Path(deidentify_anonymize.__file__).resolve()),
+            "--input-list",
+            str(input_list),
+            "--output-log",
+            str(output_log),
+        ]
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+        )
+        _tq_stream_process_output(job, process)
+        return_code = process.wait()
+        if return_code != 0:
+            if output_log.is_file():
+                with output_log.open("r", newline="", encoding="utf-8-sig") as handle:
+                    results = {
+                        row.get("original_path", ""): row.get("status", "")
+                        for row in csv.DictReader(handle)
+                    }
+                for slide in job.slides:
+                    if results.get(slide["staged_path"]) == "FAILURE":
+                        job.result_errors[slide["original_path"]] = (
+                            f"Deidentification failed for {slide['staged_path']}"
+                        )
+            raise TQError(
+                f"deidentify_anonymize.py exited with code {return_code}"
+            )
+        _tq_append_output(job, "deidentify_anonymize.py completed successfully.\n")
+    finally:
+        input_list.unlink(missing_ok=True)
+        output_log.unlink(missing_ok=True)
 
 
 def _tq_fail_before_upload(job: TQJob, error: Exception) -> None:
@@ -3231,8 +3323,9 @@ def _tq_fail_before_upload(job: TQJob, error: Exception) -> None:
 def _run_tq_job(job: TQJob) -> None:
     global _tq_active_job_id
     try:
-        _tq_stage_and_deidentify(job)
-        _tq_append_output(job, "All selected slides deidentified. Starting TQ upload.\n")
+        _tq_download_slides(job)
+        _tq_deidentify_slides(job)
+        _tq_append_output(job, "Starting TQ upload.\n")
         job.manifest_path = _tq_write_manifest(job.slides)
         command = [
             Config.TQ_EXECUTABLE,

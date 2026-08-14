@@ -1176,7 +1176,12 @@ def main():
     )
     parser.add_argument(
         "input_dir",
+        nargs="?",
         help="Directory with slides to anonymize"
+    )
+    parser.add_argument(
+        "--input-list",
+        help="CSV containing exactly one file_path column of slides to anonymize",
     )
     parser.add_argument(
         "--output-log",
@@ -1192,10 +1197,13 @@ def main():
 
     args = parser.parse_args()
 
+    if bool(args.input_dir) == bool(args.input_list):
+        parser.error("provide either input_dir or --input-list")
+
     # Get the directory where this script is located
     script_dir = os.path.dirname(os.path.abspath(__file__))
     # Path to folder containing slides to anonymize
-    slide_folder = Path(args.input_dir)
+    slide_folder = Path(args.input_dir) if args.input_dir else None
     # Path to CSV file for logging results
     mapping_file = Path(args.output_log)
     archive_root = None
@@ -1204,26 +1212,44 @@ def main():
 
     # Step 1: Recursively find all .svs files in slide_folder and subdirectories
     svs_files = []
-    for root, dirs, files in os.walk(slide_folder):
-        for file in files:
-            if file.lower().endswith('.svs'):
-                svs_files.append(os.path.join(root, file))
+    if args.input_list:
+        with open(args.input_list, newline='', encoding='utf-8-sig') as input_file:
+            reader = csv.DictReader(input_file)
+            if reader.fieldnames != ['file_path']:
+                parser.error("--input-list CSV must contain exactly one file_path column")
+            for row_number, row in enumerate(reader, start=2):
+                file_path = row['file_path'].strip()
+                if not file_path:
+                    parser.error(f"--input-list row {row_number} has an empty file_path")
+                if not file_path.lower().endswith('.svs'):
+                    parser.error(f"--input-list row {row_number} is not an .svs file")
+                svs_files.append(file_path)
+        if len(set(svs_files)) != len(svs_files):
+            parser.error("--input-list contains duplicate file paths")
+    else:
+        for root, dirs, files in os.walk(slide_folder):
+            for file in files:
+                if file.lower().endswith('.svs'):
+                    svs_files.append(os.path.join(root, file))
 
     # Step 2: Process each file to remove labels
     with open(mapping_file, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=['original_path', 'anonymized_path', 'status'])
         writer.writeheader()
 
+        failures = 0
         for file_path in svs_files:
             print('Processing', os.path.basename(file_path))
             exit_code = anonymize_slide(file_path, archive_root=archive_root)
             status = 'SUCCESS' if exit_code == 0 else 'FAILURE'
+            failures += int(exit_code != 0)
             # Log the result (note: anonymized_path is same as original_path here
             # since we're modifying in-place, but folder was already renamed)
             writer.writerow({'original_path': file_path, 'anonymized_path': file_path, 'status': status})
 
     print('Anonymization process completed. Results are logged in {}'.format(mapping_file))
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -136,6 +136,9 @@ class TQTransferTests(unittest.TestCase):
             "TQ_TRANSFER_LOG_DIR": app_module.Config.TQ_TRANSFER_LOG_DIR,
             "TQ_EXECUTABLE": app_module.Config.TQ_EXECUTABLE,
             "IMAGE_STAGING_ROOT": app_module.Config.IMAGE_STAGING_ROOT,
+            "IMAGE_STAGING_HOST_DISPLAY": (
+                app_module.Config.IMAGE_STAGING_HOST_DISPLAY
+            ),
         }
         app_module.Config.LABEL_CHECK_BATCHES = str(self.batch_base)
         app_module.Config.INSTANCE_DIR = str(self.root / "instance")
@@ -144,6 +147,7 @@ class TQTransferTests(unittest.TestCase):
         app_module.Config.TQ_TRANSFER_LOG_DIR = str(self.batch_base / "transfer_logs")
         app_module.Config.TQ_EXECUTABLE = "tq"
         app_module.Config.IMAGE_STAGING_ROOT = str(self.root / "image_staging")
+        app_module.Config.IMAGE_STAGING_HOST_DISPLAY = r"D:\image_staging"
         app_module.batch_contexts.clear()
         with app_module._tq_state_lock:
             app_module._tq_drafts.clear()
@@ -384,15 +388,34 @@ class TQTransferTests(unittest.TestCase):
         )
         captured = {}
 
-        def anonymize(path):
-            self.assertEqual(b"identifiable-slide", Path(path).read_bytes())
-            Path(path).write_bytes(b"deidentified-slide")
-            return 0
-
         def launch(command, **kwargs):
-            self.assertEqual(["tq", "pusher", "--paths"], command[:3])
             self.assertNotIn("shell", kwargs)
             self.assertNotIn("cwd", kwargs)
+            if "deidentify_anonymize.py" in command[2]:
+                input_list = Path(command[command.index("--input-list") + 1])
+                with input_list.open("r", newline="", encoding="utf-8") as handle:
+                    staged_path = next(csv.DictReader(handle))["file_path"]
+                self.assertEqual(
+                    b"identifiable-slide", Path(staged_path).read_bytes()
+                )
+                Path(staged_path).write_bytes(b"deidentified-slide")
+                output_log = Path(command[command.index("--output-log") + 1])
+                write_csv(
+                    output_log,
+                    ["original_path", "anonymized_path", "status"],
+                    [
+                        {
+                            "original_path": staged_path,
+                            "anonymized_path": staged_path,
+                            "status": "SUCCESS",
+                        }
+                    ],
+                )
+                return FakeProcess(
+                    b"Processing renamed slide\nAnonymization process completed.\n"
+                )
+
+            self.assertEqual(["tq", "pusher", "--paths"], command[:3])
             with Path(command[3]).open("r", newline="", encoding="utf-8") as handle:
                 captured["manifest"] = list(csv.DictReader(handle))
             staged_path = captured["manifest"][0]["original_path"]
@@ -405,13 +428,7 @@ class TQTransferTests(unittest.TestCase):
             ).encode()
             return FakeProcess(output)
 
-        with mock.patch.object(
-            app_module.deidentify_anonymize,
-            "anonymize_slide",
-            side_effect=anonymize,
-        ), mock.patch.object(
-            app_module.subprocess, "Popen", side_effect=launch
-        ):
+        with mock.patch.object(app_module.subprocess, "Popen", side_effect=launch):
             app_module._run_tq_job(job)
 
         manifest_row = captured["manifest"][0]
@@ -419,6 +436,15 @@ class TQTransferTests(unittest.TestCase):
         self.assertEqual("StudyA/BRAIN/AAAAAA", manifest_row["destination_dir"])
         self.assertEqual("succeeded", job.status)
         self.assertFalse(Path(slide["staged_path"]).exists())
+        output_markers = [
+            "Downloaded D:\\image_staging",
+            "Starting deidentify_anonymize.py",
+            "Processing renamed slide",
+            "deidentify_anonymize.py completed successfully",
+            "Starting TQ upload",
+        ]
+        positions = [job.output.index(marker) for marker in output_markers]
+        self.assertEqual(sorted(positions), positions)
         with job.log_path.open("r", newline="", encoding="utf-8") as handle:
             log_row = next(csv.DictReader(handle))
         self.assertEqual(str(source), log_row["original_path"])
@@ -439,18 +465,32 @@ class TQTransferTests(unittest.TestCase):
             "stage-failure", self.user.id, None, slides, slides
         )
 
+        def fail_deidentification(command, **kwargs):
+            self.assertIn("deidentify_anonymize.py", command[2])
+            output_log = Path(command[command.index("--output-log") + 1])
+            write_csv(
+                output_log,
+                ["original_path", "anonymized_path", "status"],
+                [
+                    {
+                        "original_path": slides[1]["staged_path"],
+                        "anonymized_path": slides[1]["staged_path"],
+                        "status": "FAILURE",
+                    }
+                ],
+            )
+            return FakeProcess(b"Processing failed slide\n", return_code=1)
+
         with mock.patch.object(
-            app_module.deidentify_anonymize,
-            "anonymize_slide",
-            side_effect=[0, 1],
-        ), mock.patch.object(app_module.subprocess, "Popen") as popen:
+            app_module.subprocess, "Popen", side_effect=fail_deidentification
+        ) as popen:
             app_module._run_tq_job(job)
 
         self.assertEqual("failed", job.status)
-        popen.assert_not_called()
+        self.assertEqual(1, popen.call_count)
         self.assertTrue(Path(slides[0]["staged_path"]).exists())
         self.assertTrue(Path(slides[1]["staged_path"]).exists())
-        self.assertIn("Deidentification failed", job.output)
+        self.assertIn("deidentify_anonymize.py exited with code 1", job.output)
         self.assertIsNotNone(job.log_path)
 
     def test_staging_rejects_duplicate_and_unsafe_destinations(self):
