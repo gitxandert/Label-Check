@@ -180,6 +180,13 @@ acc_query = """
       ms.specnum_formatted AS accession_id,
       mr.medrec_num AS mrn,
       ms.specimen_id AS specimen_id,
+      CONCAT_WS(
+          ' ',
+          NULLIF(LTRIM(RTRIM(pd.firstname)), ''),
+          NULLIF(LTRIM(RTRIM(pd.middlename)), ''),
+          NULLIF(LTRIM(RTRIM(pd.lastname)), '')
+      ) AS patient_name,
+      dr.description AS race_ethnicity,
       ms.accession_date,
       pd.date_of_birth,
       ap.attending_physician,
@@ -199,6 +206,8 @@ acc_query = """
   FROM #matched_specimens ms
   JOIN r_pat_demograph pd
       ON pd.patdemog_id = ms.patdemog_id
+  LEFT JOIN c_d_race dr
+      ON dr.id = pd.race_id
   LEFT JOIN text_agg ta
       ON ta.specimen_id = ms.specimen_id
   LEFT JOIN part_agg pa
@@ -418,6 +427,13 @@ mrn_query = """
       ms.specnum_formatted AS accession_id,
       mr.medrec_num AS mrn,
       ms.specimen_id AS specimen_id,
+      CONCAT_WS(
+          ' ',
+          NULLIF(LTRIM(RTRIM(pd.firstname)), ''),
+          NULLIF(LTRIM(RTRIM(pd.middlename)), ''),
+          NULLIF(LTRIM(RTRIM(pd.lastname)), '')
+      ) AS patient_name,
+      dr.description AS race_ethnicity,
       ms.accession_date,
       pd.date_of_birth,
       ap.attending_physician,
@@ -437,6 +453,8 @@ mrn_query = """
   FROM #matched_specimens ms
   JOIN r_pat_demograph pd
       ON pd.patdemog_id = ms.patdemog_id
+  LEFT JOIN c_d_race dr
+      ON dr.id = pd.race_id
   LEFT JOIN text_agg ta
       ON ta.specimen_id = ms.specimen_id
   LEFT JOIN part_agg pa
