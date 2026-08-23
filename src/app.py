@@ -1042,9 +1042,12 @@ class DataManager:
                         row["_label_path"] = row.get("label_path")
                         row["_macro_path"] = row.get("macro_path")
                         
-                        row["AccessionID"] = row.get("AccessionID", "").strip()
-                        row["Stain"] = row.get("Stain", "").strip()
-                        row["BlockNumber"] = row.get("BlockNumber", "").strip()
+                        # Preserve QC field contents exactly as stored. Validation must
+                        # catch whitespace and unsafe characters instead of silently
+                        # repairing them while loading the CSV.
+                        row["AccessionID"] = row.get("AccessionID", "")
+                        row["Stain"] = row.get("Stain", "")
+                        row["BlockNumber"] = row.get("BlockNumber", "")
                         
                         qc_passed_str = row.get("ParsingQCPassed", "").strip()
                         row["_is_complete"] = bool(
@@ -1660,19 +1663,41 @@ def _is_row_incomplete(row_dict: Dict[str, Any]) -> bool:
     return not row_dict.get("_is_complete", False)
 
 
+_qc_filename_component_pattern = re.compile(r"^[A-Z0-9-]+$")
+
+
+def _normalize_qc_values(values: Dict[str, Any]) -> Dict[str, Any]:
+    """Return QC values in their canonical form without hiding invalid input."""
+    normalized = dict(values)
+    for field in ("AccessionID", "Stain", "BlockNumber"):
+        value = str(values.get(field) or "").upper()
+        if field == "Stain":
+            value = value.replace("_", "-")
+        normalized[field] = value
+    return normalized
+
+
 def _qc_row_validation_errors(row: Dict[str, Any]) -> List[str]:
     """Return the QC fields that are missing or invalid for a completed row."""
     errors = []
-    accession_id = str(row.get("AccessionID") or "").strip()
-    if not accession_id:
+    accession_id = str(row.get("AccessionID") or "")
+    if not accession_id.strip():
         errors.append("Accession ID is required")
+    elif not _qc_filename_component_pattern.fullmatch(accession_id):
+        errors.append(
+            "Accession ID may contain only uppercase letters, numbers, and hyphens"
+        )
     elif not _accession_pattern.fullmatch(accession_id):
         errors.append("Accession ID must match A12-123")
 
-    if not str(row.get("BlockNumber") or "").strip():
-        errors.append("Block Number is required")
-    if not str(row.get("Stain") or "").strip():
-        errors.append("Stain is required")
+    for field, label in (("Stain", "Stain"), ("BlockNumber", "Block Number")):
+        value = str(row.get(field) or "")
+        if not value.strip():
+            errors.append(f"{label} is required")
+        elif not _qc_filename_component_pattern.fullmatch(value):
+            errors.append(
+                f"{label} may contain only uppercase letters, numbers, and hyphens"
+            )
     return errors
 
 
@@ -5537,12 +5562,12 @@ def update():
             is_forced_save = True # Allowed to pick up
 
         # --- Update Data ---
-        new_values = {
-            "AccessionID": request.form.get("accession_id", "").strip(),
-            "Stain": request.form.get("stain", "").strip(),
-            "BlockNumber": request.form.get("block_number", "").strip(),
+        new_values = _normalize_qc_values({
+            "AccessionID": request.form.get("accession_id", ""),
+            "Stain": request.form.get("stain", ""),
+            "BlockNumber": request.form.get("block_number", ""),
             "_is_complete": request.form.get("complete") == "on"
-        }
+        })
         
         # Validation for completion
         if new_values["_is_complete"]:

@@ -32,7 +32,7 @@ class CompletedStagesTests(unittest.TestCase):
                 {
                     "AccessionID": "A12-123",
                     "BlockNumber": "A1",
-                    "Stain": "H&E",
+                    "Stain": "HE",
                     "ParsingQCPassed": "TRUE",
                     "original_slide_path": "slide.svs",
                 }
@@ -107,12 +107,16 @@ class CompletedStagesTests(unittest.TestCase):
         valid_row = {
             "AccessionID": "NP25-1234",
             "BlockNumber": "A1",
-            "Stain": "H&E",
+            "Stain": "HE",
         }
 
         self.assertEqual(qc_app._qc_row_validation_errors(valid_row), [])
         self.assertIn(
             "Accession ID must match A12-123",
+            qc_app._qc_row_validation_errors({**valid_row, "AccessionID": "NP2-1234"}),
+        )
+        self.assertIn(
+            "Accession ID may contain only uppercase letters, numbers, and hyphens",
             qc_app._qc_row_validation_errors({**valid_row, "AccessionID": "np25-1234"}),
         )
         self.assertIn(
@@ -123,6 +127,68 @@ class CompletedStagesTests(unittest.TestCase):
             "Stain is required",
             qc_app._qc_row_validation_errors({**valid_row, "Stain": ""}),
         )
+
+    def test_qc_values_are_normalized_before_validation(self):
+        normalized = qc_app._normalize_qc_values(
+            {
+                "AccessionID": "np25-1234",
+                "Stain": "gfap_dab",
+                "BlockNumber": "b-4",
+                "_is_complete": True,
+            }
+        )
+
+        self.assertEqual(normalized["AccessionID"], "NP25-1234")
+        self.assertEqual(normalized["Stain"], "GFAP-DAB")
+        self.assertEqual(normalized["BlockNumber"], "B-4")
+        self.assertTrue(normalized["_is_complete"])
+        self.assertEqual(qc_app._qc_row_validation_errors(normalized), [])
+
+    def test_qc_validation_rejects_non_filename_safe_characters_in_every_field(self):
+        valid_row = {
+            "AccessionID": "NP25-1234",
+            "BlockNumber": "A1",
+            "Stain": "HE",
+        }
+        unsafe_values = (".", "/", "\\", " ", "_", "&", ":", "*", "?", '"', "<", ">", "|")
+
+        for field in ("AccessionID", "Stain", "BlockNumber"):
+            for unsafe in unsafe_values:
+                with self.subTest(field=field, unsafe=unsafe):
+                    malformed = dict(valid_row)
+                    malformed[field] = f"A{unsafe}1"
+                    self.assertTrue(qc_app._qc_row_validation_errors(malformed))
+
+    def test_data_manager_preserves_unsafe_whitespace_for_final_validation(self):
+        csv_path = self.batch_root / "enriched.csv"
+        with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.DictWriter(
+                csvfile,
+                fieldnames=[
+                    "AccessionID",
+                    "BlockNumber",
+                    "Stain",
+                    "ParsingQCPassed",
+                    "original_slide_path",
+                ],
+            )
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "AccessionID": "A12-123",
+                    "BlockNumber": " A1",
+                    "Stain": "HE ",
+                    "ParsingQCPassed": "TRUE",
+                    "original_slide_path": "slide.svs",
+                }
+            )
+
+        manager = qc_app.DataManager(self.batch_root, csv_path)
+        manager.load_data()
+
+        self.assertEqual(manager.data[0]["BlockNumber"], " A1")
+        self.assertEqual(manager.data[0]["Stain"], "HE ")
+        self.assertTrue(qc_app._qc_row_validation_errors(manager.data[0]))
 
     def test_final_validation_requeues_invalid_completed_row(self):
         batches, _ = qc_app.discover_batches()

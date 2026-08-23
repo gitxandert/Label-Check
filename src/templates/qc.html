@@ -598,13 +598,13 @@
 
                     <div class="form-group">
                         <label for="stain">Stain ($):</label>
-                        <input type="text" id="stain" name="stain" value="{{ row.Stain }}" required {% if lease_info.leased_by_id != current_user.id %}readonly{% endif %}>
+                        <input type="text" id="stain" name="stain" value="{{ row.Stain }}" pattern="[A-Z0-9-]+" title="Use uppercase letters, numbers, and hyphens only. Underscores are automatically converted to hyphens." required {% if lease_info.leased_by_id != current_user.id %}readonly{% endif %}>
                     </div>
 
                     <!-- NEW: Input field for Block Number -->
                     <div class="form-group">
                         <label for="block_number">Block Number (#):</label>
-                        <input type="text" id="block_number" name="block_number" value="{{ row.BlockNumber }}" required {% if lease_info.leased_by_id != current_user.id %}readonly{% endif %}>
+                        <input type="text" id="block_number" name="block_number" value="{{ row.BlockNumber }}" pattern="[A-Z0-9-]+" title="Use uppercase letters, numbers, and hyphens only." required {% if lease_info.leased_by_id != current_user.id %}readonly{% endif %}>
                     </div>
 
                     <div class="form-group">
@@ -698,6 +698,25 @@
                 // Add a listener to the checkbox to toggle the button state whenever it changes
                 completeCheckbox.addEventListener('change', toggleNextButtonState);
             }
+
+            const accessionInput = document.getElementById('accession_id');
+            const stainInput = document.getElementById('stain');
+            const blockInput = document.getElementById('block_number');
+
+            function normalizeInput(input) {
+                const selectionStart = input.selectionStart;
+                const selectionEnd = input.selectionEnd;
+                let normalized = input.value.toUpperCase();
+                if (input === stainInput) normalized = normalized.replace(/_/g, '-');
+                input.value = normalized;
+                input.setSelectionRange(selectionStart, selectionEnd);
+            }
+
+            [accessionInput, stainInput, blockInput].forEach(input => {
+                if (!input || input.readOnly) return;
+                normalizeInput(input);
+                input.addEventListener('input', () => normalizeInput(input));
+            });
 
             // Auto-focus: first empty editable field, or "Mark as Complete" if all fields are filled
             const editableFields = ['accession_id', 'stain', 'block_number']
