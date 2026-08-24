@@ -1,4 +1,4 @@
-<form class="accession-form {% if group.approved %}approved{% endif %}" method="post" action="{{ url_for('renaming_approve', batch_id=context.id) }}">
+<form class="accession-form {% if group.approved %}approved{% endif %}" method="post" action="{{ url_for('renaming_approve', batch_id=context.id) }}" data-saved-organ="{{ group.shared.Organ }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <input type="hidden" name="old_accession" value="{{ group.accession }}">
     <input type="hidden" name="mapping_signature" value="{{ signature }}">

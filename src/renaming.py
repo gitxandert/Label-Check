@@ -518,6 +518,7 @@ def pid_after_organ_change(
     batch_base: Path,
     accession: str,
     target_organ: str,
+    additional_reserved: Iterable[str] = (),
 ) -> str:
     """Resolve authoritative PID after a staged accession changes organ."""
     accession = accession.strip().upper()
@@ -571,6 +572,11 @@ def pid_after_organ_change(
         row.get("PID", "").strip().upper()
         for row in identifiers
         if row.get("Organ", "").strip().upper() == target_organ
+    )
+    reserved.update(
+        pid.strip().upper()
+        for pid in additional_reserved
+        if PID_RE.fullmatch(pid.strip().upper())
     )
     valid = sorted(pid for pid in reserved if PID_RE.fullmatch(pid))
     return increment_pid(valid[-1]) if valid else "AAAAAA"

@@ -121,8 +121,13 @@ class RenamingDataTests(unittest.TestCase):
         pid = renaming.pid_after_organ_change(
             self.batch, self.clone, self.batch_base, "NP25-100", "BRAIN"
         )
+        reserved_pid = renaming.pid_after_organ_change(
+            self.batch, self.clone, self.batch_base, "NP25-100", "BRAIN",
+            ["AAAABB"],
+        )
 
         self.assertEqual("AAAABB", pid)
+        self.assertEqual("AAAABC", reserved_pid)
 
     def test_organ_change_pid_reuses_existing_mrn_organ_pid(self):
         renaming.prepare_batch(self.batch, self.clone, self.batch_base, self.query)
@@ -369,6 +374,8 @@ class RenamingPageTests(unittest.TestCase):
         self.assertIn(b"Diagnosis text", detail.data)
         self.assertIn(b"fetch(form.action", detail.data)
         self.assertIn(b"pidLookupUrl", detail.data)
+        self.assertIn(b"pidLookupQueue", detail.data)
+        self.assertIn(b"reserved_pid", detail.data)
         self.assertIn(b'class="success approve-button"', detail.data)
 
     def test_pid_preview_returns_next_staged_pid_for_changed_organ(self):
@@ -400,6 +407,20 @@ class RenamingPageTests(unittest.TestCase):
 
         self.assertEqual(200, response.status_code)
         self.assertEqual({"success": True, "pid": "AAAAAC"}, response.get_json())
+
+        reserved_response = self.client.get(
+            f"/renaming/pid/{batches[0].id}",
+            query_string=[
+                ("accession", "NP25-100"),
+                ("organ", "BRAIN"),
+                ("mapping_signature", renaming.mapping_signature(rows)),
+                ("reserved_pid", "AAAAAC"),
+            ],
+        )
+        self.assertEqual(200, reserved_response.status_code)
+        self.assertEqual(
+            {"success": True, "pid": "AAAAAD"}, reserved_response.get_json()
+        )
 
     def test_pid_preview_rejects_stale_mapping_signature(self):
         batches, _ = app_module._renaming_batches()

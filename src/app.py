@@ -4756,6 +4756,7 @@ def renaming_pid(batch_id: str):
         }), 404
     accession = request.args.get("accession", "").strip().upper()
     organ = request.args.get("organ", "").strip().upper()
+    reserved_pids = request.args.getlist("reserved_pid")
     expected_signature = request.args.get("mapping_signature", "")
     try:
         with _renaming_clone_lock:
@@ -4770,6 +4771,7 @@ def renaming_pid(batch_id: str):
                 Path(Config.LABEL_CHECK_BATCHES),
                 accession,
                 organ,
+                reserved_pids,
             )
         return jsonify({"success": True, "pid": pid})
     except renaming.RenamingError as exc:

@@ -121,6 +121,7 @@ const sharedFieldNames = [
   'image_type', 'samp_acq_type'
 ];
 const pidLookupUrl = {{ url_for('renaming_pid', batch_id=context.id)|tojson }};
+let pidLookupQueue = Promise.resolve();
 
 const showRenamingMessage = (message, category = 'error') => {
   const item = document.createElement('li');
@@ -198,6 +199,21 @@ const replaceUpdatedGroup = (submittedForm, payload, drafts) => {
   });
   restoreDraft(updatedForm, drafts.get(payload.accession));
   bindRenamingForm(updatedForm);
+  return updatedForm;
+};
+
+const refreshDuplicatePidPreviews = (authoritativeForm) => {
+  const organ = authoritativeForm.elements.organ.value;
+  const pid = authoritativeForm.elements.pid.value;
+  document.querySelectorAll('.accession-form').forEach((form) => {
+    if (
+      form !== authoritativeForm
+      && form.elements.organ.value === organ
+      && form.elements.pid.value === pid
+    ) {
+      form.elements.organ.dispatchEvent(new Event('change', {bubbles: true}));
+    }
+  });
 };
 
 const bindRenamingForm = (form) => {
@@ -232,32 +248,48 @@ const bindRenamingForm = (form) => {
   });
   form.addEventListener('input', () => updateNames(form));
   form.addEventListener('change', () => updateNames(form));
-  organInput.addEventListener('change', async () => {
+  organInput.addEventListener('change', () => {
     const lookupVersion = ++pidLookupVersion;
+    form.dataset.pidPreviewOrgan = '';
     approveButton.disabled = true;
-    try {
-      const url = new URL(pidLookupUrl, window.location.origin);
-      url.searchParams.set('accession', form.elements.old_accession.value);
-      url.searchParams.set('organ', organInput.value);
-      url.searchParams.set('mapping_signature', form.elements.mapping_signature.value);
-      const response = await fetch(url, {headers: {'Accept': 'application/json'}});
-      const payload = await response.json();
-      if (lookupVersion !== pidLookupVersion || organInput.value !== url.searchParams.get('organ')) return;
-      if (!response.ok || !payload.success) {
-        showRenamingMessage(payload.message || 'PID assignment failed.');
-        return;
+    const lookup = async () => {
+      try {
+        if (!form.isConnected || lookupVersion !== pidLookupVersion) return;
+        const url = new URL(pidLookupUrl, window.location.origin);
+        url.searchParams.set('accession', form.elements.old_accession.value);
+        url.searchParams.set('organ', organInput.value);
+        url.searchParams.set('mapping_signature', form.elements.mapping_signature.value);
+        document.querySelectorAll('.accession-form').forEach((candidate) => {
+          const candidatePid = candidate.elements.pid.value.trim().toUpperCase();
+          if (
+            candidate !== form
+            && candidate.dataset.pidPreviewOrgan === organInput.value
+            && /^[A-Z]{6}$/.test(candidatePid)
+          ) {
+            url.searchParams.append('reserved_pid', candidatePid);
+          }
+        });
+        const response = await fetch(url, {headers: {'Accept': 'application/json'}});
+        const payload = await response.json();
+        if (lookupVersion !== pidLookupVersion || organInput.value !== url.searchParams.get('organ')) return;
+        if (!response.ok || !payload.success) {
+          showRenamingMessage(payload.message || 'PID assignment failed.');
+          return;
+        }
+        form.elements.pid.value = payload.pid;
+        form.dataset.pidPreviewOrgan = organInput.value;
+        updateNames(form);
+      } catch (error) {
+        if (lookupVersion === pidLookupVersion) {
+          showRenamingMessage('PID assignment failed. Check the connection and try again.');
+        }
+      } finally {
+        if (lookupVersion === pidLookupVersion) {
+          approveButton.disabled = approvalInitiallyDisabled;
+        }
       }
-      form.elements.pid.value = payload.pid;
-      updateNames(form);
-    } catch (error) {
-      if (lookupVersion === pidLookupVersion) {
-        showRenamingMessage('PID assignment failed. Check the connection and try again.');
-      }
-    } finally {
-      if (lookupVersion === pidLookupVersion) {
-        approveButton.disabled = approvalInitiallyDisabled;
-      }
-    }
+    };
+    pidLookupQueue = pidLookupQueue.then(lookup, lookup);
   });
   form.addEventListener('submit', async (event) => {
     const button = event.submitter;
@@ -276,7 +308,8 @@ const bindRenamingForm = (form) => {
       });
       const payload = await response.json();
       if (payload.group_html && (payload.success || payload.saved)) {
-        replaceUpdatedGroup(form, payload, drafts);
+        const updatedForm = replaceUpdatedGroup(form, payload, drafts);
+        refreshDuplicatePidPreviews(updatedForm);
       }
       if (!response.ok || !payload.success) {
         showRenamingMessage(payload.message || 'The approval could not be saved.');
