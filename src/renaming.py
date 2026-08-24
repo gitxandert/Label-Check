@@ -312,7 +312,7 @@ def clean_date(value: str) -> str:
             pass
     return "XXXXXXXX"
 
-
+MENINGES_TERMS = ["meninges", "meningioma"]
 def derive_organ(row: Optional[Dict[str, str]]) -> str:
     if row is None:
         return "UNKNOWN"
@@ -320,19 +320,21 @@ def derive_organ(row: Optional[Dict[str, str]]) -> str:
     for needle, organ in (("brain", "BRAIN"), ("breast", "BREAST"), ("testis", "TESTIS")):
         if needle in text:
             return organ
-    if "meninges" in text:
-        return "BRAIN"
+    for term in MENINGES_TERMS:
+        if term in text:
+            return "BRAIN"
     return "OTHER"
 
-
+RESECTION_TERMS = ["resection", "excision"]
 def derive_sample_type(row: Optional[Dict[str, str]]) -> str:
     if row is None:
         return "XX"
     text = " ".join(
         ((row.get("sample_acquisition_type") or ""), compile_report(row))
     ).lower()
-    if "resection" in text:
-        return "RE"
+    for term in RESECTION_TERMS:
+        if term in text:
+            return "RE"
     if "biopsy" in text:
         return "BP"
     return "XX"
