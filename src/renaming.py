@@ -321,7 +321,7 @@ def derive_organ(row: Optional[Dict[str, str]]) -> str:
         if needle in text:
             return organ
     if "meninges" in text:
-        return BRAIN
+        return "BRAIN"
     return "OTHER"
 
 
