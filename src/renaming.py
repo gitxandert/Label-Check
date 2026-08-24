@@ -321,6 +321,9 @@ def derive_organ(row: Optional[Dict[str, str]]) -> str:
         if needle in text:
             return organ
     ex_text = " ".join((text, compile_report(row))).lower()
+    for needle, organ in (("brain", "BRAIN"), ("breast", "BREAST"), ("testis", "TESTIS")):
+        if needle in ex_text:
+            return organ
     for term in MENINGES_TERMS:
         if term in ex_text:
             return "BRAIN"
