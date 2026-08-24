@@ -48,7 +48,7 @@ REPORT_FIELDS = (
     "postmortem_imaging_studies", "procedure_note",
 )
 COPATH_FIELDS = (
-    "accession_id", "mrn", "specimen_id", "accession_date", "date_of_birth",
+    "accession_id", "mrn", "specimen_id", "patient_name", "race_ethnicity", "accession_date", "date_of_birth",
     "attending_physician", "specimen_class_id", "specimen_class_name",
     "sample_acquisition_type", "blocks_and_stains", "report", "signout_date",
     "specimen_status", "status_date", "report_status", "latest_report_status_datetime",
