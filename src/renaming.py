@@ -447,6 +447,135 @@ def _reserved_pids(batch_base: Path) -> Dict[str, set]:
     return result
 
 
+def _staged_pid_pairs(
+    batch_base: Path, identifiers: Sequence[Dict[str, str]]
+) -> Dict[Tuple[str, str], str]:
+    """Return consistent staged PID assignments keyed by (MRN, organ)."""
+    pairs: Dict[Tuple[str, str], str] = {}
+    identifier_by_accession = {
+        row_accession(row): row for row in identifiers if row_accession(row)
+    }
+
+    def remember(mrn: str, organ: str, pid: str) -> None:
+        mrn = mrn.strip()
+        organ = organ.strip().upper()
+        pid = pid.strip().upper()
+        if not mrn or organ not in ORGANS or not PID_RE.fullmatch(pid):
+            return
+        key = (mrn, organ)
+        existing = pairs.get(key)
+        if existing and existing != pid:
+            raise RenamingError(
+                f"MRN {mrn} has conflicting staged PIDs in {organ}"
+            )
+        pairs[key] = pid
+
+    for mapping_path in sorted(batch_base.glob("SS*/*/name_mapping.csv")):
+        batch_root = mapping_path.parent
+        mrns = {
+            accession: row.get("MRN", "").strip()
+            for accession, row in identifier_by_accession.items()
+        }
+        pending_path = batch_root / "pending_CoPath_data.csv"
+        if pending_path.exists():
+            try:
+                _, pending = read_csv(pending_path)
+            except RenamingError:
+                pending = []
+            for row in pending:
+                accession = row_accession(row)
+                if accession:
+                    mrns[accession] = row.get("mrn", "").strip()
+        try:
+            _, mapping = read_csv(mapping_path)
+        except RenamingError:
+            continue
+        seen = set()
+        for row in mapping:
+            accession = row_accession(row)
+            if not accession or accession in seen:
+                continue
+            seen.add(accession)
+            remember(
+                mrns.get(accession, ""),
+                row.get("Organ", ""),
+                row.get("PID", ""),
+            )
+
+    for history_path in sorted(batch_base.glob("SS*/*/pending_CoPath_history.csv")):
+        try:
+            _, history = read_csv(history_path)
+        except RenamingError:
+            continue
+        for row in history:
+            remember(row.get("mrn", ""), row.get("organ", ""), row.get("PID", ""))
+    return pairs
+
+
+def pid_after_organ_change(
+    batch_root: Path,
+    clone_root: Path,
+    batch_base: Path,
+    accession: str,
+    target_organ: str,
+) -> str:
+    """Resolve authoritative PID after a staged accession changes organ."""
+    accession = accession.strip().upper()
+    target_organ = target_organ.strip().upper()
+    if not ACCESSION_RE.fullmatch(accession):
+        raise RenamingError("AccessionID must match A12-123")
+    if target_organ not in ORGANS:
+        raise RenamingError("Select a valid Organ")
+
+    mapping_path = batch_root / "name_mapping.csv"
+    _, mapping = read_csv(mapping_path)
+    current = next((row for row in mapping if row_accession(row) == accession), None)
+    if current is None:
+        raise RenamingError("The accession is no longer available in this batch")
+    current_organ = current.get("Organ", "").strip().upper()
+    current_pid = current.get("PID", "").strip().upper()
+    if current_organ == target_organ and PID_RE.fullmatch(current_pid):
+        return current_pid
+
+    identifiers = _identifier_rows(clone_root)
+    reports = report_rows(batch_root, clone_root)
+    mrn = reports.get(accession, {}).get("mrn", "").strip()
+    pairs: Dict[Tuple[str, str], str] = {}
+    for row in identifiers:
+        identifier_mrn = row.get("MRN", "").strip()
+        organ = row.get("Organ", "").strip().upper()
+        pid = row.get("PID", "").strip().upper()
+        if identifier_mrn and organ in ORGANS and PID_RE.fullmatch(pid):
+            pairs[(identifier_mrn, organ)] = pid
+    for key, pid in _staged_pid_pairs(batch_base, identifiers).items():
+        existing = pairs.get(key)
+        if existing and existing != pid:
+            raise RenamingError(
+                f"MRN {key[0]} has conflicting committed and staged PIDs in {key[1]}"
+            )
+        pairs[key] = pid
+    pid_owners: Dict[Tuple[str, str], str] = {}
+    for (pair_mrn, organ), pid in pairs.items():
+        reverse = (organ, pid)
+        existing_mrn = pid_owners.get(reverse)
+        if existing_mrn and existing_mrn != pair_mrn:
+            raise RenamingError(
+                f"PID {pid} has conflicting committed or staged MRNs in {organ}"
+            )
+        pid_owners[reverse] = pair_mrn
+    if mrn and (mrn, target_organ) in pairs:
+        return pairs[(mrn, target_organ)]
+
+    reserved = _reserved_pids(batch_base)[target_organ]
+    reserved.update(
+        row.get("PID", "").strip().upper()
+        for row in identifiers
+        if row.get("Organ", "").strip().upper() == target_organ
+    )
+    valid = sorted(pid for pid in reserved if PID_RE.fullmatch(pid))
+    return increment_pid(valid[-1]) if valid else "AAAAAA"
+
+
 def _pid_for_identifiers(
     row: Optional[Dict[str, str]], organ: str, identifiers: Sequence[Dict[str, str]], used: set
 ) -> str:

@@ -4745,6 +4745,38 @@ def _renaming_group_html(
     )
 
 
+@app.route("/renaming/pid/<batch_id>", methods=["GET"])
+@login_required
+def renaming_pid(batch_id: str):
+    context = _renaming_context(batch_id)
+    if context is None:
+        return jsonify({
+            "success": False,
+            "message": "The batch is no longer available for renaming.",
+        }), 404
+    accession = request.args.get("accession", "").strip().upper()
+    organ = request.args.get("organ", "").strip().upper()
+    expected_signature = request.args.get("mapping_signature", "")
+    try:
+        with _renaming_clone_lock:
+            _, rows = renaming.read_csv(context.root / "name_mapping.csv")
+            if renaming.mapping_signature(rows) != expected_signature:
+                raise renaming.RenamingError(
+                    "The mapping changed in another session; reload and try again"
+                )
+            pid = renaming.pid_after_organ_change(
+                context.root,
+                Path(Config.COPATH_CLONE),
+                Path(Config.LABEL_CHECK_BATCHES),
+                accession,
+                organ,
+            )
+        return jsonify({"success": True, "pid": pid})
+    except renaming.RenamingError as exc:
+        status = 409 if "changed in another session" in str(exc) else 400
+        return jsonify({"success": False, "message": str(exc)}), status
+
+
 @app.route("/renaming/approve/<batch_id>", methods=["POST"])
 @login_required
 def renaming_approve(batch_id: str):
@@ -4776,38 +4808,6 @@ def renaming_approve(batch_id: str):
             raise renaming.RenamingError(
                 "Wait for the active CoPath job to finish before approving names"
             )
-        _, current_rows = renaming.read_csv(mapping_path)
-        target_exists = any(
-            row["AccessionID"] == values["AccessionID"]
-            for row in current_rows
-            if row["AccessionID"] != old_accession
-        )
-        if values["AccessionID"] != old_accession and not target_exists:
-            raise renaming.RenamingError(
-                "Retry CoPath after changing an accession ID before approving it"
-            )
-        if not target_exists:
-            reports = renaming.report_rows(context.root, Path(Config.COPATH_CLONE))
-            mrn = reports.get(old_accession, {}).get("mrn", "").strip()
-            pid_error = renaming.validate_pid_assignment(
-                Path(Config.COPATH_CLONE), values["Organ"], values["PID"], mrn
-            )
-            if pid_error:
-                raise renaming.RenamingError(pid_error)
-            if mrn:
-                for other in current_rows:
-                    other_accession = renaming.row_accession(other)
-                    if other_accession == old_accession:
-                        continue
-                    other_mrn = reports.get(other_accession, {}).get("mrn", "").strip()
-                    if (
-                        other_mrn == mrn
-                        and other.get("Organ", "").strip().upper() == values["Organ"]
-                        and other.get("PID", "").strip().upper() != values["PID"]
-                    ):
-                        raise renaming.RenamingError(
-                            f"MRN {mrn} must use one PID within {values['Organ']}"
-                        )
         slide_values: Dict[str, Dict[str, str]] = {}
         try:
             slide_count = int(request.form.get("slide_count", "0"))
@@ -4820,10 +4820,64 @@ def renaming_approve(batch_id: str):
                 "BlockNumber": request.form.get(f"block_number_{index}", "").strip(),
                 "SectionCount": request.form.get(f"section_count_{index}", "").strip(),
             }
-        updated, merged = renaming.update_group(
-            mapping_path, old_accession, values, slide_values,
-            request.form.get("mapping_signature", ""),
-        )
+        with _renaming_clone_lock:
+            _, current_rows = renaming.read_csv(mapping_path)
+            target_exists = any(
+                row["AccessionID"] == values["AccessionID"]
+                for row in current_rows
+                if row["AccessionID"] != old_accession
+            )
+            if values["AccessionID"] != old_accession and not target_exists:
+                raise renaming.RenamingError(
+                    "Retry CoPath after changing an accession ID before approving it"
+                )
+            current = next(
+                (row for row in current_rows if row["AccessionID"] == old_accession),
+                None,
+            )
+            if current is None:
+                raise renaming.RenamingError(
+                    "The accession is no longer available in this batch"
+                )
+            if (
+                not target_exists
+                and current.get("Organ", "").strip().upper() != values["Organ"]
+            ):
+                values["PID"] = renaming.pid_after_organ_change(
+                    context.root,
+                    Path(Config.COPATH_CLONE),
+                    Path(Config.LABEL_CHECK_BATCHES),
+                    old_accession,
+                    values["Organ"],
+                )
+            if not target_exists:
+                reports = renaming.report_rows(
+                    context.root, Path(Config.COPATH_CLONE)
+                )
+                mrn = reports.get(old_accession, {}).get("mrn", "").strip()
+                pid_error = renaming.validate_pid_assignment(
+                    Path(Config.COPATH_CLONE), values["Organ"], values["PID"], mrn
+                )
+                if pid_error:
+                    raise renaming.RenamingError(pid_error)
+                if mrn:
+                    for other in current_rows:
+                        other_accession = renaming.row_accession(other)
+                        if other_accession == old_accession:
+                            continue
+                        other_mrn = reports.get(other_accession, {}).get("mrn", "").strip()
+                        if (
+                            other_mrn == mrn
+                            and other.get("Organ", "").strip().upper() == values["Organ"]
+                            and other.get("PID", "").strip().upper() != values["PID"]
+                        ):
+                            raise renaming.RenamingError(
+                                f"MRN {mrn} must use one PID within {values['Organ']}"
+                            )
+            updated, merged = renaming.update_group(
+                mapping_path, old_accession, values, slide_values,
+                request.form.get("mapping_signature", ""),
+            )
         if merged:
             message = "Accessions were merged. Review and approve the combined group."
             category = "info"
