@@ -10,6 +10,7 @@ from striprtf.striprtf import rtf_to_text
 from copath_connection import prepared_connection_string
 
 from copath_texttypes import (
+    compile_report_fields,
     format_text_agg_columns,
     format_text_select_columns,
     format_texttype_id_list,
@@ -476,7 +477,7 @@ def parse_field(field):
 
 def normalize_report_field(field):
     parsed = parse_field(field)
-    if parsed is None:
+    if parsed is None or pd.isna(parsed):
         return ""
 
     return str(parsed).replace('\r', '\n').replace('\x00', '')
@@ -506,10 +507,7 @@ def compile_report_column(results):
 
     report_column_index = min(results.columns.get_loc(column) for column in report_columns)
     compiled_reports = results[report_columns].apply(
-        lambda row: "\n\n".join(
-            value for value in row
-            if isinstance(value, str) and value
-        ),
+        lambda row: compile_report_fields(row, report_columns),
         axis=1,
     )
 

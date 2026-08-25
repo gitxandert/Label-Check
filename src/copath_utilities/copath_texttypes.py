@@ -78,3 +78,15 @@ def format_text_select_columns(table_alias, indent="    "):
 
 def text_field_references(table_alias):
     return [f"{table_alias}.{column_name}" for _, column_name in TEXT_TYPES]
+
+
+def compile_report_fields(row, field_names):
+    """Combine report fields into labeled sections, retaining empty fields."""
+    sections = []
+    for field_name in field_names:
+        value = row[field_name]
+        if not isinstance(value, str):
+            value = ""
+        label = field_name.replace("_", " ").title()
+        sections.append(f"{label}:\n{value}")
+    return "\n\n".join(sections)
