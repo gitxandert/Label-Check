@@ -4535,7 +4535,19 @@ def index():
     if requested_index is not None:
         return redirect(url_for("qc", index=requested_index))
 
-    statistics = stats_store.dashboard(str(current_user.id))
+    statistics = _statistics_dashboard(str(current_user.id))
+    return render_template(
+        "index.html",
+        statistics=statistics,
+        statistics_heading="Your activity",
+        lifetime_url=url_for("lifetime_statistics"),
+        statistics_live=True,
+        messages=flash_messages(),
+    )
+
+
+def _statistics_dashboard(user_id: str) -> Dict[str, Any]:
+    statistics = stats_store.dashboard(user_id)
     statistics["chart_max"] = max(
         1,
         *(
@@ -4544,8 +4556,30 @@ def index():
             for metric in ("slides_completed", "accessions_logged", "hours")
         ),
     )
+    return statistics
+
+
+def _admin_statistics_user() -> User:
+    user_id = request.args.get("user_id", "")
+    user = user_manager.get(user_id) if user_id else None
+    if user is None:
+        abort(404)
+    return user
+
+
+@app.route("/admin/statistics")
+@admin_required
+def admin_user_statistics():
+    user = _admin_statistics_user()
     return render_template(
-        "index.html", statistics=statistics, messages=flash_messages()
+        "index.html",
+        statistics=_statistics_dashboard(str(user.id)),
+        statistics_heading=f"{user.id} activity",
+        lifetime_url=url_for(
+            "admin_user_lifetime_statistics", user_id=user.id
+        ),
+        statistics_live=False,
+        messages=flash_messages(),
     )
 
 
@@ -4566,7 +4600,11 @@ def statistics_heartbeat():
 def lifetime_statistics():
     rows = stats_store.read_csv(str(current_user.id))
     return render_template(
-        "lifetime_statistics.html", rows=rows, messages=flash_messages()
+        "lifetime_statistics.html",
+        rows=rows,
+        statistics_user=current_user,
+        download_url=url_for("download_lifetime_statistics"),
+        messages=flash_messages(),
     )
 
 
@@ -4576,6 +4614,37 @@ def download_lifetime_statistics():
     path = stats_store.csv_path(str(current_user.id))
     if not path.is_file():
         stats_store.rollup_user(str(current_user.id))
+    return send_file(
+        path,
+        mimetype="text/csv",
+        as_attachment=True,
+        download_name="lifetime_stats.csv",
+    )
+
+
+@app.route("/admin/statistics/lifetime")
+@admin_required
+def admin_user_lifetime_statistics():
+    user = _admin_statistics_user()
+    rows = stats_store.read_csv(str(user.id))
+    return render_template(
+        "lifetime_statistics.html",
+        rows=rows,
+        statistics_user=user,
+        download_url=url_for(
+            "admin_download_lifetime_statistics", user_id=user.id
+        ),
+        messages=flash_messages(),
+    )
+
+
+@app.route("/admin/statistics/lifetime.csv")
+@admin_required
+def admin_download_lifetime_statistics():
+    user = _admin_statistics_user()
+    path = stats_store.csv_path(str(user.id))
+    if not path.is_file():
+        stats_store.rollup_user(str(user.id))
     return send_file(
         path,
         mimetype="text/csv",

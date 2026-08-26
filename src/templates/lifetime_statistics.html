@@ -27,8 +27,8 @@
 <header><h1>Lifetime Statistics</h1></header>
 <main>
     <div class="heading">
-        <h2>{{ current_user.id }}</h2>
-        <a class="button" href="{{ url_for('download_lifetime_statistics') }}">Download CSV</a>
+        <h2>{{ statistics_user.id }}</h2>
+        <a class="button" href="{{ download_url }}">Download CSV</a>
     </div>
     <section class="table-card">
         {% if rows %}

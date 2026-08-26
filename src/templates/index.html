@@ -219,7 +219,7 @@
             </ul>
         {% endif %}
         <div class="intro">
-            <h2>Your activity</h2>
+            <h2>{{ statistics_heading }}</h2>
             <p>Today and the previous six days.</p>
         </div>
         <section class="statistics-card" aria-labelledby="weekly-statistics-title">
@@ -248,9 +248,10 @@
                 <div class="total">Accessions Logged<strong data-total-metric="accessions_logged">{{ statistics.totals.accessions_logged }}</strong></div>
                 <div class="total">Hours<strong data-total-metric="hours">{{ statistics.totals.hours }}</strong></div>
             </div>
-            <div class="statistics-actions"><a href="{{ url_for('lifetime_statistics') }}">View Lifetime Statistics</a></div>
+            <div class="statistics-actions"><a href="{{ lifetime_url }}">View Lifetime Statistics</a></div>
         </section>
     </main>
+    {% if statistics_live %}
     <script nonce="{{ csp_nonce() }}">
         window.addEventListener('statistics-update', event => {
             const statistics = event.detail;
@@ -269,5 +270,6 @@
             });
         });
     </script>
+    {% endif %}
 </body>
 </html>

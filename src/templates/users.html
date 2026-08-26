@@ -205,6 +205,11 @@
             text-decoration: underline;
         }
 
+        .stats-link {
+            color: var(--primary-color);
+            font-weight: 600;
+        }
+
         @media (max-width: 768px) {
             .header {
                 flex-direction: column;
@@ -256,6 +261,7 @@
                     <th>Username</th>
                     <th>Slides Completed</th>
                     <th>Is Admin</th>
+                    <th>Actions</th>
                 </tr>
             </thead>
             <tbody>
@@ -264,6 +270,7 @@
                     <td>{{ user.id }}</td>
                     <td>{{ user.slides_completed }}</td>
                     <td>{{ 'Yes' if user.is_admin else 'No' }}</td>
+                    <td><a class="stats-link" href="{{ url_for('admin_user_statistics', user_id=user.id) }}">View Stats</a></td>
                 </tr>
                 {% endfor %}
             </tbody>

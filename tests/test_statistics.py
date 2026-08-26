@@ -180,6 +180,118 @@ class SDLStatisticsIntegrationTests(unittest.TestCase):
         download.close()
 
 
+class AdminStatisticsIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.old_users = app_module.user_manager.users.copy()
+        self.old_stats_configuration = (
+            app_module.stats_store.db_path,
+            app_module.stats_store.user_root,
+        )
+        self.admin = app_module.User("stats-admin", "", is_admin=True)
+        self.user = app_module.User("team/operator", "")
+        app_module.user_manager.users = {
+            self.admin.id: self.admin,
+            self.user.id: self.user,
+        }
+        app_module.stats_store.configure(
+            str(self.root / "statistics.sqlite3"), str(self.root / "users")
+        )
+        self.activity_date = datetime.date.today() - datetime.timedelta(days=1)
+        app_module.stats_store.increment(
+            self.user.id, "slides_completed", 4, self.activity_date
+        )
+        app_module.stats_store.increment(
+            self.user.id, "accessions_logged", 2, self.activity_date
+        )
+        app_module.stats_store.rollup_user(self.user.id, self.activity_date)
+        app_module.app.config.update(TESTING=True, SECRET_KEY="admin-statistics-test")
+        self.client = app_module.app.test_client()
+        self.login(self.admin)
+
+    def tearDown(self):
+        app_module.user_manager.users = self.old_users
+        app_module.stats_store.configure(*self.old_stats_configuration)
+        self.temporary.cleanup()
+
+    def login(self, user):
+        with self.client.session_transaction() as session:
+            session.clear()
+            session["_user_id"] = user.id
+            session["_fresh"] = True
+
+    def test_admin_can_open_user_dashboard_from_user_management(self):
+        users_page = self.client.get("/users")
+        dashboard = self.client.get(
+            "/admin/statistics", query_string={"user_id": self.user.id}
+        )
+
+        self.assertEqual(users_page.status_code, 200)
+        self.assertIn(b"View Stats", users_page.data)
+        self.assertIn(b"user_id=team/operator", users_page.data)
+        self.assertEqual(dashboard.status_code, 200)
+        self.assertIn(b"team/operator activity", dashboard.data)
+        self.assertIn(self.activity_date.isoformat().encode(), dashboard.data)
+        self.assertIn(b"View Lifetime Statistics", dashboard.data)
+        self.assertNotIn(
+            b"window.addEventListener('statistics-update'", dashboard.data
+        )
+
+    def test_admin_can_view_and_download_selected_user_lifetime_stats(self):
+        query = {"user_id": self.user.id}
+        page = self.client.get("/admin/statistics/lifetime", query_string=query)
+        download = self.client.get(
+            "/admin/statistics/lifetime.csv", query_string=query
+        )
+
+        self.assertEqual(page.status_code, 200)
+        self.assertIn(b"team/operator", page.data)
+        self.assertIn(self.activity_date.isoformat().encode(), page.data)
+        self.assertIn(b">4</td>", page.data)
+        self.assertEqual(download.status_code, 200)
+        self.assertIn("attachment", download.headers["Content-Disposition"])
+        self.assertIn(self.activity_date.isoformat().encode(), download.data)
+        self.assertIn(b",4,2,", download.data)
+        download.close()
+
+    def test_non_admin_cannot_access_selected_user_statistics(self):
+        self.login(self.user)
+        query = {"user_id": self.user.id}
+
+        for path in (
+            "/admin/statistics",
+            "/admin/statistics/lifetime",
+            "/admin/statistics/lifetime.csv",
+        ):
+            with self.subTest(path=path):
+                response = self.client.get(path, query_string=query)
+                self.assertEqual(response.status_code, 403)
+
+    def test_admin_statistics_reject_missing_or_unknown_user(self):
+        for path in (
+            "/admin/statistics",
+            "/admin/statistics/lifetime",
+            "/admin/statistics/lifetime.csv",
+        ):
+            with self.subTest(path=path, user="missing"):
+                self.assertEqual(self.client.get(path).status_code, 404)
+            with self.subTest(path=path, user="unknown"):
+                response = self.client.get(
+                    path, query_string={"user_id": "unknown"}
+                )
+                self.assertEqual(response.status_code, 404)
+
+    def test_admin_statistics_requires_login(self):
+        with self.client.session_transaction() as session:
+            session.clear()
+        response = self.client.get(
+            "/admin/statistics", query_string={"user_id": self.user.id}
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/login", response.headers["Location"])
+
+
 class QCStatisticsIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
