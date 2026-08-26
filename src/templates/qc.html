@@ -514,6 +514,7 @@
     </style>
 </head>
 <body>
+{% include '_app_sidebar.html' %}
     <div class="header">
         <h1>SVS Slide Quality Control — {{ batch_name }}</h1>
         <div class="header-links">
@@ -524,7 +525,7 @@
                 {% if current_user.is_admin %}
                     <a href="{{ url_for('users_management') }}">User Management</a>
                 {% endif %}
-                <span>Logged in as <b>{{ current_user.id }}</b> (Corrections: {{ current_user.correction_count }})</span>
+                <span>Logged in as <b>{{ current_user.id }}</b> (Slides Completed: {{ current_user.slides_completed }})</span>
                 <a href="{{ url_for('logout') }}">Logout</a>
             {% endif %}
         </div>

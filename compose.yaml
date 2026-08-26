@@ -9,6 +9,7 @@ services:
         PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
     image: label-check:${IMAGE_TAG:-latest}
     environment:
+      TZ: ${TZ:?Set TZ to the server-local IANA timezone}
       SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY}
       ADMIN_DEFAULT_PASSWORD: ${ADMIN_DEFAULT_PASSWORD:?Set ADMIN_DEFAULT_PASSWORD}
       API_REQUIRE_HTTPS: "true"
@@ -59,6 +60,25 @@ services:
         source: ${SSH_HOME_HOST:?Set SSH_HOME_HOST}
         target: /home/labelcheck/.ssh
         read_only: true
+    restart: unless-stopped
+
+  statistics-scheduler:
+    platform: linux/amd64
+    build:
+      context: .
+      target: runtime
+      args:
+        RUST_VERSION: ${RUST_VERSION:-1.95}
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
+    image: label-check:${IMAGE_TAG:-latest}
+    command: stats-scheduler
+    environment:
+      TZ: ${TZ:?Set TZ to the server-local IANA timezone}
+      INSTANCE_DIR: /data/state/instance
+    volumes:
+      - type: bind
+        source: ${LABEL_CHECK_STATE_HOST:?Set LABEL_CHECK_STATE_HOST}
+        target: /data/state
     restart: unless-stopped
 
   caddy:

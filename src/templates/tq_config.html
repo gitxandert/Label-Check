@@ -18,6 +18,7 @@
     </style>
 </head>
 <body>
+{% include '_app_sidebar.html' %}
 <header><h1>Edit TQ Config</h1><nav><a href="{{ url_for('tq_logs') }}">Logs</a><a href="{{ url_for('tq_page') }}">Transfers</a><a href="{{ url_for('logout') }}">Logout</a></nav></header>
 <main>
     {% for message in messages %}<p class="{{ message.category }}">{{ message.message }}</p>{% endfor %}

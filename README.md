@@ -111,6 +111,13 @@ links in sensitive instance state are rejected. On Windows bind mounts, NTFS
 ACLs remain the security boundary: restrict `LABEL_CHECK_STATE_HOST` to the
 service account, Docker Desktop service account, and administrators.
 
+User activity is accumulated in `/data/state/instance/statistics.sqlite3`.
+The `statistics-scheduler` Compose service atomically refreshes each active
+user's `lifetime_stats.csv` after the server-local date changes. Days without
+a successful login or authenticated app activity are omitted. Keep web and
+scheduler containers on the same local timezone; set `TZ` consistently when
+the container default is not the desired zone.
+
 Obtain the SFTP server's SHA-256 host-key fingerprint through a trusted
 out-of-band channel. After verifying it, place the corresponding OpenSSH
 `known_hosts` entry in `${SSH_HOME_HOST}\known_hosts`. `ssh-keyscan` output must

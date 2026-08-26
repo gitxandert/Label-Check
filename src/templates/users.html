@@ -235,6 +235,7 @@
     </style>
 </head>
 <body>
+{% include '_app_sidebar.html' %}
     <div class="header">
         <h1>User Management</h1>
         <div class="auth-status">
@@ -253,7 +254,7 @@
             <thead>
                 <tr>
                     <th>Username</th>
-                    <th>Corrections Made</th>
+                    <th>Slides Completed</th>
                     <th>Is Admin</th>
                 </tr>
             </thead>
@@ -261,7 +262,7 @@
                 {% for user in users %}
                 <tr>
                     <td>{{ user.id }}</td>
-                    <td>{{ user.correction_count }}</td>
+                    <td>{{ user.slides_completed }}</td>
                     <td>{{ 'Yes' if user.is_admin else 'No' }}</td>
                 </tr>
                 {% endfor %}

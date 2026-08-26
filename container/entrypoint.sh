@@ -25,6 +25,9 @@ case "$command_name" in
     nightly)
         exec python -u /app/nightly_label_check.py "$@"
         ;;
+    stats-scheduler)
+        exec python -u /app/src/stats_scheduler.py "$@"
+        ;;
     python)
         exec python "$@"
         ;;
@@ -32,7 +35,7 @@ case "$command_name" in
         exec /bin/sh "$@"
         ;;
     *)
-        echo "Unknown container command '$command_name'. Use web, pipeline, nightly, python, or shell." >&2
+        echo "Unknown container command '$command_name'. Use web, pipeline, nightly, stats-scheduler, python, or shell." >&2
         exit 2
         ;;
 esac

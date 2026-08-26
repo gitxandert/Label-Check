@@ -22,6 +22,7 @@ The application features:
 import csv
 import codecs
 import contextlib
+import base64
 import datetime
 import functools
 import hmac
@@ -63,6 +64,7 @@ from flask import (
     redirect,
     render_template,
     request,
+    send_file,
     send_from_directory,
     session,
     url_for,
@@ -127,6 +129,8 @@ class Config:
     USERS_CSV_PATH = os.path.join(INSTANCE_DIR, "users.csv")
     QUEUE_CSV_PATH = os.path.join(INSTANCE_DIR, "queue.csv")
     API_DB_PATH = os.path.join(INSTANCE_DIR, "api.sqlite3")
+    STATS_DB_PATH = os.path.join(INSTANCE_DIR, "statistics.sqlite3")
+    USER_STATS_ROOT = os.path.join(INSTANCE_DIR, "users")
     API_JOB_OUTPUT_DIR = os.path.join(INSTANCE_DIR, "pipeline_job_output")
     API_REQUIRE_HTTPS = os.environ.get("API_REQUIRE_HTTPS", "true").lower() == "true"
     API_TRUST_PROXY_HEADERS = os.environ.get("API_TRUST_PROXY_HEADERS", "false").lower() == "true"
@@ -772,8 +776,252 @@ class APIStore:
                 )
 
 
+class StatisticsStore:
+    """Durable per-user activity counters and nightly CSV materialization."""
+
+    METRICS = {"slides_completed", "accessions_logged"}
+
+    def __init__(self, db_path: str, user_root: str):
+        self.db_path = db_path
+        self.user_root = user_root
+        self._initialized_path: Optional[str] = None
+        self._init_lock = threading.Lock()
+
+    def configure(self, db_path: str, user_root: str) -> None:
+        self.db_path = db_path
+        self.user_root = user_root
+        self._initialized_path = None
+
+    def _ensure_schema(self) -> None:
+        if self._initialized_path == self.db_path:
+            return
+        with self._init_lock:
+            if self._initialized_path == self.db_path:
+                return
+            parent = Path(self.db_path).parent
+            _make_private_directory(parent)
+            connection = sqlite3.connect(self.db_path, timeout=30)
+            try:
+                connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS user_days (
+                        user_id TEXT NOT NULL,
+                        activity_date TEXT NOT NULL,
+                        PRIMARY KEY (user_id, activity_date)
+                    );
+                    CREATE TABLE IF NOT EXISTS daily_statistics (
+                        user_id TEXT NOT NULL,
+                        activity_date TEXT NOT NULL,
+                        slides_completed INTEGER NOT NULL DEFAULT 0,
+                        accessions_logged INTEGER NOT NULL DEFAULT 0,
+                        active_minutes INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (user_id, activity_date)
+                    );
+                    CREATE TABLE IF NOT EXISTS heartbeat_state (
+                        user_id TEXT PRIMARY KEY,
+                        last_minute_bucket INTEGER NOT NULL
+                    );
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            os.chmod(self.db_path, PRIVATE_FILE_MODE)
+            self._initialized_path = self.db_path
+
+    @contextlib.contextmanager
+    def connection(self):
+        self._ensure_schema()
+        connection = sqlite3.connect(self.db_path, timeout=30)
+        connection.row_factory = sqlite3.Row
+        try:
+            yield connection
+            connection.commit()
+        finally:
+            connection.close()
+
+    @staticmethod
+    def local_date() -> datetime.date:
+        return datetime.date.today()
+
+    def note_presence(
+        self, user_id: str, activity_date: Optional[datetime.date] = None
+    ) -> None:
+        date_text = (activity_date or self.local_date()).isoformat()
+        with self.connection() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO user_days (user_id, activity_date) VALUES (?, ?)",
+                (str(user_id), date_text),
+            )
+
+    def increment(
+        self,
+        user_id: str,
+        metric: str,
+        amount: int = 1,
+        activity_date: Optional[datetime.date] = None,
+    ) -> None:
+        if metric not in self.METRICS:
+            raise ValueError(f"Unknown statistics metric: {metric}")
+        date_text = (activity_date or self.local_date()).isoformat()
+        with self.connection() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO user_days (user_id, activity_date) VALUES (?, ?)",
+                (str(user_id), date_text),
+            )
+            connection.execute(
+                f"""INSERT INTO daily_statistics
+                    (user_id, activity_date, {metric}) VALUES (?, ?, ?)
+                    ON CONFLICT(user_id, activity_date) DO UPDATE SET
+                    {metric}={metric}+excluded.{metric}""",
+                (str(user_id), date_text, int(amount)),
+            )
+
+    def heartbeat(
+        self, user_id: str, now: Optional[datetime.datetime] = None
+    ) -> bool:
+        current = now or datetime.datetime.now()
+        date_text = current.date().isoformat()
+        minute_bucket = int(current.timestamp() // 60)
+        credited = False
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT OR IGNORE INTO user_days (user_id, activity_date) VALUES (?, ?)",
+                (str(user_id), date_text),
+            )
+            state = connection.execute(
+                "SELECT last_minute_bucket FROM heartbeat_state WHERE user_id=?",
+                (str(user_id),),
+            ).fetchone()
+            if state is None or minute_bucket > state["last_minute_bucket"]:
+                connection.execute(
+                    """INSERT INTO heartbeat_state (user_id, last_minute_bucket)
+                       VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET
+                       last_minute_bucket=excluded.last_minute_bucket""",
+                    (str(user_id), minute_bucket),
+                )
+                connection.execute(
+                    """INSERT INTO daily_statistics
+                       (user_id, activity_date, active_minutes) VALUES (?, ?, 1)
+                       ON CONFLICT(user_id, activity_date) DO UPDATE SET
+                       active_minutes=active_minutes+1""",
+                    (str(user_id), date_text),
+                )
+                credited = True
+        return credited
+
+    @staticmethod
+    def rounded_hours(active_minutes: int) -> int:
+        return (int(active_minutes) + 30) // 60
+
+    @staticmethod
+    def _storage_key(user_id: str) -> str:
+        encoded = base64.urlsafe_b64encode(str(user_id).encode("utf-8"))
+        return "u_" + encoded.decode("ascii").rstrip("=")
+
+    def csv_path(self, user_id: str) -> Path:
+        return Path(self.user_root) / self._storage_key(user_id) / "logs" / "lifetime_stats.csv"
+
+    def _database_rows(self, user_id: str) -> Dict[str, Dict[str, int]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """SELECT u.activity_date,
+                          COALESCE(d.slides_completed, 0) AS slides_completed,
+                          COALESCE(d.accessions_logged, 0) AS accessions_logged,
+                          COALESCE(d.active_minutes, 0) AS active_minutes
+                   FROM user_days AS u
+                   LEFT JOIN daily_statistics AS d
+                     ON d.user_id=u.user_id AND d.activity_date=u.activity_date
+                   WHERE u.user_id=? ORDER BY u.activity_date""",
+                (str(user_id),),
+            ).fetchall()
+        values = {str(row["activity_date"]): dict(row) for row in rows if row["activity_date"]}
+        return values
+
+    def read_csv(self, user_id: str) -> List[Dict[str, Any]]:
+        path = self.csv_path(user_id)
+        if not path.is_file():
+            return []
+        with open(path, newline="", encoding="utf-8") as handle:
+            return [
+                {
+                    "date": row["date"],
+                    "slides_completed": int(row["slides_completed"]),
+                    "accessions_logged": int(row["accessions_logged"]),
+                    "hours": int(row["hours"]),
+                }
+                for row in csv.DictReader(handle)
+            ]
+
+    def rollup_user(
+        self, user_id: str, through_date: Optional[datetime.date] = None
+    ) -> Path:
+        cutoff = through_date or (self.local_date() - datetime.timedelta(days=1))
+        rows = self._database_rows(user_id)
+        completed = []
+        for date_text, row in sorted(rows.items()):
+            if datetime.date.fromisoformat(date_text) > cutoff:
+                continue
+            completed.append(
+                {
+                    "date": date_text,
+                    "slides_completed": int(row.get("slides_completed") or 0),
+                    "accessions_logged": int(row.get("accessions_logged") or 0),
+                    "hours": self.rounded_hours(int(row.get("active_minutes") or 0)),
+                }
+            )
+        path = self.csv_path(user_id)
+        _make_private_directory(path.parent.parent)
+        _make_private_directory(path.parent)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with open(temporary, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=("date", "slides_completed", "accessions_logged", "hours"),
+                )
+                writer.writeheader()
+                writer.writerows(completed)
+            os.chmod(temporary, PRIVATE_FILE_MODE)
+            os.replace(temporary, path)
+            os.chmod(path, PRIVATE_FILE_MODE)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+        return path
+
+    def dashboard(self, user_id: str) -> Dict[str, Any]:
+        today = self.local_date()
+        csv_rows = {row["date"]: row for row in self.read_csv(user_id)}
+        database_rows = self._database_rows(user_id)
+        today_values = database_rows.get(today.isoformat(), {})
+        csv_rows[today.isoformat()] = {
+            "date": today.isoformat(),
+            "slides_completed": int(today_values.get("slides_completed") or 0),
+            "accessions_logged": int(today_values.get("accessions_logged") or 0),
+            "hours": self.rounded_hours(int(today_values.get("active_minutes") or 0)),
+        }
+        week = []
+        for offset in range(6, -1, -1):
+            date_text = (today - datetime.timedelta(days=offset)).isoformat()
+            week.append(
+                csv_rows.get(
+                    date_text,
+                    {"date": date_text, "slides_completed": 0, "accessions_logged": 0, "hours": 0},
+                )
+            )
+        totals = {
+            metric: sum(int(row[metric]) for row in csv_rows.values())
+            for metric in ("slides_completed", "accessions_logged", "hours")
+        }
+        return {"week": week, "totals": totals}
+
+
 api_store = APIStore(Config.API_DB_PATH, Config.API_JOB_OUTPUT_DIR)
-api_store.mark_stale_jobs_interrupted()
+if os.environ.get("LABEL_CHECK_STATS_SCHEDULER") != "true":
+    api_store.mark_stale_jobs_interrupted()
+stats_store = StatisticsStore(Config.STATS_DB_PATH, Config.USER_STATS_ROOT)
 
 
 # ==============================================================================
@@ -784,7 +1032,7 @@ class User(UserMixin):
     def __init__(self, id: str, password_hash: str, correction_count: int = 0, is_admin: bool = False):
         self.id = id
         self.password_hash = password_hash
-        self.correction_count = int(correction_count)
+        # correction_count remains an accepted argument for legacy callers only.
         # Handle string 'True'/'False' from CSV loading
         if isinstance(is_admin, str):
             self.is_admin = is_admin.lower() == 'true'
@@ -797,11 +1045,14 @@ class User(UserMixin):
     def verify_password(self, password: str) -> bool:
         return check_password_hash(self.password_hash, password)
 
+    @property
+    def slides_completed(self) -> int:
+        return int(stats_store.dashboard(str(self.id))["totals"]["slides_completed"])
+
     def to_dict(self) -> Dict[str, str]:
         return {
             "id": self.id,
             "password_hash": self.password_hash,
-            "correction_count": str(self.correction_count),
             "is_admin": str(self.is_admin)
         }
 
@@ -908,7 +1159,7 @@ class CSVManager:
 
 class UserManager(CSVManager):
     def __init__(self):
-        super().__init__(Config.USERS_CSV_PATH, ["id", "password_hash", "correction_count", "is_admin"])
+        super().__init__(Config.USERS_CSV_PATH, ["id", "password_hash", "is_admin"])
         # Cache users in memory for performance, similar to DB
         self.users: Dict[str, User] = {}
         self.load()
@@ -920,7 +1171,6 @@ class UserManager(CSVManager):
             u = User(
                 id=row["id"],
                 password_hash=row["password_hash"],
-                correction_count=int(row["correction_count"]),
                 is_admin=row["is_admin"]
             )
             self.users[u.id] = u
@@ -4132,6 +4382,12 @@ def before_request_handler():
         )
         return None
 
+    if current_user.is_authenticated:
+        try:
+            stats_store.note_presence(str(current_user.id))
+        except Exception:
+            app.logger.exception("Could not record user presence")
+
     if (
         request.method in {"POST", "PUT", "PATCH", "DELETE"}
         and app.config.get("CSRF_ENABLED", True)
@@ -4191,6 +4447,10 @@ def login():
         if user and password_is_bounded and user.verify_password(password):
             api_store.clear_login_failures(username, client_address)
             login_user(user)
+            try:
+                stats_store.note_presence(user.id)
+            except Exception:
+                app.logger.exception("Could not record login presence")
             app.logger.info(f"User '{username}' logged in successfully.")
             return redirect(next_url or url_for("index"))
 
@@ -4274,7 +4534,53 @@ def index():
     if requested_index is not None:
         return redirect(url_for("qc", index=requested_index))
 
-    return render_template("index.html", messages=flash_messages())
+    statistics = stats_store.dashboard(str(current_user.id))
+    statistics["chart_max"] = max(
+        1,
+        *(
+            int(day[metric])
+            for day in statistics["week"]
+            for metric in ("slides_completed", "accessions_logged", "hours")
+        ),
+    )
+    return render_template(
+        "index.html", statistics=statistics, messages=flash_messages()
+    )
+
+
+@app.route("/statistics/heartbeat", methods=["POST"])
+@login_required
+def statistics_heartbeat():
+    credited = stats_store.heartbeat(str(current_user.id))
+    return jsonify(
+        {
+            "credited": credited,
+            "statistics": stats_store.dashboard(str(current_user.id)),
+        }
+    )
+
+
+@app.route("/statistics/lifetime")
+@login_required
+def lifetime_statistics():
+    rows = stats_store.read_csv(str(current_user.id))
+    return render_template(
+        "lifetime_statistics.html", rows=rows, messages=flash_messages()
+    )
+
+
+@app.route("/statistics/lifetime.csv")
+@login_required
+def download_lifetime_statistics():
+    path = stats_store.csv_path(str(current_user.id))
+    if not path.is_file():
+        stats_store.rollup_user(str(current_user.id))
+    return send_file(
+        path,
+        mimetype="text/csv",
+        as_attachment=True,
+        download_name="lifetime_stats.csv",
+    )
 
 
 @app.route("/tq", methods=["GET"])
@@ -5379,6 +5685,16 @@ def sdl():
         if workbook is not None:
             workbook.close()
 
+    if action == "add":
+        try:
+            stats_store.increment(str(current_user.id), "accessions_logged")
+        except Exception:
+            app.logger.exception("Could not record accession activity")
+            flash(
+                "The row was saved, but its statistics entry could not be recorded.",
+                "warning",
+            )
+
     flash(
         "Slide Digitization Log row updated successfully."
         if action == "update"
@@ -5639,10 +5955,11 @@ def update():
         has_changed = data_manager.update_row(idx, new_values)
 
         if has_changed:
-            current_user.correction_count += 1
-            user_manager.save()
-            
-            if request.form.get("action") == "next" and new_values["_is_complete"]:
+            completed_now = (
+                request.form.get("action") == "next" and new_values["_is_complete"]
+            )
+
+            if completed_now:
                 qi.status = "completed"
                 qi.completed_by_id = current_user.id
                 qi.completed_at = datetime.datetime.utcnow()
@@ -5657,6 +5974,18 @@ def update():
                 _create_backup(context)
                 data_manager.save_data(context.csv_path)
                 context.csv_mod_time = context.csv_path.stat().st_mtime
+
+                if completed_now:
+                    try:
+                        stats_store.increment(
+                            str(current_user.id), "slides_completed"
+                        )
+                    except Exception:
+                        app.logger.exception("Could not record slide completion activity")
+                        flash(
+                            "The slide was completed, but its statistics entry could not be recorded.",
+                            "warning",
+                        )
 
                 # --- CHECK IF LIST IS DONE ---
                 remaining = len([i for i in queue_manager.get_all() if i.status != "completed"])

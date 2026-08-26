@@ -51,6 +51,7 @@
     </style>
 </head>
 <body>
+{% include '_app_sidebar.html' %}
 <header>
     <h1>Renaming &amp; Deidentification</h1>
     <nav><a href="{{ url_for('index') }}">Menu</a><a href="{{ url_for('renaming_page', choose=1) }}">Choose Batch</a><a href="{{ url_for('logout') }}">Logout</a></nav>
