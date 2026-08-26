@@ -530,7 +530,7 @@
             {% endif %}
         </div>
     </div>
-    <div class="content-wrapper">
+    <main class="content-wrapper">
         <div class="left-panel">
             <ul class="flash-messages">
                 {% for message in messages %}
@@ -679,7 +679,7 @@
                 </div>
             </div>
         </div>
-    </div>
+    </main>
     <script nonce="{{ csp_nonce() }}">
         document.addEventListener('DOMContentLoaded', function() {
             const completeCheckbox = document.getElementById('complete');
