@@ -518,6 +518,44 @@ def _staged_pid_pairs(
     return pairs
 
 
+def _pid_pairs(
+    batch_base: Path, identifiers: Sequence[Dict[str, str]]
+) -> Dict[Tuple[str, str], str]:
+    """Return canonical committed and staged PIDs keyed by (MRN, organ)."""
+    pairs: Dict[Tuple[str, str], str] = {}
+    owners: Dict[Tuple[str, str], str] = {}
+
+    def remember(mrn: str, organ: str, pid: str, source: str) -> None:
+        mrn = mrn.strip()
+        organ = organ.strip().upper()
+        pid = pid.strip().upper()
+        if not mrn or organ not in ORGANS or not PID_RE.fullmatch(pid):
+            return
+        key = (mrn, organ)
+        existing = pairs.get(key)
+        if existing and existing != pid:
+            raise RenamingError(
+                f"MRN {mrn} has conflicting {source} PIDs in {organ}"
+            )
+        reverse = (organ, pid)
+        existing_mrn = owners.get(reverse)
+        if existing_mrn and existing_mrn != mrn:
+            raise RenamingError(
+                f"PID {pid} is assigned to multiple MRNs in {organ}"
+            )
+        pairs[key] = pid
+        owners[reverse] = mrn
+
+    for row in identifiers:
+        remember(
+            row.get("MRN", ""), row.get("Organ", ""), row.get("PID", ""),
+            "committed",
+        )
+    for (mrn, organ), pid in _staged_pid_pairs(batch_base, identifiers).items():
+        remember(mrn, organ, pid, "committed and staged")
+    return pairs
+
+
 def pid_after_organ_change(
     batch_root: Path,
     clone_root: Path,
@@ -539,39 +577,17 @@ def pid_after_organ_change(
     current = next((row for row in mapping if row_accession(row) == accession), None)
     if current is None:
         raise RenamingError("The accession is no longer available in this batch")
-    current_organ = current.get("Organ", "").strip().upper()
-    current_pid = current.get("PID", "").strip().upper()
-    if current_organ == target_organ and PID_RE.fullmatch(current_pid):
-        return current_pid
-
     identifiers = _identifier_rows(clone_root)
     reports = report_rows(batch_root, clone_root)
     mrn = reports.get(accession, {}).get("mrn", "").strip()
-    pairs: Dict[Tuple[str, str], str] = {}
-    for row in identifiers:
-        identifier_mrn = row.get("MRN", "").strip()
-        organ = row.get("Organ", "").strip().upper()
-        pid = row.get("PID", "").strip().upper()
-        if identifier_mrn and organ in ORGANS and PID_RE.fullmatch(pid):
-            pairs[(identifier_mrn, organ)] = pid
-    for key, pid in _staged_pid_pairs(batch_base, identifiers).items():
-        existing = pairs.get(key)
-        if existing and existing != pid:
-            raise RenamingError(
-                f"MRN {key[0]} has conflicting committed and staged PIDs in {key[1]}"
-            )
-        pairs[key] = pid
-    pid_owners: Dict[Tuple[str, str], str] = {}
-    for (pair_mrn, organ), pid in pairs.items():
-        reverse = (organ, pid)
-        existing_mrn = pid_owners.get(reverse)
-        if existing_mrn and existing_mrn != pair_mrn:
-            raise RenamingError(
-                f"PID {pid} has conflicting committed or staged MRNs in {organ}"
-            )
-        pid_owners[reverse] = pair_mrn
+    pairs = _pid_pairs(batch_base, identifiers)
     if mrn and (mrn, target_organ) in pairs:
         return pairs[(mrn, target_organ)]
+
+    current_organ = current.get("Organ", "").strip().upper()
+    current_pid = current.get("PID", "").strip().upper()
+    if not mrn and current_organ == target_organ and PID_RE.fullmatch(current_pid):
+        return current_pid
 
     reserved = _reserved_pids(batch_base)[target_organ]
     reserved.update(
@@ -589,9 +605,13 @@ def pid_after_organ_change(
 
 
 def _pid_for_identifiers(
-    row: Optional[Dict[str, str]], organ: str, identifiers: Sequence[Dict[str, str]], used: set
+    row: Optional[Dict[str, str]], organ: str, identifiers: Sequence[Dict[str, str]],
+    used: set, pairs: Optional[Dict[Tuple[str, str], str]] = None,
 ) -> str:
     mrn = (row or {}).get("mrn", "").strip()
+    key = (mrn, organ)
+    if mrn and pairs is not None and key in pairs:
+        return pairs[key]
     if mrn:
         for existing in identifiers:
             if (
@@ -599,7 +619,10 @@ def _pid_for_identifiers(
                 and existing.get("Organ", "").strip().upper() == organ
                 and PID_RE.fullmatch(existing.get("PID", "").strip().upper())
             ):
-                return existing["PID"].strip().upper()
+                pid = existing["PID"].strip().upper()
+                if pairs is not None:
+                    pairs[key] = pid
+                return pid
     candidates = used | {
         item.get("PID", "").strip().upper()
         for item in identifiers
@@ -610,6 +633,8 @@ def _pid_for_identifiers(
     while candidate in candidates:
         candidate = increment_pid(candidate)
     used.add(candidate)
+    if mrn and pairs is not None:
+        pairs[key] = candidate
     return candidate
 
 
@@ -741,16 +766,9 @@ def stage_longitudinal_history(
         identifier_by_accession = {row_accession(row): row for row in identifiers}
         _, clone_rows, _ = _clone_rows(clone_root)
         reserved = _reserved_pids(batch_base)
+        canonical_pairs = _pid_pairs(batch_base, identifiers)
         reports = report_rows(batch_root, clone_root)
         _, mapping = read_csv(batch_root / "name_mapping.csv")
-        pair_pids: Dict[Tuple[str, str], str] = {}
-        for row in mapping:
-            report = reports.get(row_accession(row), {})
-            mrn = report.get("mrn", "").strip()
-            organ = row.get("Organ", "").strip().upper()
-            pid = row.get("PID", "").strip().upper()
-            if mrn and organ in ORGANS and PID_RE.fullmatch(pid):
-                pair_pids[(mrn, organ)] = pid
         staged: Dict[str, Dict[str, str]] = {}
         for raw in queried:
             row = collapse_report_fields(raw)
@@ -759,7 +777,7 @@ def stage_longitudinal_history(
                 continue
             organ = derive_organ(row)
             mrn = row.get("mrn", "").strip()
-            pid = pair_pids.get((mrn, organ), "")
+            pid = canonical_pairs.get((mrn, organ), "")
             row.update({
                 "organ": organ,
                 "_accdate": clean_date(row.get("accession_date", "")),
@@ -779,9 +797,10 @@ def stage_longitudinal_history(
                 for field in DERIVED_COPATH_FIELDS:
                     row[field] = existing_raw.get(field, "")
             else:
-                if not PID_RE.fullmatch(pid):
-                    pid = _pid_for_identifiers(row, organ, identifiers, reserved[organ])
-                    pair_pids[(mrn, organ)] = pid
+                if mrn or not PID_RE.fullmatch(pid):
+                    pid = _pid_for_identifiers(
+                        row, organ, identifiers, reserved[organ], canonical_pairs
+                    )
                 row["PID"] = pid
             staged[accession] = row
         fields = list(dict.fromkeys([*headers, *DERIVED_COPATH_FIELDS]))
@@ -839,14 +858,17 @@ def prepare_batch(
     atomic_write(pending_path, pending_headers, pending_rows)
     pending_by_accession = {row_accession(row): row for row in pending_rows}
     reserved = _reserved_pids(batch_base)
+    canonical_pairs = _pid_pairs(batch_base, identifiers)
     accession_values: Dict[str, Dict[str, str]] = {}
     for accession in accessions:
         source = existing.get(accession) or pending_by_accession.get(accession)
         organ = (source or {}).get("organ") or derive_organ(source)
         organ = organ if organ in ORGANS else "UNKNOWN"
         pid = (source or {}).get("PID", "")
-        if not PID_RE.fullmatch(pid):
-            pid = _pid_for_identifiers(source, organ, identifiers, reserved[organ])
+        if (source or {}).get("mrn", "").strip() or not PID_RE.fullmatch(pid):
+            pid = _pid_for_identifiers(
+                source, organ, identifiers, reserved[organ], canonical_pairs
+            )
         accession_values[accession] = {
             "Organ": organ,
             "PID": pid,
@@ -1051,16 +1073,12 @@ def retry_group(
     else:
         organ = organ or derive_organ(source)
         reserved = _reserved_pids(batch_base)
+        canonical_pairs = _pid_pairs(batch_base, identifiers)
         pid = (source or {}).get("PID", "")
-        if (
-            not PID_RE.fullmatch(pid)
-            and current
-            and current.get("Organ") == organ
-            and PID_RE.fullmatch(current.get("PID", ""))
-        ):
-            pid = current["PID"]
-        if not PID_RE.fullmatch(pid):
-            pid = _pid_for_identifiers(source, organ, identifiers, reserved[organ])
+        if (source or {}).get("mrn", "").strip() or not PID_RE.fullmatch(pid):
+            pid = _pid_for_identifiers(
+                source, organ, identifiers, reserved[organ], canonical_pairs
+            )
         shared = {
             "Organ": organ, "PID": pid,
             "AccessionDate": clean_date((source or {}).get("accession_date", "")),
@@ -1142,11 +1160,14 @@ def finalize_batch(batch_root: Path, clone_root: Path) -> None:
             history_headers = list(dict.fromkeys([
                 *collapse_report_headers(history_headers), *DERIVED_COPATH_FIELDS,
             ]))
-            pair_pids: Dict[Tuple[str, str], str] = {}
-            for accession, approved in approved_by_accession.items():
-                mrn = (reports.get(accession) or {}).get("mrn", "").strip()
-                if mrn:
-                    pair_pids[(mrn, approved["Organ"])] = approved["PID"]
+            pair_pids = {
+                (row.get("MRN", "").strip(), row.get("Organ", "").strip().upper()):
+                    row.get("PID", "").strip().upper()
+                for row in identifiers.values()
+                if row.get("MRN", "").strip()
+                and row.get("Organ", "").strip().upper() in ORGANS
+                and PID_RE.fullmatch(row.get("PID", "").strip().upper())
+            }
             commit_used = {
                 organ: {
                     row.get("PID", "").strip().upper()
@@ -1178,24 +1199,16 @@ def finalize_batch(batch_root: Path, clone_root: Path) -> None:
                     pid = pair_pids[(mrn, organ)]
                     raw["PID"] = pid
                 if not old and not approved:
-                    pair_match = next((
-                        item.get("PID", "").strip().upper()
-                        for item in identifiers.values()
-                        if item.get("MRN", "").strip() == mrn
-                        and item.get("Organ", "").strip().upper() == organ
-                        and PID_RE.fullmatch(item.get("PID", "").strip().upper())
-                    ), "")
                     collision = any(
                         item.get("Organ", "").strip().upper() == organ
                         and item.get("PID", "").strip().upper() == pid
                         and item.get("MRN", "").strip() != mrn
                         for item in identifiers.values()
                     )
-                    if pair_match:
-                        pid = pair_match
-                    elif not PID_RE.fullmatch(pid) or collision:
+                    if mrn or not PID_RE.fullmatch(pid) or collision:
                         pid = _pid_for_identifiers(
-                            raw, organ, list(identifiers.values()), commit_used[organ]
+                            raw, organ, list(identifiers.values()), commit_used[organ],
+                            pair_pids,
                         )
                     raw["PID"] = pid
                     commit_used[organ].add(pid)

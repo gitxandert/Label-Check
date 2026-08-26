@@ -70,6 +70,97 @@ class RenamingDataTests(unittest.TestCase):
         self.assertEqual("BRAIN_AAAAAZ_20250304_XXXX_HE_WSI_REB4000.svs", rows[0]["NewName"])
         self.assertTrue(all(row["Approved"] == "False" for row in rows))
 
+    def test_prepare_maps_new_accessions_by_mrn_and_organ(self):
+        write_csv(
+            self.batch / "enriched.csv",
+            ["AccessionID", "Stain", "BlockNumber", "original_slide_path"],
+            [
+                {"AccessionID": "NP25-100", "Stain": "HE", "BlockNumber": "A1", "original_slide_path": "one.svs"},
+                {"AccessionID": "NP25-200", "Stain": "HE", "BlockNumber": "A2", "original_slide_path": "two.svs"},
+            ],
+        )
+
+        def same_patient(_batch, accessions, output):
+            self.assertEqual(["NP25-100", "NP25-200"], list(accessions))
+            write_csv(
+                output,
+                ["accession_id", "mrn", "sample_acquisition_type"],
+                [
+                    {"accession_id": accession, "mrn": "MRN2", "sample_acquisition_type": "Brain resection"}
+                    for accession in accessions
+                ],
+            )
+
+        renaming.prepare_batch(
+            self.batch, self.clone, self.batch_base, same_patient
+        )
+
+        _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
+        self.assertEqual({"NP25-100", "NP25-200"}, {
+            row["AccessionID"] for row in rows
+        })
+        self.assertEqual({"AAAABA"}, {row["PID"] for row in rows})
+
+    def test_prepare_reuses_pair_from_another_staged_batch(self):
+        staged_batch = self.batch_base / "SS200" / "batch-2"
+        staged = {
+            "AccessionID": "NP25-200", "Organ": "BRAIN", "PID": "AAAABA",
+            "AccessionDate": "20250101", "Timepoint": "XXXX", "Stain": "HE",
+            "ImageType": "WSI", "SampAcqType": "RE", "BlockNumber": "A1",
+            "SectionCount": "000", "OriginalPath": "staged.svs", "Approved": "False",
+        }
+        staged["NewName"] = renaming.build_new_name(staged)
+        renaming.atomic_write(
+            staged_batch / "name_mapping.csv", renaming.MAPPING_FIELDS, [staged]
+        )
+        write_csv(
+            staged_batch / "pending_CoPath_data.csv",
+            ["accession_id", "mrn"],
+            [{"accession_id": "NP25-200", "mrn": "MRN2"}],
+        )
+
+        def same_patient(_batch, _accessions, output):
+            write_csv(
+                output,
+                ["accession_id", "mrn", "sample_acquisition_type"],
+                [{"accession_id": "NP25-100", "mrn": "MRN2", "sample_acquisition_type": "Brain resection"}],
+            )
+
+        renaming.prepare_batch(
+            self.batch, self.clone, self.batch_base, same_patient
+        )
+
+        _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
+        self.assertEqual({"AAAABA"}, {row["PID"] for row in rows})
+
+    def test_same_mrn_uses_separate_pid_mapping_for_each_organ(self):
+        write_csv(
+            self.batch / "enriched.csv",
+            ["AccessionID", "Stain", "BlockNumber", "original_slide_path"],
+            [
+                {"AccessionID": "NP25-100", "Stain": "HE", "BlockNumber": "A1", "original_slide_path": "one.svs"},
+                {"AccessionID": "NP25-200", "Stain": "HE", "BlockNumber": "A2", "original_slide_path": "two.svs"},
+            ],
+        )
+
+        def two_organs(_batch, _accessions, output):
+            write_csv(
+                output,
+                ["accession_id", "mrn", "sample_acquisition_type"],
+                [
+                    {"accession_id": "NP25-100", "mrn": "MRN2", "sample_acquisition_type": "Brain resection"},
+                    {"accession_id": "NP25-200", "mrn": "MRN2", "sample_acquisition_type": "Breast biopsy"},
+                ],
+            )
+
+        renaming.prepare_batch(
+            self.batch, self.clone, self.batch_base, two_organs
+        )
+
+        _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
+        assignments = {row["Organ"]: row["PID"] for row in rows}
+        self.assertEqual({"BRAIN": "AAAABA", "BREAST": "AAAAAA"}, assignments)
+
     def test_prepare_missing_report_uses_unknown_and_index_only_on_finalize(self):
         def no_results(_batch, _accessions, output):
             write_csv(output, ["accession_id"], [])
@@ -376,6 +467,7 @@ class RenamingPageTests(unittest.TestCase):
         self.assertIn(b"pidLookupUrl", detail.data)
         self.assertIn(b"pidLookupQueue", detail.data)
         self.assertIn(b"reserved_pid", detail.data)
+        self.assertIn(b'name="pid" value="AAAAAA" maxlength="6" required readonly', detail.data)
         self.assertIn(b'class="success approve-button"', detail.data)
 
     def test_pid_preview_returns_next_staged_pid_for_changed_organ(self):
@@ -461,6 +553,21 @@ class RenamingPageTests(unittest.TestCase):
         first = next(row for row in saved if row["AccessionID"] == "NP25-100")
         self.assertEqual("BRAIN", first["Organ"])
         self.assertEqual("AAAAAC", first["PID"])
+
+    def test_approval_ignores_submitted_pid_without_organ_change(self):
+        _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
+        batches, _ = app_module._renaming_batches()
+
+        response = self.client.post(
+            f"/renaming/approve/{batches[0].id}",
+            data=self.approval_data(rows, pid="ZZZZZZ"),
+            headers={"Accept": "application/json"},
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertTrue(response.get_json()["success"])
+        _, saved = renaming.read_csv(self.batch / "name_mapping.csv")
+        self.assertEqual("AAAAAA", saved[0]["PID"])
 
     def test_multiple_accessions_render_as_complete_rows_before_expansion(self):
         self.add_second_accession()

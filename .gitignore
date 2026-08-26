@@ -229,3 +229,4 @@ docker-compose.yml
 # agent artifacts
 CLAUDE.md
 .codex
+AGENTS.md

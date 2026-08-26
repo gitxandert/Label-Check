@@ -1772,11 +1772,12 @@ def _start_longitudinal_job(context: BatchContext, *, force: bool = False) -> bo
 
     def worker() -> None:
         try:
-            renaming.stage_longitudinal_history(
-                context.root,
-                Path(Config.COPATH_CLONE),
-                Path(Config.LABEL_CHECK_BATCHES),
-            )
+            with _renaming_clone_lock:
+                renaming.stage_longitudinal_history(
+                    context.root,
+                    Path(Config.COPATH_CLONE),
+                    Path(Config.LABEL_CHECK_BATCHES),
+                )
             mapping_path = context.root / "name_mapping.csv"
             if mapping_path.exists():
                 _, rows = renaming.read_csv(mapping_path)
@@ -5147,10 +5148,7 @@ def renaming_approve(batch_id: str):
                 raise renaming.RenamingError(
                     "The accession is no longer available in this batch"
                 )
-            if (
-                not target_exists
-                and current.get("Organ", "").strip().upper() != values["Organ"]
-            ):
+            if not target_exists:
                 values["PID"] = renaming.pid_after_organ_change(
                     context.root,
                     Path(Config.COPATH_CLONE),
