@@ -1031,6 +1031,8 @@ def retry_group(
     mapping_path = batch_root / "name_mapping.csv"
     _, mapping = read_csv(mapping_path)
     current = next((row for row in mapping if row["AccessionID"] == old_accession), None)
+    if current is None:
+        raise RenamingError("The accession is no longer available in this batch")
     target = next(
         (
             row for row in mapping
@@ -1041,9 +1043,27 @@ def retry_group(
     accession_org, clone_rows, _ = _clone_rows(clone_root)
     identifiers = _identifier_rows(clone_root)
     source: Optional[Dict[str, str]] = None
+    source_from_history = False
+    history_source_headers: List[str] = []
     organ = accession_org.get(new_accession)
     if organ in ORGANS:
         source = next((row for row in clone_rows[organ] if row_accession(row) == new_accession), None)
+    # A corrected accession may already be present in this batch's pending CoPath
+    # data (for example, from longitudinal history). Reuse it before issuing a
+    # duplicate exact-accession query. An unchanged accession still forces retry.
+    if source is None and target is None and new_accession != old_accession:
+        source = report_rows(batch_root, clone_root).get(new_accession)
+    if source is None and target is None and new_accession != old_accession:
+        history_path = batch_root / "pending_CoPath_history.csv"
+        if history_path.exists():
+            history_source_headers, history_rows = read_csv(history_path)
+            history_source_headers = collapse_report_headers(history_source_headers)
+            history_rows = [collapse_report_fields(row) for row in history_rows]
+            source = next(
+                (row for row in history_rows if row_accession(row) == new_accession),
+                None,
+            )
+            source_from_history = source is not None
     if source is None and target is None:
         with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as handle:
             retry_path = Path(handle.name)
@@ -1068,6 +1088,23 @@ def retry_group(
             atomic_write(pending_path, pending_headers or ["accession_id"], pending)
         finally:
             retry_path.unlink(missing_ok=True)
+    if new_accession != old_accession:
+        pending_path = batch_root / "pending_CoPath_data.csv"
+        if pending_path.exists():
+            pending_headers, pending = read_csv(pending_path)
+            pending_headers = collapse_report_headers(pending_headers)
+            pending = [collapse_report_fields(row) for row in pending]
+            pending = [row for row in pending if row_accession(row) != old_accession]
+        else:
+            pending_headers, pending = [], []
+        if source_from_history and source is not None:
+            pending = [row for row in pending if row_accession(row) != new_accession]
+            pending.append(source)
+            pending_headers = list(dict.fromkeys([
+                *pending_headers, *history_source_headers, *source.keys(),
+            ]))
+        if pending_path.exists() or source_from_history:
+            atomic_write(pending_path, pending_headers or ["accession_id"], pending)
     if target:
         shared = {field: target[field] for field in ("Organ", "PID", "AccessionDate", "Timepoint", "ImageType", "SampAcqType")}
     else:
@@ -1099,6 +1136,18 @@ def retry_group(
     if errors:
         raise RenamingError("; ".join(errors))
     atomic_write(mapping_path, MAPPING_FIELDS, mapping)
+    if new_accession != old_accession:
+        enriched_path = batch_root / "enriched.csv"
+        enriched_headers, enriched_rows = read_csv(enriched_path)
+        if "AccessionID" not in enriched_headers:
+            raise RenamingError("enriched.csv must contain AccessionID")
+        enriched_changed = False
+        for row in enriched_rows:
+            if row_accession(row) == old_accession:
+                row["AccessionID"] = new_accession
+                enriched_changed = True
+        if enriched_changed:
+            atomic_write(enriched_path, enriched_headers, enriched_rows)
     known_mrns = {row.get("MRN", "").strip() for row in identifiers if row.get("MRN", "").strip()}
     mrn = (source or {}).get("mrn", "").strip()
     seeds = [new_accession] if source is not None and mrn and mrn not in known_mrns else []

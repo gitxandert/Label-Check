@@ -1834,6 +1834,9 @@ def _start_renaming_job(
                         old_accession,
                         new_accession,
                     )
+                    _replace_sdl_accession(old_accession, new_accession)
+                    context.data_manager.load_data(context.csv_path)
+                    context.csv_mod_time = context.csv_path.stat().st_mtime
                 else:
                     renaming.prepare_batch(
                         context.root,
@@ -2508,6 +2511,27 @@ def _update_sdl_after_renaming(batch_root: Path) -> int:
             if initialized_headers or new_rows:
                 _save_sdl_workbook(workbook)
             return len(new_rows)
+        finally:
+            workbook.close()
+
+
+def _replace_sdl_accession(old_accession: str, new_accession: str) -> int:
+    """Replace an accession in existing SDL rows and return rows changed."""
+    if old_accession == new_accession:
+        return 0
+    with _sdl_workbook_lock:
+        workbook, worksheet, _ = _load_sdl_workbook()
+        try:
+            accession_column = _sdl_header_columns(worksheet)["Accession ID"]
+            changed = 0
+            for row_number in range(2, worksheet.max_row + 1):
+                cell = worksheet.cell(row=row_number, column=accession_column)
+                if str(cell.value or "").strip().upper() == old_accession:
+                    cell.value = new_accession
+                    changed += 1
+            if changed:
+                _save_sdl_workbook(workbook)
+            return changed
         finally:
             workbook.close()
 

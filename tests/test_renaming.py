@@ -354,6 +354,71 @@ class RenamingDataTests(unittest.TestCase):
         self.assertTrue(all(row["PID"] == "AAAAAB" for row in updated))
         self.assertTrue(all(row["Approved"] == "False" for row in updated))
 
+    def test_retry_reuses_existing_accession_and_updates_batch_tables(self):
+        renaming.prepare_batch(self.batch, self.clone, self.batch_base, self.query)
+        pending_path = self.batch / "pending_CoPath_data.csv"
+        headers, pending = renaming.read_csv(pending_path)
+        corrected = dict(pending[0])
+        corrected.update({
+            "accession_id": "NP25-200",
+            "accession_date": "2025-04-05",
+        })
+        renaming.atomic_write(pending_path, headers, [*pending, corrected])
+
+        def unexpected_query(_batch, _accessions, _output):
+            self.fail("existing corrected accession should not requery CoPath")
+
+        renaming.retry_group(
+            self.batch,
+            self.clone,
+            self.batch_base,
+            "NP25-100",
+            "NP25-200",
+            unexpected_query,
+        )
+
+        _, mapping = renaming.read_csv(self.batch / "name_mapping.csv")
+        _, enriched = renaming.read_csv(self.batch / "enriched.csv")
+        _, pending = renaming.read_csv(pending_path)
+        self.assertEqual({"NP25-200"}, {row["AccessionID"] for row in mapping})
+        self.assertEqual({"NP25-200"}, {row["AccessionID"] for row in enriched})
+        self.assertEqual({"NP25-200"}, {renaming.row_accession(row) for row in pending})
+
+    def test_retry_reuses_accession_from_pending_history(self):
+        renaming.prepare_batch(self.batch, self.clone, self.batch_base, self.query)
+        history_path = self.batch / "pending_CoPath_history.csv"
+        write_csv(
+            history_path,
+            ["accession_id", "mrn", "accession_date", "sample_acquisition_type"],
+            [{
+                "accession_id": "NP25-200",
+                "mrn": "MRN2",
+                "accession_date": "2025-04-05",
+                "sample_acquisition_type": "Brain resection",
+            }],
+        )
+
+        def unexpected_query(_batch, _accessions, _output):
+            self.fail("pending history accession should not requery CoPath")
+
+        renaming.retry_group(
+            self.batch,
+            self.clone,
+            self.batch_base,
+            "NP25-100",
+            "NP25-200",
+            unexpected_query,
+        )
+
+        _, mapping = renaming.read_csv(self.batch / "name_mapping.csv")
+        _, pending = renaming.read_csv(self.batch / "pending_CoPath_data.csv")
+        corrected = next(
+            row for row in pending if renaming.row_accession(row) == "NP25-200"
+        )
+        self.assertEqual({"NP25-200"}, {row["AccessionID"] for row in mapping})
+        self.assertEqual("MRN2", corrected["mrn"])
+        self.assertFalse(history_path.exists())
+
 
 class RenamingPageTests(unittest.TestCase):
     def setUp(self):
@@ -469,6 +534,31 @@ class RenamingPageTests(unittest.TestCase):
         self.assertIn(b"reserved_pid", detail.data)
         self.assertIn(b'name="pid" value="AAAAAA" maxlength="6" required readonly', detail.data)
         self.assertIn(b'class="success approve-button"', detail.data)
+
+    def test_replace_sdl_accession_updates_existing_rows(self):
+        workbook = load_workbook(app_module.Config.SDL_FILE_PATH)
+        worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
+        old_row = {header: None for header in app_module.SDL_HEADERS}
+        old_row["Accession ID"] = "NP25-100"
+        other_row = dict(old_row)
+        other_row["Accession ID"] = "NP25-300"
+        worksheet.append([old_row[header] for header in app_module.SDL_HEADERS])
+        worksheet.append([other_row[header] for header in app_module.SDL_HEADERS])
+        workbook.save(app_module.Config.SDL_FILE_PATH)
+        workbook.close()
+
+        changed = app_module._replace_sdl_accession("NP25-100", "NP25-200")
+
+        self.assertEqual(1, changed)
+        workbook = load_workbook(app_module.Config.SDL_FILE_PATH)
+        worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
+        headers = app_module._sdl_header_columns(worksheet)
+        values = [
+            worksheet.cell(row=row, column=headers["Accession ID"]).value
+            for row in range(2, worksheet.max_row + 1)
+        ]
+        self.assertEqual(["NP25-200", "NP25-300"], values)
+        workbook.close()
 
     def test_pid_preview_returns_next_staged_pid_for_changed_organ(self):
         _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
