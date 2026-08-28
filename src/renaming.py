@@ -969,6 +969,19 @@ def group_mapping(rows: Sequence[Dict[str, str]], reports: Dict[str, Dict[str, s
     return result
 
 
+def renumber_merged_mapping(rows: Sequence[Dict[str, str]]) -> None:
+    """Assign unique section numbers and names after accession groups merge."""
+    counters: Dict[Tuple[str, ...], int] = defaultdict(int)
+    for row in rows:
+        key = (
+            row["Organ"], row["PID"], row["AccessionDate"], row["Timepoint"],
+            row["Stain"], row["ImageType"], row["SampAcqType"], row["BlockNumber"],
+        )
+        row["SectionCount"] = f"{counters[key]:03d}"
+        counters[key] += 1
+        row["NewName"] = build_new_name(row)
+
+
 def update_group(
     mapping_path: Path, old_accession: str, values: Dict[str, str], slide_values: Dict[str, Dict[str, str]],
     expected_signature: str,
@@ -995,15 +1008,7 @@ def update_group(
         for row in rows:
             if row["AccessionID"] == new_accession:
                 row["Approved"] = "False"
-        counters: Dict[Tuple[str, ...], int] = defaultdict(int)
-        for row in rows:
-            key = (
-                row["Organ"], row["PID"], row["AccessionDate"], row["Timepoint"],
-                row["Stain"], row["ImageType"], row["SampAcqType"], row["BlockNumber"],
-            )
-            row["SectionCount"] = f"{counters[key]:03d}"
-            counters[key] += 1
-            row["NewName"] = build_new_name(row)
+        renumber_merged_mapping(rows)
     errors = validate_mapping_rows(rows)
     if errors:
         raise RenamingError("; ".join(errors))
@@ -1132,6 +1137,7 @@ def retry_group(
         for row in mapping:
             if row["AccessionID"] == new_accession:
                 row["Approved"] = "False"
+        renumber_merged_mapping(mapping)
     errors = validate_mapping_rows(mapping)
     if errors:
         raise RenamingError("; ".join(errors))

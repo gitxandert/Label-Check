@@ -419,6 +419,62 @@ class RenamingDataTests(unittest.TestCase):
         self.assertEqual("MRN2", corrected["mrn"])
         self.assertFalse(history_path.exists())
 
+    def test_retry_merges_typo_group_into_existing_accession(self):
+        rows = []
+        for accession, path in (
+            ("NP25-100", "typo.svs"),
+            ("NP25-200", "correct.svs"),
+        ):
+            row = {
+                "AccessionID": accession,
+                "Organ": "BRAIN",
+                "PID": "AAAAAA",
+                "AccessionDate": "20250304",
+                "Timepoint": "XXXX",
+                "Stain": "HE",
+                "ImageType": "WSI",
+                "SampAcqType": "RE",
+                "BlockNumber": "B4",
+                "SectionCount": "000",
+                "OriginalPath": path,
+                "Approved": "False",
+            }
+            row["NewName"] = renaming.build_new_name(row)
+            rows.append(row)
+        renaming.atomic_write(
+            self.batch / "name_mapping.csv", renaming.MAPPING_FIELDS, rows
+        )
+        write_csv(
+            self.batch / "enriched.csv",
+            ["AccessionID", "Stain", "BlockNumber", "original_slide_path"],
+            [
+                {"AccessionID": "NP25-100", "Stain": "HE", "BlockNumber": "B4", "original_slide_path": "typo.svs"},
+                {"AccessionID": "NP25-200", "Stain": "HE", "BlockNumber": "B4", "original_slide_path": "correct.svs"},
+            ],
+        )
+
+        def unexpected_query(_batch, _accessions, _output):
+            self.fail("existing target accession should not requery CoPath")
+
+        renaming.retry_group(
+            self.batch,
+            self.clone,
+            self.batch_base,
+            "NP25-100",
+            "NP25-200",
+            unexpected_query,
+        )
+
+        _, merged = renaming.read_csv(self.batch / "name_mapping.csv")
+        groups = renaming.group_mapping(merged, {})
+        _, enriched = renaming.read_csv(self.batch / "enriched.csv")
+        self.assertEqual(1, len(groups))
+        self.assertEqual("NP25-200", groups[0]["accession"])
+        self.assertEqual(2, len(groups[0]["slides"]))
+        self.assertEqual(["000", "001"], [row["SectionCount"] for row in merged])
+        self.assertEqual(2, len({row["NewName"] for row in merged}))
+        self.assertEqual({"NP25-200"}, {row["AccessionID"] for row in enriched})
+
 
 class RenamingPageTests(unittest.TestCase):
     def setUp(self):
