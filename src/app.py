@@ -211,8 +211,28 @@ def _make_private_directory(path: Union[str, Path]) -> Path:
     if directory.is_symlink():
         raise RuntimeError(f"Sensitive runtime directory cannot be a symbolic link: {directory}")
     directory.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIRECTORY_MODE)
-    os.chmod(directory, PRIVATE_DIRECTORY_MODE)
+    _set_private_mode(directory, PRIVATE_DIRECTORY_MODE)
     return directory
+
+
+def _set_private_mode(path: Path, expected_mode: int) -> bool:
+    """Apply POSIX mode, tolerating unsupported Docker Desktop bind mounts."""
+    try:
+        os.chmod(path, expected_mode)
+        return True
+    except PermissionError:
+        containerized = os.environ.get("LABEL_CHECK_CONTAINER", "false").lower() == "true"
+        required_access = os.R_OK | os.W_OK
+        if path.is_dir():
+            required_access |= os.X_OK
+        if not containerized or not os.access(path, required_access):
+            raise
+        logging.getLogger(__name__).warning(
+            "POSIX permissions are unsupported for bind-mounted runtime path %s; "
+            "enforce access through Windows ACLs",
+            path,
+        )
+        return False
 
 
 def _verify_private_mode(path: Path, expected_mode: int) -> None:
@@ -238,8 +258,8 @@ def harden_runtime_permissions(
             raise RuntimeError(
                 f"Sensitive runtime directory cannot be a symbolic link: {root_path}"
             )
-        os.chmod(root_path, PRIVATE_DIRECTORY_MODE)
-        _verify_private_mode(root_path, PRIVATE_DIRECTORY_MODE)
+        if _set_private_mode(root_path, PRIVATE_DIRECTORY_MODE):
+            _verify_private_mode(root_path, PRIVATE_DIRECTORY_MODE)
         for name in directories:
             child = root_path / name
             if child.is_symlink():
@@ -252,16 +272,17 @@ def harden_runtime_permissions(
                 raise RuntimeError(
                     f"Sensitive runtime path cannot be a symbolic link: {child}"
                 )
-            os.chmod(child, PRIVATE_FILE_MODE)
-            _verify_private_mode(child, PRIVATE_FILE_MODE)
+            if _set_private_mode(child, PRIVATE_FILE_MODE):
+                _verify_private_mode(child, PRIVATE_FILE_MODE)
 
     for child in logs.glob("app.log*"):
         if child.is_symlink():
             raise RuntimeError(f"Log file cannot be a symbolic link: {child}")
         if child.is_file():
-            os.chmod(child, PRIVATE_FILE_MODE)
-            _verify_private_mode(child, PRIVATE_FILE_MODE)
-    _verify_private_mode(logs, PRIVATE_DIRECTORY_MODE)
+            if _set_private_mode(child, PRIVATE_FILE_MODE):
+                _verify_private_mode(child, PRIVATE_FILE_MODE)
+    if _set_private_mode(logs, PRIVATE_DIRECTORY_MODE):
+        _verify_private_mode(logs, PRIVATE_DIRECTORY_MODE)
 
 
 # ==============================================================================
@@ -272,7 +293,7 @@ def setup_logging(app: Flask) -> None:
     log_dir = _make_private_directory(app.config["APP_LOG_DIR"])
     log_path = log_dir / "app.log"
     file_handler = RotatingFileHandler(log_path, maxBytes=102400, backupCount=10)
-    os.chmod(log_path, PRIVATE_FILE_MODE)
+    _set_private_mode(log_path, PRIVATE_FILE_MODE)
     file_handler.setFormatter(
         logging.Formatter(
             "%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]"

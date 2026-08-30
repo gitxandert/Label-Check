@@ -174,6 +174,25 @@ class SecurityConfigurationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "symbolic link"):
                 app_module.harden_runtime_permissions(instance, logs)
 
+    def test_container_bind_mount_can_rely_on_windows_acls_when_chmod_is_unsupported(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "batch_catalog.sqlite3"
+            path.touch()
+            permission_error = PermissionError(1, "Operation not permitted", str(path))
+            with (
+                mock.patch.dict(os.environ, {"LABEL_CHECK_CONTAINER": "true"}),
+                mock.patch.object(os, "chmod", side_effect=permission_error),
+                mock.patch.object(os, "access", return_value=True),
+            ):
+                self.assertFalse(app_module._set_private_mode(path, 0o600))
+
+            with (
+                mock.patch.dict(os.environ, {"LABEL_CHECK_CONTAINER": "false"}),
+                mock.patch.object(os, "chmod", side_effect=permission_error),
+            ):
+                with self.assertRaises(PermissionError):
+                    app_module._set_private_mode(path, 0o600)
+
     def test_api_store_creates_private_database_and_job_output(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

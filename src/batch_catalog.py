@@ -139,7 +139,14 @@ class BatchCatalog:
                     raise RuntimeError(f"Unsupported batch catalog schema version: {version}")
                 connection.commit()
                 if os.name != "nt":
-                    os.chmod(path, 0o600)
+                    try:
+                        os.chmod(path, 0o600)
+                    except PermissionError:
+                        containerized = os.environ.get(
+                            "LABEL_CHECK_CONTAINER", "false"
+                        ).lower() == "true"
+                        if not containerized or not os.access(path, os.R_OK | os.W_OK):
+                            raise
             finally:
                 connection.close()
             self._schema_path = path
