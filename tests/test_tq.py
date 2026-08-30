@@ -142,6 +142,14 @@ class TQTransferTests(unittest.TestCase):
         }
         app_module.Config.LABEL_CHECK_BATCHES = str(self.batch_base)
         app_module.Config.INSTANCE_DIR = str(self.root / "instance")
+        app_module.batch_contexts.clear()
+        catalog_batches, _ = app_module.discover_batches()
+        app_module.batch_catalog.update_stages(
+            app_module.Config.INSTANCE_DIR,
+            catalog_batches[0].id,
+            qc_complete=True,
+            renamed_complete=True,
+        )
         app_module.Config.SDL_FILE_PATH = str(self.sdl_path)
         app_module.Config.TQ_HOME_DIR = str(self.tq_home)
         app_module.Config.TQ_TRANSFER_LOG_DIR = str(self.batch_base / "transfer_logs")

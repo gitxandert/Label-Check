@@ -43,6 +43,7 @@ class CompletedStagesTests(unittest.TestCase):
         qc_app.Config.LABEL_CHECK_BATCHES = str(self.batch_base)
         qc_app.Config.INSTANCE_DIR = str(self.root / "instance")
         qc_app.batch_contexts.clear()
+        qc_app.app.config.update(TESTING=True, SECRET_KEY="completed-stages-test")
 
     def tearDown(self):
         qc_app.batch_contexts.clear()
@@ -50,16 +51,16 @@ class CompletedStagesTests(unittest.TestCase):
         qc_app.Config.INSTANCE_DIR = self.old_instance_dir
         self.temp_dir.cleanup()
 
-    def test_discovery_creates_default_file_and_ignores_row_completion(self):
+    def test_discovery_creates_catalog_row_and_ignores_row_completion(self):
         batches, warnings = qc_app.discover_batches()
 
         self.assertEqual(warnings, [])
         self.assertEqual(len(batches), 1)
         self.assertFalse(batches[0].qc_complete)
-        self.assertEqual(
-            (self.batch_root / "completed_stages.csv").read_text(encoding="utf-8"),
-            "QC,Renamed\nFalse,False\n",
+        self.assertTrue(
+            (Path(qc_app.Config.INSTANCE_DIR) / "batch_catalog.sqlite3").exists()
         )
+        self.assertFalse((self.batch_root / "completed_stages.csv").exists())
 
         with qc_app.app.test_request_context("/qc"):
             selected, available, selection_warnings = qc_app._selected_batch()
@@ -81,21 +82,23 @@ class CompletedStagesTests(unittest.TestCase):
             self.assertEqual(selected.id, batches[0].id)
             self.assertEqual(available, [])
 
-    def test_malformed_existing_file_is_skipped_without_replacement(self):
+    def test_legacy_stage_file_is_not_read_or_replaced(self):
         status_path = self.batch_root / "completed_stages.csv"
         malformed = "QC,Renamed\nmaybe,False\n"
         status_path.write_text(malformed, encoding="utf-8")
 
         batches, warnings = qc_app.discover_batches()
 
-        self.assertEqual(batches, [])
+        self.assertEqual(len(batches), 1)
+        self.assertFalse(batches[0].qc_complete)
         self.assertEqual(status_path.read_text(encoding="utf-8"), malformed)
-        self.assertTrue(any("invalid QC value" in warning for warning in warnings))
+        self.assertEqual(warnings, [])
 
     def test_mark_qc_complete_preserves_renamed(self):
-        status_path = self.batch_root / "completed_stages.csv"
-        status_path.write_text("QC,Renamed\nFalse,True\n", encoding="utf-8")
-        context = qc_app.BatchContext("test-batch", self.batch_root)
+        context = qc_app.discover_batches()[0][0]
+        qc_app.batch_catalog.update_stages(
+            qc_app.Config.INSTANCE_DIR, context.id, renamed_complete=True
+        )
         context.load_completed_stages()
 
         context.mark_qc_complete()
@@ -193,6 +196,7 @@ class CompletedStagesTests(unittest.TestCase):
     def test_final_validation_requeues_invalid_completed_row(self):
         batches, _ = qc_app.discover_batches()
         context = batches[0]
+        context.refresh()
         row = context.data_manager.data[0]
         row["AccessionID"] = "A12/123"
         item = context.queue_manager.get(0)
@@ -210,6 +214,7 @@ class CompletedStagesTests(unittest.TestCase):
     def test_final_validation_leaves_valid_completed_row_unchanged(self):
         batches, _ = qc_app.discover_batches()
         context = batches[0]
+        context.refresh()
         item = context.queue_manager.get(0)
 
         self.assertEqual(qc_app._requeue_invalid_qc_rows(context), [])

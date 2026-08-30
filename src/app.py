@@ -49,6 +49,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from urllib.parse import urlsplit
 
 import click
+from batch_catalog import catalog as batch_catalog, normalize_relative_path
 from container_paths import runtime_path
 import deidentify_anonymize
 import renaming
@@ -132,6 +133,9 @@ class Config:
     STATS_DB_PATH = os.path.join(INSTANCE_DIR, "statistics.sqlite3")
     USER_STATS_ROOT = os.path.join(INSTANCE_DIR, "users")
     API_JOB_OUTPUT_DIR = os.path.join(INSTANCE_DIR, "pipeline_job_output")
+    BATCH_CATALOG_RECONCILE_SECONDS = int(
+        os.environ.get("BATCH_CATALOG_RECONCILE_SECONDS", "60")
+    )
     API_REQUIRE_HTTPS = os.environ.get("API_REQUIRE_HTTPS", "true").lower() == "true"
     API_TRUST_PROXY_HEADERS = os.environ.get("API_TRUST_PROXY_HEADERS", "false").lower() == "true"
     API_SUBMIT_RATE_LIMIT = int(os.environ.get("API_SUBMIT_RATE_LIMIT", "5"))
@@ -1194,14 +1198,16 @@ class UserManager(CSVManager):
         return list(self.users.values())
 
 
-class QueueManager(CSVManager):
-    def __init__(self, filepath: str = Config.QUEUE_CSV_PATH):
-        super().__init__(filepath, ["original_index", "status", "leased_by_id", "leased_at", "completed_by_id", "completed_at"])
+class QueueManager:
+    """In-memory queue adapter persisted in the central batch catalog."""
+
+    def __init__(self, batch_id: str):
+        self.batch_id = batch_id
         self.items: Dict[int, QueueItem] = {}
-        self.load()
+        self._snapshot: Dict[int, Dict[str, str]] = {}
 
     def load(self):
-        rows = self.read_all()
+        rows = batch_catalog.load_queue(Config.INSTANCE_DIR, self.batch_id)
         self.items = {}
         for row in rows:
             try:
@@ -1217,10 +1223,19 @@ class QueueManager(CSVManager):
                 self.items[idx] = item
             except ValueError:
                 continue
+        self._snapshot = {index: item.to_dict() for index, item in self.items.items()}
 
     def save(self):
-        data = [item.to_dict() for item in self.items.values()]
-        self.write_all(data)
+        current = {index: item.to_dict() for index, item in self.items.items()}
+        changed = [row for index, row in current.items() if self._snapshot.get(index) != row]
+        deleted = set(self._snapshot).difference(current)
+        batch_catalog.apply_queue_changes(
+            Config.INSTANCE_DIR,
+            self.batch_id,
+            changed,
+            deleted,
+        )
+        self._snapshot = current
 
     def get(self, original_index: int) -> Optional[QueueItem]:
         return self.items.get(original_index)
@@ -1236,6 +1251,30 @@ class QueueManager(CSVManager):
     def update(self):
         """Persist current state."""
         self.save()
+
+    def claim(self, user_id: str, original_index: Optional[int] = None) -> Optional[QueueItem]:
+        row = batch_catalog.claim_item(
+            Config.INSTANCE_DIR,
+            self.batch_id,
+            user_id,
+            datetime.datetime.utcnow().isoformat(),
+            original_index,
+        )
+        self.load()
+        return self.items.get(int(row["original_index"])) if row else None
+
+    def release_expired(self, before: datetime.datetime) -> int:
+        count = batch_catalog.release_expired(
+            Config.INSTANCE_DIR, self.batch_id, before.isoformat()
+        )
+        if count:
+            self.load()
+        return count
+
+    def release_user(self, user_id: str) -> int:
+        count = batch_catalog.release_user(Config.INSTANCE_DIR, self.batch_id, user_id)
+        self.load()
+        return count
 
 
 # Initialize Managers
@@ -1452,142 +1491,55 @@ class DataManager:
 class BatchContext:
     """Loaded data and persistent queue belonging to one discovered batch."""
 
-    COMPLETED_STAGES_FIELDS = ["QC", "Renamed"]
-
-    def __init__(self, batch_id: str, root: Path):
+    def __init__(self, batch_id: str, root: Path, catalog_row: Optional[Dict[str, Any]] = None):
         self.id = batch_id
         self.root = root
         self.name = root.name
         self.display_name = f"{root.parent.name}/{root.name}"
         self.csv_path = root / "enriched.csv"
-        self.completed_stages_path = root / "completed_stages.csv"
-        queue_dir = Path(Config.INSTANCE_DIR) / "batch_queues"
-        queue_dir.mkdir(parents=True, exist_ok=True)
         self.data_manager = DataManager(root, self.csv_path)
-        self.queue_manager = QueueManager(str(queue_dir / f"{batch_id}.csv"))
+        self.queue_manager = QueueManager(batch_id)
         self.csv_mod_time: Optional[float] = None
-        self.completed_stages = {"QC": False, "Renamed": False}
-        self._completed_stages_lock = threading.Lock()
-
-    @staticmethod
-    def _parse_stage_value(value: Optional[str], column: str) -> bool:
-        normalized = (value or "").strip().lower()
-        if normalized not in {"true", "false"}:
-            raise DataLoadError(
-                f"completed_stages.csv has an invalid {column} value"
-            )
-        return normalized == "true"
-
-    def _write_new_completed_stages(self) -> None:
-        """Atomically create the default stage file without replacing an existing one."""
-        temp_path = self.completed_stages_path.with_name(
-            f".{self.completed_stages_path.name}.{uuid.uuid4().hex}.tmp"
-        )
-        try:
-            with open(temp_path, "x", newline="", encoding="utf-8") as csvfile:
-                writer = csv.DictWriter(
-                    csvfile, fieldnames=self.COMPLETED_STAGES_FIELDS
-                )
-                writer.writeheader()
-                writer.writerow({"QC": "False", "Renamed": "False"})
-                csvfile.flush()
-                os.fsync(csvfile.fileno())
-            try:
-                os.link(temp_path, self.completed_stages_path)
-            except FileExistsError:
-                # Another discovery request initialized the batch first.
-                pass
-        finally:
-            try:
-                temp_path.unlink()
-            except FileNotFoundError:
-                pass
+        row = catalog_row or {}
+        self.completed_stages = {
+            "QC": bool(row.get("qc_complete", False)),
+            "Renamed": bool(row.get("renamed_complete", False)),
+        }
+        self._pending_count = int(row.get("pending_count", 0))
+        self._total_count = int(row.get("queue_total", row.get("slide_count", 0)))
 
     def load_completed_stages(self, create_if_missing: bool = False) -> None:
-        """Load the single-row batch stage file, optionally initializing it."""
-        with self._completed_stages_lock:
-            if create_if_missing and not self.completed_stages_path.exists():
-                self._write_new_completed_stages()
-            try:
-                with open(
-                    self.completed_stages_path,
-                    "r",
-                    newline="",
-                    encoding="utf-8",
-                ) as csvfile:
-                    reader = csv.DictReader(csvfile)
-                    if reader.fieldnames != self.COMPLETED_STAGES_FIELDS:
-                        raise DataLoadError(
-                            "completed_stages.csv must have QC and Renamed columns"
-                        )
-                    rows = list(reader)
-            except DataLoadError:
-                raise
-            except (OSError, UnicodeError, csv.Error) as exc:
-                raise DataLoadError(
-                    f"could not read completed_stages.csv: {exc}"
-                ) from exc
-
-            if len(rows) != 1:
-                raise DataLoadError(
-                    "completed_stages.csv must contain exactly one data row"
-                )
-            row = rows[0]
-            self.completed_stages = {
-                column: self._parse_stage_value(row.get(column), column)
-                for column in self.COMPLETED_STAGES_FIELDS
-            }
+        """Refresh stage flags from the central catalog."""
+        row = batch_catalog.get_batch(Config.INSTANCE_DIR, self.id)
+        if row is None:
+            raise DataLoadError("batch is missing from batch_catalog.sqlite3")
+        self.completed_stages = {
+            "QC": bool(row["qc_complete"]),
+            "Renamed": bool(row["renamed_complete"]),
+        }
 
     def mark_qc_complete(self) -> None:
-        """Atomically mark the batch QC stage complete and preserve Renamed."""
-        with self._completed_stages_lock:
-            renamed = self.completed_stages["Renamed"]
-            temp_path = self.completed_stages_path.with_name(
-                f".{self.completed_stages_path.name}.{uuid.uuid4().hex}.tmp"
-            )
-            try:
-                with open(temp_path, "x", newline="", encoding="utf-8") as csvfile:
-                    writer = csv.DictWriter(
-                        csvfile, fieldnames=self.COMPLETED_STAGES_FIELDS
-                    )
-                    writer.writeheader()
-                    writer.writerow(
-                        {
-                            "QC": "True",
-                            "Renamed": "True" if renamed else "False",
-                        }
-                    )
-                    csvfile.flush()
-                    os.fsync(csvfile.fileno())
-                os.replace(temp_path, self.completed_stages_path)
-                self.completed_stages["QC"] = True
-            except OSError as exc:
-                try:
-                    temp_path.unlink()
-                except FileNotFoundError:
-                    pass
-                raise DataSaveError(
-                    f"could not update completed_stages.csv: {exc}"
-                ) from exc
+        """Atomically mark the catalog QC stage complete."""
+        try:
+            if not batch_catalog.mark_qc_complete_if_queue_complete(
+                Config.INSTANCE_DIR, self.id
+            ):
+                raise DataSaveError("queue still contains unfinished slides")
+            self.completed_stages["QC"] = True
+        except DataSaveError:
+            raise
+        except (OSError, sqlite3.Error, KeyError) as exc:
+            raise DataSaveError(f"could not update batch catalog: {exc}") from exc
 
     def mark_renamed_complete(self) -> None:
-        """Atomically mark renaming complete while preserving QC."""
-        with self._completed_stages_lock:
-            temp_path = self.completed_stages_path.with_name(
-                f".{self.completed_stages_path.name}.{uuid.uuid4().hex}.tmp"
+        """Atomically mark both catalog workflow stages complete."""
+        try:
+            batch_catalog.update_stages(
+                Config.INSTANCE_DIR, self.id, qc_complete=True, renamed_complete=True
             )
-            try:
-                with open(temp_path, "x", newline="", encoding="utf-8") as csvfile:
-                    writer = csv.DictWriter(csvfile, fieldnames=self.COMPLETED_STAGES_FIELDS)
-                    writer.writeheader()
-                    writer.writerow({"QC": "True", "Renamed": "True"})
-                    csvfile.flush()
-                    os.fsync(csvfile.fileno())
-                os.replace(temp_path, self.completed_stages_path)
-                self.completed_stages = {"QC": True, "Renamed": True}
-            except OSError as exc:
-                temp_path.unlink(missing_ok=True)
-                raise DataSaveError(f"could not update completed_stages.csv: {exc}") from exc
+            self.completed_stages = {"QC": True, "Renamed": True}
+        except (OSError, sqlite3.Error, KeyError) as exc:
+            raise DataSaveError(f"could not update batch catalog: {exc}") from exc
 
     @property
     def qc_complete(self) -> bool:
@@ -1598,6 +1550,7 @@ class BatchContext:
         if not self.data_manager.data or mod_time != self.csv_mod_time:
             self.data_manager.load_data(self.csv_path)
             self.csv_mod_time = mod_time
+        self.queue_manager.load()
         valid_indices = set(range(len(self.data_manager.data)))
         changed = False
         for index in list(self.queue_manager.items):
@@ -1624,6 +1577,10 @@ class BatchContext:
                 changed = True
         if changed:
             self.queue_manager.save()
+        self._pending_count = sum(
+            item.status == "pending" for item in self.queue_manager.get_all()
+        )
+        self._total_count = len(self.queue_manager.items)
 
     @property
     def is_complete(self) -> bool:
@@ -1632,13 +1589,19 @@ class BatchContext:
 
     @property
     def pending_count(self) -> int:
-        return sum(
-            item.status == "pending" for item in self.queue_manager.get_all()
-        )
+        return self._pending_count
+
+    @property
+    def total_count(self) -> int:
+        return self._total_count
 
 
 batch_contexts: Dict[str, BatchContext] = {}
 batch_contexts_lock = threading.Lock()
+_catalog_reconcile_lock = threading.Lock()
+_catalog_reconciled_target: Optional[Tuple[str, str]] = None
+_catalog_reconciler_started = False
+_catalog_reconcile_owner = uuid.uuid4().hex
 _renaming_jobs: Dict[str, Dict[str, Any]] = {}
 _renaming_jobs_lock = threading.Lock()
 _renaming_clone_lock = threading.Lock()
@@ -1646,15 +1609,38 @@ _longitudinal_active: set = set()
 _longitudinal_lock = threading.Lock()
 
 
-def _batch_id(root: Path) -> str:
-    return hashlib.sha256(str(root.resolve()).encode("utf-8")).hexdigest()[:16]
+def _batch_relative_path(root: Path) -> str:
+    return normalize_relative_path(root.relative_to(Path(Config.LABEL_CHECK_BATCHES)).as_posix())
 
 
-def discover_batches() -> Tuple[List[BatchContext], List[str]]:
-    """Discover slide batches beneath immediate SS* directories."""
+def _reconcile_queue_rows(public_id: str, slide_rows: Sequence[Dict[str, str]]) -> None:
+    current = {
+        int(row["original_index"]): row
+        for row in batch_catalog.load_queue(Config.INSTANCE_DIR, public_id)
+    }
+    reconciled = []
+    for index, slide in enumerate(slide_rows):
+        complete_value = (slide.get("ParsingQCPassed") or "").strip()
+        complete = bool(complete_value and complete_value.lower() != "false")
+        row = dict(current.get(index, {"original_index": index, "status": "pending"}))
+        if complete and row.get("status") != "completed":
+            row.update({"status": "completed", "leased_by_id": None, "leased_at": None})
+        elif not complete and row.get("status") == "completed":
+            row.update(
+                {
+                    "status": "pending", "completed_by_id": None,
+                    "completed_at": None,
+                }
+            )
+        reconciled.append(row)
+    batch_catalog.replace_queue(Config.INSTANCE_DIR, public_id, reconciled)
+
+
+def reconcile_batch_catalog() -> List[str]:
+    """Refresh catalog from batch directory; never read legacy stage/queue files."""
     base = Path(Config.LABEL_CHECK_BATCHES)
     warnings: List[str] = []
-    discovered: List[BatchContext] = []
+    seen: List[str] = []
     try:
         scanner_dirs = sorted(
             (path for path in base.iterdir() if path.is_dir() and path.name.startswith("SS")),
@@ -1662,7 +1648,7 @@ def discover_batches() -> Tuple[List[BatchContext], List[str]]:
         )
     except OSError as exc:
         app.logger.warning("Label-check batch directory unavailable: %s", exc)
-        return [], [f"Batch directory is unavailable: {base}"]
+        return [f"Batch directory is unavailable: {base}"]
 
     candidates: List[Path] = []
     for scanner_dir in scanner_dirs:
@@ -1677,8 +1663,15 @@ def discover_batches() -> Tuple[List[BatchContext], List[str]]:
             app.logger.warning("Scanner directory unavailable: %s", exc)
             warnings.append(f"Skipped {scanner_dir.name}: directory is unavailable.")
 
+    existing_batches = {
+        str(row["relative_path"]).casefold(): row
+        for row in batch_catalog.list_batches(Config.INSTANCE_DIR)
+    }
+
     for root in candidates:
         display_name = f"{root.parent.name}/{root.name}"
+        relative_path = normalize_relative_path(f"{root.parent.name}/{root.name}")
+        seen.append(relative_path)
         missing = [
             name for name in ("label", "macro")
             if not (root / name).is_dir() or not os.access(root / name, os.R_OK | os.X_OK)
@@ -1686,30 +1679,157 @@ def discover_batches() -> Tuple[List[BatchContext], List[str]]:
         csv_path = root / "enriched.csv"
         if not csv_path.is_file() or not os.access(csv_path, os.R_OK):
             missing.append("enriched.csv")
-        if missing:
-            warnings.append(f"Skipped {display_name}: missing {', '.join(missing)}.")
-            continue
         try:
-            batch_id = _batch_id(root)
-            with batch_contexts_lock:
-                context = batch_contexts.get(batch_id)
-                if context is None or context.root.resolve() != root.resolve():
-                    context = BatchContext(batch_id, root.resolve())
-                    batch_contexts[batch_id] = context
-            context.queue_manager.load()
-            context.refresh()
-            context.load_completed_stages(create_if_missing=True)
-            if not context.data_manager.data:
-                raise DataLoadError("enriched.csv has no slide rows")
-            if "ParsingQCPassed" not in context.data_manager.headers:
-                warnings.append(
-                    f"Skipped {display_name}: enriched.csv is missing ParsingQCPassed."
+            if missing:
+                message = f"missing {', '.join(missing)}"
+                batch_catalog.upsert_batch(
+                    Config.INSTANCE_DIR, relative_path, validity="invalid",
+                    validation_error=message,
+                )
+                warnings.append(f"Skipped {display_name}: {message}.")
+                continue
+            mapping_path = root / "name_mapping.csv"
+            history_path = root / "copath_history_job.json"
+            enriched_mtime = csv_path.stat().st_mtime_ns
+            mapping_mtime = mapping_path.stat().st_mtime_ns if mapping_path.exists() else None
+            history_mtime = history_path.stat().st_mtime_ns if history_path.exists() else None
+            existing = existing_batches.get(relative_path.casefold())
+            if (
+                existing is not None
+                and existing["validity"] == "ready"
+                and existing["enriched_mtime_ns"] == enriched_mtime
+                and existing["mapping_mtime_ns"] == mapping_mtime
+                and existing["history_mtime_ns"] == history_mtime
+            ):
+                batch_catalog.upsert_batch(
+                    Config.INSTANCE_DIR,
+                    relative_path,
+                    validity="ready",
+                    slide_count=int(existing["slide_count"]),
+                    enriched_mtime_ns=enriched_mtime,
+                    mapping_mtime_ns=mapping_mtime,
+                    history_mtime_ns=history_mtime,
+                    renaming_status=str(existing["renaming_status"]),
+                    history_status=str(existing["history_status"]),
                 )
                 continue
-            discovered.append(context)
-        except (DataLoadError, OSError, ValueError) as exc:
+            with csv_path.open("r", newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                if not reader.fieldnames or "ParsingQCPassed" not in reader.fieldnames:
+                    raise DataLoadError("enriched.csv is missing ParsingQCPassed")
+                slide_rows = list(reader)
+            if not slide_rows:
+                raise DataLoadError("enriched.csv has no slide rows")
+            renaming_status = "missing"
+            if mapping_path.exists():
+                _, mapping_rows = renaming.read_csv(mapping_path)
+                renaming_status = (
+                    "approved"
+                    if mapping_rows and all(renaming.parse_bool(row["Approved"]) for row in mapping_rows)
+                    else "ready"
+                )
+            history_status = str(renaming.read_history_job(root).get("status", "not_needed"))
+            public_id = batch_catalog.upsert_batch(
+                Config.INSTANCE_DIR,
+                relative_path,
+                validity="ready",
+                validation_error="",
+                slide_count=len(slide_rows),
+                enriched_mtime_ns=enriched_mtime,
+                mapping_mtime_ns=mapping_mtime,
+                history_mtime_ns=history_mtime,
+                renaming_status=renaming_status,
+                history_status=history_status,
+            )
+            _reconcile_queue_rows(public_id, slide_rows)
+        except (DataLoadError, OSError, ValueError, csv.Error, renaming.RenamingError) as exc:
             app.logger.warning("Skipping invalid batch %s: %s", root, exc)
             warnings.append(f"Skipped {display_name}: {exc}")
+            batch_catalog.upsert_batch(
+                Config.INSTANCE_DIR, relative_path, validity="invalid",
+                validation_error=str(exc),
+            )
+
+    batch_catalog.mark_unseen_missing(Config.INSTANCE_DIR, seen)
+    batch_catalog.set_metadata(Config.INSTANCE_DIR, "last_reconciled_at", _iso_utc())
+    batch_catalog.set_metadata(Config.INSTANCE_DIR, "last_reconcile_warnings", json.dumps(warnings))
+    return warnings
+
+
+def _catalog_reconciler() -> None:
+    while True:
+        time.sleep(max(1, Config.BATCH_CATALOG_RECONCILE_SECONDS))
+        try:
+            with _catalog_reconcile_lock:
+                lease_seconds = max(60, Config.BATCH_CATALOG_RECONCILE_SECONDS * 2)
+                if batch_catalog.acquire_reconcile_lease(
+                    Config.INSTANCE_DIR, _catalog_reconcile_owner, lease_seconds
+                ):
+                    try:
+                        reconcile_batch_catalog()
+                    finally:
+                        batch_catalog.release_reconcile_lease(
+                            Config.INSTANCE_DIR, _catalog_reconcile_owner
+                        )
+        except Exception:
+            app.logger.exception("Background batch catalog reconciliation failed")
+
+
+def _ensure_catalog_reconciled() -> List[str]:
+    global _catalog_reconciled_target, _catalog_reconciler_started
+    target = (str(Path(Config.INSTANCE_DIR)), str(Path(Config.LABEL_CHECK_BATCHES)))
+    warnings: List[str] = []
+    with _catalog_reconcile_lock:
+        if _catalog_reconciled_target != target:
+            batch_catalog.reset()
+            lease_seconds = max(60, Config.BATCH_CATALOG_RECONCILE_SECONDS * 2)
+            if batch_catalog.acquire_reconcile_lease(
+                Config.INSTANCE_DIR, _catalog_reconcile_owner, lease_seconds
+            ):
+                try:
+                    warnings = reconcile_batch_catalog()
+                finally:
+                    batch_catalog.release_reconcile_lease(
+                        Config.INSTANCE_DIR, _catalog_reconcile_owner
+                    )
+            _catalog_reconciled_target = target
+    if not app.config.get("TESTING") and not _catalog_reconciler_started:
+        threading.Thread(target=_catalog_reconciler, daemon=True).start()
+        _catalog_reconciler_started = True
+    return warnings
+
+
+def discover_batches() -> Tuple[List[BatchContext], List[str]]:
+    """Return lightweight valid batch contexts from central catalog."""
+    warnings = _ensure_catalog_reconciled()
+    if not warnings:
+        raw_warnings = batch_catalog.get_metadata(
+            Config.INSTANCE_DIR, "last_reconcile_warnings"
+        )
+        if raw_warnings:
+            try:
+                warnings = list(json.loads(raw_warnings))
+            except (TypeError, ValueError):
+                warnings = []
+    discovered: List[BatchContext] = []
+    for row in batch_catalog.list_batches(Config.INSTANCE_DIR):
+        if row["validity"] != "ready":
+            continue
+        root = Path(Config.LABEL_CHECK_BATCHES) / Path(row["relative_path"])
+        batch_id = str(row["public_id"])
+        with batch_contexts_lock:
+            context = batch_contexts.get(batch_id)
+            if context is None or context.root != root:
+                context = BatchContext(batch_id, root, row)
+                batch_contexts[batch_id] = context
+            else:
+                context.completed_stages = {
+                    "QC": bool(row["qc_complete"]),
+                    "Renamed": bool(row["renamed_complete"]),
+                }
+                context._pending_count = int(row["pending_count"])
+                context._total_count = int(row["queue_total"])
+        discovered.append(context)
 
     return discovered, warnings
 
@@ -1723,6 +1843,7 @@ def _selected_batch(allow_completed: bool = False) -> Tuple[Optional[BatchContex
     requested_id = request.values.get("batch") or session.get("qc_batch_id")
     selected = next((batch for batch in batches if batch.id == requested_id), None)
     if selected and (allow_completed or not selected.qc_complete):
+        selected.refresh()
         session["qc_batch_id"] = selected.id
         return selected, available, warnings
     if requested_id:
@@ -1860,40 +1981,16 @@ def _start_renaming_job(
 # ==============================================================================
 def _release_expired_leases(context: BatchContext):
     """Scans for and releases any item leases that have expired."""
-    data_manager = context.data_manager
     queue_manager = context.queue_manager
     lease_duration = datetime.timedelta(seconds=app.config["LEASE_DURATION_SECONDS"])
     expired_time = datetime.datetime.utcnow() - lease_duration
-
-    # Look for expired leases in QueueManager
-    expired_items = [
-        item for item in queue_manager.get_all()
-        if item.status == "leased" and item.leased_at and item.leased_at < expired_time
-    ]
-
-    if expired_items:
-        count = 0
-        for item in expired_items:
-            try:
-                row = data_manager.get_row(item.original_index)
-                acc_id = row.get("AccessionID", "Unknown") if row else "Unknown"
-                
-                app.logger.info(
-                    f"Lease expired for item {item.original_index} ({acc_id}), leased by {item.leased_by_id}."
-                )
-                item.status = "pending"
-                item.leased_by_id = None
-                item.leased_at = None
-                count += 1
-            except Exception as e:
-                app.logger.error(f"Error releasing lease for item {item.original_index}: {e}")
-        
-        if count > 0:
-            queue_manager.save()
-            flash(
-                f"{count} item(s) had expired leases and were returned to the queue.",
-                "warning",
-            )
+    count = queue_manager.release_expired(expired_time)
+    if count:
+        app.logger.info("Released %d expired lease(s) for batch %s", count, context.id)
+        flash(
+            f"{count} item(s) had expired leases and were returned to the queue.",
+            "warning",
+        )
 
 
 def _create_backup(context: BatchContext, suffix: str = "") -> None:
@@ -5811,8 +5908,6 @@ def qc():
     queue_manager = context.queue_manager
 
     _release_expired_leases(context)
-    queue_manager.load()
-
     item_to_display = None
     requested_index_str = request.args.get("index")
 
@@ -5821,62 +5916,19 @@ def qc():
         try:
             idx = int(requested_index_str)
             if 0 <= idx < len(data_manager.data):
-                # Release existing leases for this user that are not the requested one
-                existing_leases = [
-                    l for l in queue_manager.get_all() 
-                    if l.leased_by_id == current_user.id and l.status == "leased"
-                ]
-                for lease in existing_leases:
-                    if lease.original_index != idx:
-                        lease.status = "pending"
-                        lease.leased_by_id = None
-                        lease.leased_at = None
-                
-                qi = queue_manager.get(idx)
-                if not qi: 
-                    # Should exist if created in init, but if not create ephemeral or fail?
-                    # We assume queue is sync'd. 
-                    qi = QueueItem(original_index=idx)
-                    queue_manager.add(qi)
-
+                qi = queue_manager.claim(str(current_user.id), idx)
+                if qi is None:
+                    raise ValueError("queue item is missing")
                 if qi.status == "leased" and qi.leased_by_id != current_user.id:
                     flash("This item is currently leased by another user. Viewing in read-only mode.", "warning")
-                elif qi.status != "completed":
-                    # Acquiring lease
-                    qi.status = "leased"
-                    qi.leased_by_id = current_user.id
-                    qi.leased_at = datetime.datetime.utcnow()
-                
-                queue_manager.save()
                 item_to_display = qi
         except (ValueError, TypeError):
             flash("Invalid index provided in URL.", "error")
 
     # 2. Check active lease
     if not item_to_display:
-        active_lease = next(
-            (i for i in queue_manager.get_all() if i.leased_by_id == current_user.id and i.status == "leased"),
-            None
-        )
-
-        if active_lease:
-            item_to_display = active_lease
-        else:
-            # 3. Get next pending
-            # Sort by original_index 
-            pending_items = sorted(
-                [i for i in queue_manager.get_all() if i.status == "pending"],
-                key=lambda x: x.original_index
-            )
-            
-            if pending_items:
-                next_pending_item = pending_items[0]
-                next_pending_item.status = "leased"
-                next_pending_item.leased_by_id = current_user.id
-                next_pending_item.leased_at = datetime.datetime.utcnow()
-                queue_manager.save()
-                item_to_display = next_pending_item
-            else:
+        item_to_display = queue_manager.claim(str(current_user.id))
+        if item_to_display is None:
                 # 4. Every unfinished item is currently leased by another user.
                 total = len(queue_manager.items)
                 done = len([i for i in queue_manager.get_all() if i.status == "completed"])
@@ -6163,18 +6215,9 @@ def release_lease():
         flash("The selected batch is no longer available.", "warning")
         return redirect(url_for("qc"))
     queue_manager = context.queue_manager
-    leases = [
-        l for l in queue_manager.get_all() 
-        if l.leased_by_id == current_user.id and l.status == "leased"
-    ]
-    
-    if leases:
-        for lease in leases:
-            lease.status = "pending"
-            lease.leased_by_id = None
-            lease.leased_at = None
-        queue_manager.save()
-        flash(f"Successfully released {len(leases)} item(s) back to the queue.", "info")
+    released = queue_manager.release_user(str(current_user.id))
+    if released:
+        flash(f"Successfully released {released} item(s) back to the queue.", "info")
         
     return redirect(url_for("qc", batch=context.id))
 
@@ -6212,6 +6255,7 @@ def serve_relative_image(batch: str, filepath: str):
     context = next((item for item in batches if item.id == batch), None)
     if context is None:
         return "Batch not found.", 404
+    context.refresh()
     abs_file_path = context.data_manager.get_absolute_path(filepath)
     if not abs_file_path:
         app.logger.warning("Blocked invalid image path for batch %s: %s", batch, filepath)
@@ -6514,7 +6558,7 @@ def init_db_command():
         validate_security_config()
     except SecurityConfigurationError as exc:
         raise click.ClickException(str(exc)) from exc
-    print("--- Initializing App Persistence (CSV) ---")
+    print("--- Initializing App Persistence ---")
     
     # Init Users
     if not user_manager.get("admin"):

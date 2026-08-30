@@ -522,6 +522,12 @@ class RenamingPageTests(unittest.TestCase):
         workbook.close()
         app_module.batch_contexts.clear()
         app_module._renaming_jobs.clear()
+        catalog_batches, _ = app_module.discover_batches()
+        app_module.batch_catalog.update_stages(
+            app_module.Config.INSTANCE_DIR,
+            catalog_batches[0].id,
+            qc_complete=True,
+        )
         self.user = app_module.User("renamer", "", False)
         app_module.user_manager.users[self.user.id] = self.user
         app_module.app.config.update(TESTING=True, SECRET_KEY="renaming-test")
@@ -812,7 +818,11 @@ class RenamingPageTests(unittest.TestCase):
         )
 
         self.assertEqual(302, response.status_code)
-        self.assertEqual("QC,Renamed\nTrue,True\n", (self.batch / "completed_stages.csv").read_text())
+        catalog_row = app_module.batch_catalog.get_batch(
+            app_module.Config.INSTANCE_DIR, batches[0].id
+        )
+        self.assertTrue(catalog_row["qc_complete"])
+        self.assertTrue(catalog_row["renamed_complete"])
         _, index_rows = renaming.read_csv(self.clone / "all_iuh_identifiers.csv")
         self.assertEqual("NP25-100", index_rows[0]["AccessionID"])
         _, clone_rows = renaming.read_csv(self.clone / "BRAIN" / "copath_data.csv")
@@ -849,10 +859,11 @@ class RenamingPageTests(unittest.TestCase):
         self.assertTrue(payload["success"])
         self.assertTrue(payload["finalized"])
         self.assertEqual("/renaming", payload["redirect_url"])
-        self.assertEqual(
-            "QC,Renamed\nTrue,True\n",
-            (self.batch / "completed_stages.csv").read_text(),
+        catalog_row = app_module.batch_catalog.get_batch(
+            app_module.Config.INSTANCE_DIR, batches[0].id
         )
+        self.assertTrue(catalog_row["qc_complete"])
+        self.assertTrue(catalog_row["renamed_complete"])
 
     def test_sdl_failure_leaves_batch_available_for_retry(self):
         Path(app_module.Config.SDL_FILE_PATH).unlink()
@@ -880,10 +891,11 @@ class RenamingPageTests(unittest.TestCase):
         )
 
         self.assertEqual(302, response.status_code)
-        self.assertEqual(
-            "QC,Renamed\nTrue,False\n",
-            (self.batch / "completed_stages.csv").read_text(),
+        catalog_row = app_module.batch_catalog.get_batch(
+            app_module.Config.INSTANCE_DIR, batches[0].id
         )
+        self.assertTrue(catalog_row["qc_complete"])
+        self.assertFalse(catalog_row["renamed_complete"])
         self.assertEqual(1, len(app_module._renaming_batches()[0]))
 
     def test_async_finalization_error_returns_the_saved_group_state(self):

@@ -82,6 +82,35 @@ Copy `.env.example` to `.env`, replace all placeholders, and create the host
 directories. `LABEL_CHECK_STATE_HOST` must contain
 `Slide_Digitization_Log.xlsx` before SDL workflows run.
 
+Batch workflow stages, queues, and leases are stored in
+`LABEL_CHECK_STATE_HOST\instance\batch_catalog.sqlite3`. Batch list pages query
+this catalog and load `enriched.csv` only after a batch is selected. A
+background reconciliation scans for externally-created batches at startup and
+every `BATCH_CATALOG_RECONCILE_SECONDS` seconds (60 by default).
+
+Before the first catalog-aware deployment, stop the Label-Check container and
+validate legacy state from a PowerShell prompt:
+
+```powershell
+python src\migrate_batch_catalog.py `
+  --batches-root D:\label_check_batches `
+  --state-root D:\label_check_batches\state
+```
+
+Resolve every error and review unmatched-queue warnings, then apply migration:
+
+```powershell
+python src\migrate_batch_catalog.py `
+  --batches-root D:\label_check_batches `
+  --state-root D:\label_check_batches\state `
+  --apply
+```
+
+Migration verifies new SQLite database, archives imported stage and queue CSVs
+under `state\instance\legacy_batch_state_archive`, writes SHA-256 manifest, then
+removes verified originals. Batches without `completed_stages.csv` are skipped
+during migration and registered as new `False,False` batches by reconciliation.
+
 `SECRET_KEY` must contain at least 32 characters and
 `ADMIN_DEFAULT_PASSWORD` at least 12. Missing, weak, legacy-default, or example
 placeholder values stop application initialization. Rotating `SECRET_KEY`
