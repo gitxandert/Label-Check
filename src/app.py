@@ -3064,23 +3064,31 @@ def _tq_slide_id(batch_id: str, original_path: str) -> str:
     return hashlib.sha256(value).hexdigest()[:24]
 
 
-def _tq_sdl_accession_dates() -> Tuple[Dict[str, List[str]], Optional[str]]:
+def _tq_sdl_accession_metadata(
+) -> Tuple[Dict[str, Dict[str, List[str]]], Optional[str]]:
     workbook = None
     try:
         with _sdl_workbook_lock:
             workbook, worksheet, _ = _load_sdl_workbook()
             dates: Dict[str, set] = defaultdict(set)
+            types: Dict[str, set] = defaultdict(set)
             for row in _read_sdl_rows(worksheet):
                 accession = row["values"]["Accession ID"].strip().upper()
                 loaded = row["values"]["Date Loaded"].strip()
+                slide_type = row["values"]["Type"].strip()
                 if accession and _strict_sdl_date(loaded):
                     dates[accession].add(loaded)
+                if accession and slide_type:
+                    types[accession].add(slide_type)
             return {
-                accession: sorted(values)
-                for accession, values in dates.items()
+                accession: {
+                    "dates": sorted(dates.get(accession, set())),
+                    "types": sorted(values, key=str.casefold),
+                }
+                for accession, values in types.items()
             }, None
     except (SDLWorkbookError, OSError) as exc:
-        return {}, f"Slide Digitization Log dates are unavailable: {exc}"
+        return {}, f"Slide Digitization Log transfer metadata is unavailable: {exc}"
     finally:
         if workbook is not None:
             workbook.close()
@@ -3104,7 +3112,7 @@ def _tq_digitization_date(
 
 def _tq_catalog() -> Tuple[List[Dict[str, str]], List[str]]:
     batches, warnings = discover_batches()
-    sdl_dates, sdl_warning = _tq_sdl_accession_dates()
+    sdl_metadata, sdl_warning = _tq_sdl_accession_metadata()
     if sdl_warning:
         warnings.append(sdl_warning)
     slides: List[Dict[str, str]] = []
@@ -3134,6 +3142,9 @@ def _tq_catalog() -> Tuple[List[Dict[str, str]], List[str]]:
                         "contains a row missing OriginalPath, AccessionID, "
                         "Organ, PID, or NewName"
                     )
+                accession_metadata = sdl_metadata.get(accession.upper())
+                if not accession_metadata:
+                    continue
                 slides.append(
                     {
                         "id": _tq_slide_id(context.id, original_path),
@@ -3151,8 +3162,12 @@ def _tq_catalog() -> Tuple[List[Dict[str, str]], List[str]]:
                         "section_count": row["SectionCount"].strip(),
                         "original_path": original_path,
                         "destination_name": destination_name,
+                        "sdl_types": accession_metadata["types"],
                         "digitization_date": _tq_digitization_date(
-                            original_path, context.root, accession, sdl_dates
+                            original_path,
+                            context.root,
+                            accession,
+                            {accession.upper(): accession_metadata["dates"]},
                         ),
                     }
                 )
@@ -3285,6 +3300,36 @@ def _tq_grouped_rows(
             }
             for (batch_name, accession), values in grouped.items()
         ]
+    if selection_type == "Type":
+        grouped_types: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+        for slide in slides:
+            for slide_type in slide["sdl_types"]:
+                grouped_types[slide_type].append(slide)
+        rows = []
+        for slide_type, type_slides in grouped_types.items():
+            accessions: Dict[
+                Tuple[str, str], List[Dict[str, str]]
+            ] = defaultdict(list)
+            for slide in type_slides:
+                accessions[(slide["batch_name"], slide["accession"])].append(slide)
+            rows.append(
+                {
+                    "type": "sdl_type",
+                    "name": slide_type,
+                    "slides": type_slides,
+                    "date": _tq_date_summary(type_slides),
+                    "accessions": [
+                        {
+                            "name": accession,
+                            "batch_name": batch_name,
+                            "slides": values,
+                            "date": _tq_date_summary(values),
+                        }
+                        for (batch_name, accession), values in accessions.items()
+                    ],
+                }
+            )
+        return rows
 
     batch_groups: Dict[str, List[Dict[str, str]]] = defaultdict(list)
     for slide in slides:
@@ -3330,7 +3375,7 @@ def _tq_sort_grouped_rows(
             reverse=sort_order == "za",
         )
         for row in rows:
-            if row["type"] == "batch":
+            if "accessions" in row:
                 row["accessions"].sort(
                     key=lambda accession: accession["name"].casefold(),
                     reverse=sort_order == "za",
@@ -3352,19 +3397,28 @@ def _tq_sort_grouped_rows(
             )
         )
         (dated if date_value else undated).append((date_value, row))
-        if row["type"] == "batch":
-            row["accessions"] = _tq_sort_grouped_rows(
-                [
-                    {
-                        "type": "accession",
-                        "name": accession["name"],
-                        "slides": accession["slides"],
-                        "date": accession["date"],
-                    }
-                    for accession in row["accessions"]
-                ],
-                sort_order,
+        if "accessions" in row:
+            nested_dated = []
+            nested_undated = []
+            for accession in row["accessions"]:
+                accession_date = next(
+                    (
+                        slide["digitization_date"]
+                        for slide in accession["slides"]
+                        if slide["digitization_date"]
+                    ),
+                    "",
+                )
+                (nested_dated if accession_date else nested_undated).append(
+                    (accession_date, accession)
+                )
+            nested_dated.sort(
+                key=lambda item: item[0],
+                reverse=sort_order == "date_reverse",
             )
+            row["accessions"] = [
+                accession for _, accession in nested_dated
+            ] + [accession for _, accession in nested_undated]
     dated.sort(
         key=lambda item: item[0],
         reverse=sort_order == "date_reverse",
@@ -4800,7 +4854,7 @@ def admin_download_lifetime_statistics():
 def tq_page():
     all_slides, discovery_warnings = _tq_catalog()
     selection_type = request.args.get("select", "Batch")
-    if selection_type not in {"Batch", "Accession", "Slide"}:
+    if selection_type not in {"Batch", "Accession", "Slide", "Type"}:
         selection_type = "Batch"
     filter_field = request.args.get("filter", "None")
     filter_value = request.args.get("filter_value", "").strip()

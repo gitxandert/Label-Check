@@ -91,7 +91,7 @@
                 <div class="field">
                     <label for="select">Select</label>
                     <select id="select" name="select">
-                        {% for option in ('Batch','Accession','Slide') %}<option value="{{ option }}" {% if selection_type == option %}selected{% endif %}>{{ option }}</option>{% endfor %}
+                        {% for option in ('Batch','Accession','Slide','Type') %}<option value="{{ option }}" {% if selection_type == option %}selected{% endif %}>{{ option }}</option>{% endfor %}
                     </select>
                 </div>
                 <div class="field">
@@ -264,6 +264,37 @@
                         </div>
                     </details>
                     {% endfor %}
+                {% elif selection_type == 'Type' %}
+                    {% for type_group in rows %}
+                    <details class="group type-group">
+                        <summary>
+                            <input class="parent-checkbox" type="checkbox" aria-label="Select type {{ type_group.name }}">
+                            <span>{{ type_group.name }}</span>
+                            <span class="summary-meta">{{ type_group.accessions|length }} accession(s) · {{ type_group.slides|length }} slide(s) · {{ type_group.date }}</span>
+                        </summary>
+                        <div class="nested">
+                            {% for accession in type_group.accessions %}
+                            <details class="group accession-group">
+                                <summary>
+                                    <input class="parent-checkbox" type="checkbox" aria-label="Select accession {{ accession.name }}">
+                                    <span>{{ accession.name }} <span class="muted">({{ accession.batch_name }})</span></span>
+                                    <span class="summary-meta">{{ accession.slides|length }} slide(s) · {{ accession.date }}</span>
+                                </summary>
+                                <div class="nested">
+                                    {% for slide in accession.slides %}
+                                    <div class="slide-row">
+                                        <input class="slide-checkbox" type="checkbox" name="slide_id" value="{{ slide.id }}" {% if slide.id in selected_ids %}checked{% endif %}>
+                                        <span class="slide-name">{{ slide.destination_name }}</span>
+                                        <span class="path">{{ slide.original_path }}</span>
+                                        <span>{{ slide.organ }}</span><span>{{ slide.pid }}</span><span>{{ slide.digitization_date or 'Unknown' }}</span>
+                                    </div>
+                                    {% endfor %}
+                                </div>
+                            </details>
+                            {% endfor %}
+                        </div>
+                    </details>
+                    {% endfor %}
                 {% else %}
                     {% for row in rows %}{% set slide = row.slide %}
                     <div class="slide-row">
@@ -351,18 +382,30 @@ function updateParentState(group) {
 function updateAllParents() {
     document.querySelectorAll('.accession-group').forEach(updateParentState);
     document.querySelectorAll('.batch-group').forEach(updateParentState);
+    document.querySelectorAll('.type-group').forEach(updateParentState);
+}
+function setSlideChecked(slideId, checked) {
+    document.querySelectorAll('.slide-checkbox').forEach((item) => {
+        if (item.value === slideId) item.checked = checked;
+    });
 }
 document.querySelectorAll('.parent-checkbox').forEach((checkbox) => {
     checkbox.addEventListener('click', (event) => event.stopPropagation());
     checkbox.addEventListener('change', () => {
         const group = checkbox.closest('.group');
-        group.querySelectorAll('.slide-checkbox').forEach((child) => { child.checked = checkbox.checked; });
+        group.querySelectorAll('.slide-checkbox').forEach((child) => {
+            setSlideChecked(child.value, checkbox.checked);
+        });
         updateAllParents();
         saveSelectionDraft();
     });
 });
 document.querySelectorAll('.slide-checkbox').forEach((checkbox) => {
-    checkbox.addEventListener('change', () => { updateAllParents(); saveSelectionDraft(); });
+    checkbox.addEventListener('change', () => {
+        setSlideChecked(checkbox.value, checkbox.checked);
+        updateAllParents();
+        saveSelectionDraft();
+    });
 });
 document.getElementById('review-form')?.addEventListener('submit', () => {
     captureVisibleSelection();

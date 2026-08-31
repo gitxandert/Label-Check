@@ -114,6 +114,7 @@ class TQTransferTests(unittest.TestCase):
         worksheet.append(app_module.SDL_HEADERS)
         row = [None] * len(app_module.SDL_HEADERS)
         row[app_module.SDL_HEADERS.index("Accession ID")] = "NP25-100"
+        row[app_module.SDL_HEADERS.index("Type")] = "PROSP"
         row[app_module.SDL_HEADERS.index("Date Loaded")] = app_module.datetime.date(
             2026, 7, 20
         )
@@ -199,6 +200,7 @@ class TQTransferTests(unittest.TestCase):
         slides = self.catalog()
 
         self.assertEqual("2026-07-20", slides[0]["digitization_date"])
+        self.assertEqual(["PROSP"], slides[0]["sdl_types"])
         self.assertEqual(
             [slides[0]],
             app_module._tq_filtered_slides(
@@ -211,6 +213,58 @@ class TQTransferTests(unittest.TestCase):
         )
         with self.assertRaises(app_module.TQError):
             app_module._tq_destination_dir("../outside", slides[0])
+
+    def test_catalog_excludes_accessions_without_nonblank_sdl_type(self):
+        workbook = load_workbook(self.sdl_path)
+        worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
+        columns = app_module._sdl_header_columns(worksheet)
+        worksheet.cell(row=2, column=columns["Type"]).value = "   "
+        workbook.save(self.sdl_path)
+        workbook.close()
+
+        slides, warnings = app_module._tq_catalog()
+
+        self.assertEqual([], warnings)
+        self.assertEqual([], slides)
+
+        workbook = load_workbook(self.sdl_path)
+        worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
+        worksheet.delete_rows(2)
+        workbook.save(self.sdl_path)
+        workbook.close()
+
+        missing_slides, missing_warnings = app_module._tq_catalog()
+
+        self.assertEqual([], missing_warnings)
+        self.assertEqual([], missing_slides)
+
+    def test_type_selection_groups_all_nonblank_types_and_ignores_blank_rows(self):
+        workbook = load_workbook(self.sdl_path)
+        worksheet = workbook[app_module.Config.SDL_SHEET_NAME]
+        for slide_type in ("SEMINOMA", None):
+            row = [None] * len(app_module.SDL_HEADERS)
+            row[app_module.SDL_HEADERS.index("Accession ID")] = "NP25-100"
+            row[app_module.SDL_HEADERS.index("Type")] = slide_type
+            worksheet.append(row)
+        workbook.save(self.sdl_path)
+        workbook.close()
+
+        slides = self.catalog()
+        groups = app_module._tq_grouped_rows(slides, "Type")
+        response = self.client.get("/tq?select=Type")
+
+        self.assertEqual(["PROSP", "SEMINOMA"], slides[0]["sdl_types"])
+        self.assertEqual({"PROSP", "SEMINOMA"}, {row["name"] for row in groups})
+        self.assertTrue(all(len(row["slides"]) == 2 for row in groups))
+        self.assertEqual(200, response.status_code)
+        self.assertIn(b"Available types", response.data)
+        self.assertIn(b"Select type PROSP", response.data)
+        self.assertIn(b"Select type SEMINOMA", response.data)
+        self.assertEqual(
+            2,
+            response.data.count(f'value="{slides[0]["id"]}"'.encode()),
+        )
+        self.assertIn(b"function setSlideChecked(slideId, checked)", response.data)
 
     def test_page_filters_pid_and_contains_transfer_navigation(self):
         response = self.client.get("/tq?filter=PID&filter_value=AAAAAA")
