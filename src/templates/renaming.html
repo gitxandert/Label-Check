@@ -278,6 +278,11 @@ const bindRenamingForm = (form) => {
           return;
         }
         form.elements.pid.value = payload.pid;
+        if (payload.mapping_signature) {
+          document.querySelectorAll('input[name="mapping_signature"]').forEach((input) => {
+            input.value = payload.mapping_signature;
+          });
+        }
         form.dataset.pidPreviewOrgan = organInput.value;
         updateNames(form);
       } catch (error) {

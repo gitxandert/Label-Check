@@ -260,7 +260,7 @@ class RenamingDataTests(unittest.TestCase):
 
         self.assertEqual("AAAAAZ", pid)
 
-    def test_conflicting_staged_pids_without_committed_pid_still_fail(self):
+    def test_multiple_staged_pids_for_one_pair_are_normalized(self):
         renaming.initialize_clone(self.clone)
         for index, pid in enumerate(("AAAAAA", "AAAAAB"), start=1):
             staged_batch = self.batch_base / f"SS20{index}" / f"batch-{index}"
@@ -281,10 +281,86 @@ class RenamingDataTests(unittest.TestCase):
                 [{"accession_id": f"NP25-{index}", "mrn": "MRN2"}],
             )
 
-        with self.assertRaisesRegex(
-            renaming.RenamingError, "conflicting staged PIDs in OTHER"
-        ):
-            renaming._pid_pairs(self.batch_base, [])
+        changed = renaming.repair_staged_pid_assignments(
+            self.clone, self.batch_base
+        )
+        pairs = renaming._pid_pairs(self.batch_base, [])
+        _, first = renaming.read_csv(
+            self.batch_base / "SS201" / "batch-1" / "name_mapping.csv"
+        )
+        _, second = renaming.read_csv(
+            self.batch_base / "SS202" / "batch-2" / "name_mapping.csv"
+        )
+
+        self.assertEqual(1, changed)
+        self.assertEqual("AAAAAA", pairs[("MRN2", "OTHER")])
+        self.assertEqual("AAAAAA", first[0]["PID"])
+        self.assertEqual("AAAAAA", second[0]["PID"])
+        self.assertEqual(0, renaming.repair_staged_pid_assignments(
+            self.clone, self.batch_base
+        ))
+
+    def test_duplicate_staged_pid_for_different_mrns_is_renumbered(self):
+        renaming.initialize_clone(self.clone)
+        for index in (1, 2):
+            staged_batch = self.batch_base / f"SS20{index}" / f"batch-{index}"
+            staged = {
+                "AccessionID": f"NP25-{index}", "Organ": "BREAST", "PID": "AAAAAC",
+                "AccessionDate": "20250101", "Timepoint": "XXXX", "Stain": "HE",
+                "ImageType": "WSI", "SampAcqType": "RE", "BlockNumber": "A1",
+                "SectionCount": "000", "OriginalPath": f"{index}.svs",
+                "Approved": "False",
+            }
+            staged["NewName"] = renaming.build_new_name(staged)
+            renaming.atomic_write(
+                staged_batch / "name_mapping.csv", renaming.MAPPING_FIELDS, [staged]
+            )
+            write_csv(
+                staged_batch / "pending_CoPath_data.csv",
+                ["accession_id", "mrn"],
+                [{"accession_id": f"NP25-{index}", "mrn": f"MRN{index}"}],
+            )
+
+        changed = renaming.repair_staged_pid_assignments(
+            self.clone, self.batch_base
+        )
+        pairs = renaming._pid_pairs(self.batch_base, [])
+        _, second = renaming.read_csv(
+            self.batch_base / "SS202" / "batch-2" / "name_mapping.csv"
+        )
+
+        self.assertEqual(1, changed)
+        self.assertEqual("AAAAAC", pairs[("MRN1", "BREAST")])
+        self.assertEqual("AAAAAD", pairs[("MRN2", "BREAST")])
+        self.assertEqual("AAAAAD", second[0]["PID"])
+        self.assertTrue(second[0]["NewName"].startswith("BREAST_AAAAAD_"))
+
+    def test_duplicate_history_pid_is_repaired_with_mapping(self):
+        renaming.prepare_batch(self.batch, self.clone, self.batch_base, self.query)
+        write_csv(
+            self.batch / "pending_CoPath_history.csv",
+            ["accession_id", "mrn", "organ", "PID"],
+            [
+                {
+                    "accession_id": "SP24-1", "mrn": "MRN2",
+                    "organ": "BREAST", "PID": "AAAAAC",
+                },
+                {
+                    "accession_id": "SP24-2", "mrn": "MRN3",
+                    "organ": "BREAST", "PID": "AAAAAC",
+                },
+            ],
+        )
+
+        changed = renaming.repair_staged_pid_assignments(
+            self.clone, self.batch_base
+        )
+        _, history = renaming.read_csv(
+            self.batch / "pending_CoPath_history.csv"
+        )
+
+        self.assertEqual(1, changed)
+        self.assertEqual(["AAAAAC", "AAAAAD"], [row["PID"] for row in history])
 
     def test_empty_clone_is_initialized_with_all_required_csvs(self):
         empty_clone = self.root / "empty-clone"
@@ -732,18 +808,18 @@ class RenamingPageTests(unittest.TestCase):
         self.assertFalse(response.get_json()["success"])
         self.assertIn("changed in another session", response.get_json()["message"])
 
-    def test_organ_change_reuses_committed_pid_despite_conflicting_stage(self):
+    def test_organ_change_repairs_pid_owned_by_different_mrn(self):
         renaming.initialize_clone(self.clone)
         write_csv(
             self.clone / "all_iuh_identifiers.csv",
             renaming.IDENTIFIER_FIELDS,
             [{
-                "AccessionID": "NP24-1", "Organ": "OTHER",
-                "MRN": "MRN1", "PID": "AAAAAZ",
+                "AccessionID": "NP24-1", "Organ": "BREAST",
+                "MRN": "MRN2", "PID": "AAAAAC",
             }],
         )
         _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
-        rows[0].update({"Organ": "BREAST", "PID": "AAAAAA"})
+        rows[0].update({"Organ": "BRAIN", "PID": "AAAAAA"})
         rows[0]["NewName"] = renaming.build_new_name(rows[0])
         renaming.atomic_write(
             self.batch / "name_mapping.csv", renaming.MAPPING_FIELDS, rows
@@ -751,7 +827,7 @@ class RenamingPageTests(unittest.TestCase):
         staged_batch = self.batch_base / "SS200" / "batch-2"
         staged = dict(rows[0])
         staged.update({
-            "AccessionID": "NP24-2", "Organ": "OTHER", "PID": "AAAAAY"
+            "AccessionID": "NP24-2", "Organ": "BREAST", "PID": "AAAAAC"
         })
         staged["NewName"] = renaming.build_new_name(staged)
         renaming.atomic_write(
@@ -768,23 +844,23 @@ class RenamingPageTests(unittest.TestCase):
             f"/renaming/pid/{batches[0].id}",
             query_string={
                 "accession": "NP25-100",
-                "organ": "OTHER",
+                "organ": "BREAST",
                 "mapping_signature": renaming.mapping_signature(rows),
             },
         )
         approval = self.client.post(
             f"/renaming/approve/{batches[0].id}",
-            data=self.approval_data(rows, organ="OTHER", pid="AAAAAY"),
+            data=self.approval_data(rows, organ="BREAST", pid="ZZZZZZ"),
             headers={"Accept": "application/json"},
         )
 
         self.assertEqual(200, preview.status_code)
-        self.assertEqual({"success": True, "pid": "AAAAAZ"}, preview.get_json())
+        self.assertEqual({"success": True, "pid": "AAAAAD"}, preview.get_json())
         self.assertEqual(200, approval.status_code)
         self.assertTrue(approval.get_json()["success"])
         _, saved = renaming.read_csv(self.batch / "name_mapping.csv")
-        self.assertEqual("OTHER", saved[0]["Organ"])
-        self.assertEqual("AAAAAZ", saved[0]["PID"])
+        self.assertEqual("BREAST", saved[0]["Organ"])
+        self.assertEqual("AAAAAD", saved[0]["PID"])
 
     def test_approval_overrides_submitted_pid_after_organ_change(self):
         rows = self.add_second_accession()
