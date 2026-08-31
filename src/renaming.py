@@ -454,10 +454,13 @@ def _reserved_pids(batch_base: Path) -> Dict[str, set]:
 
 
 def _staged_pid_pairs(
-    batch_base: Path, identifiers: Sequence[Dict[str, str]]
+    batch_base: Path,
+    identifiers: Sequence[Dict[str, str]],
+    authoritative_pairs: Optional[Dict[Tuple[str, str], str]] = None,
 ) -> Dict[Tuple[str, str], str]:
     """Return consistent staged PID assignments keyed by (MRN, organ)."""
     pairs: Dict[Tuple[str, str], str] = {}
+    authoritative_pairs = authoritative_pairs or {}
     identifier_by_accession = {
         row_accession(row): row for row in identifiers if row_accession(row)
     }
@@ -469,6 +472,8 @@ def _staged_pid_pairs(
         if not mrn or organ not in ORGANS or not PID_RE.fullmatch(pid):
             return
         key = (mrn, organ)
+        if key in authoritative_pairs:
+            return
         existing = pairs.get(key)
         if existing and existing != pid:
             raise RenamingError(
@@ -551,7 +556,9 @@ def _pid_pairs(
             row.get("MRN", ""), row.get("Organ", ""), row.get("PID", ""),
             "committed",
         )
-    for (mrn, organ), pid in _staged_pid_pairs(batch_base, identifiers).items():
+    for (mrn, organ), pid in _staged_pid_pairs(
+        batch_base, identifiers, pairs
+    ).items():
         remember(mrn, organ, pid, "committed and staged")
     return pairs
 

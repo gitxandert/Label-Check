@@ -236,6 +236,56 @@ class RenamingDataTests(unittest.TestCase):
 
         self.assertEqual("AAAAAZ", pid)
 
+    def test_committed_pid_wins_over_conflicting_staged_pid(self):
+        renaming.prepare_batch(self.batch, self.clone, self.batch_base, self.query)
+        staged_batch = self.batch_base / "SS200" / "batch-2"
+        _, mapping = renaming.read_csv(self.batch / "name_mapping.csv")
+        staged = dict(mapping[0])
+        staged.update({
+            "AccessionID": "NP25-200", "Organ": "BRAIN", "PID": "AAAABA"
+        })
+        staged["NewName"] = renaming.build_new_name(staged)
+        renaming.atomic_write(
+            staged_batch / "name_mapping.csv", renaming.MAPPING_FIELDS, [staged]
+        )
+        write_csv(
+            staged_batch / "pending_CoPath_data.csv",
+            ["accession_id", "mrn"],
+            [{"accession_id": "NP25-200", "mrn": "MRN1"}],
+        )
+
+        pid = renaming.pid_after_organ_change(
+            self.batch, self.clone, self.batch_base, "NP25-100", "BRAIN"
+        )
+
+        self.assertEqual("AAAAAZ", pid)
+
+    def test_conflicting_staged_pids_without_committed_pid_still_fail(self):
+        renaming.initialize_clone(self.clone)
+        for index, pid in enumerate(("AAAAAA", "AAAAAB"), start=1):
+            staged_batch = self.batch_base / f"SS20{index}" / f"batch-{index}"
+            staged = {
+                "AccessionID": f"NP25-{index}", "Organ": "OTHER", "PID": pid,
+                "AccessionDate": "20250101", "Timepoint": "XXXX", "Stain": "HE",
+                "ImageType": "WSI", "SampAcqType": "RE", "BlockNumber": "A1",
+                "SectionCount": "000", "OriginalPath": f"{index}.svs",
+                "Approved": "False",
+            }
+            staged["NewName"] = renaming.build_new_name(staged)
+            renaming.atomic_write(
+                staged_batch / "name_mapping.csv", renaming.MAPPING_FIELDS, [staged]
+            )
+            write_csv(
+                staged_batch / "pending_CoPath_data.csv",
+                ["accession_id", "mrn"],
+                [{"accession_id": f"NP25-{index}", "mrn": "MRN2"}],
+            )
+
+        with self.assertRaisesRegex(
+            renaming.RenamingError, "conflicting staged PIDs in OTHER"
+        ):
+            renaming._pid_pairs(self.batch_base, [])
+
     def test_empty_clone_is_initialized_with_all_required_csvs(self):
         empty_clone = self.root / "empty-clone"
 
@@ -681,6 +731,60 @@ class RenamingPageTests(unittest.TestCase):
         self.assertEqual(409, response.status_code)
         self.assertFalse(response.get_json()["success"])
         self.assertIn("changed in another session", response.get_json()["message"])
+
+    def test_organ_change_reuses_committed_pid_despite_conflicting_stage(self):
+        renaming.initialize_clone(self.clone)
+        write_csv(
+            self.clone / "all_iuh_identifiers.csv",
+            renaming.IDENTIFIER_FIELDS,
+            [{
+                "AccessionID": "NP24-1", "Organ": "OTHER",
+                "MRN": "MRN1", "PID": "AAAAAZ",
+            }],
+        )
+        _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
+        rows[0].update({"Organ": "BREAST", "PID": "AAAAAA"})
+        rows[0]["NewName"] = renaming.build_new_name(rows[0])
+        renaming.atomic_write(
+            self.batch / "name_mapping.csv", renaming.MAPPING_FIELDS, rows
+        )
+        staged_batch = self.batch_base / "SS200" / "batch-2"
+        staged = dict(rows[0])
+        staged.update({
+            "AccessionID": "NP24-2", "Organ": "OTHER", "PID": "AAAAAY"
+        })
+        staged["NewName"] = renaming.build_new_name(staged)
+        renaming.atomic_write(
+            staged_batch / "name_mapping.csv", renaming.MAPPING_FIELDS, [staged]
+        )
+        write_csv(
+            staged_batch / "pending_CoPath_data.csv",
+            ["accession_id", "mrn"],
+            [{"accession_id": "NP24-2", "mrn": "MRN1"}],
+        )
+        batches, _ = app_module._renaming_batches()
+
+        preview = self.client.get(
+            f"/renaming/pid/{batches[0].id}",
+            query_string={
+                "accession": "NP25-100",
+                "organ": "OTHER",
+                "mapping_signature": renaming.mapping_signature(rows),
+            },
+        )
+        approval = self.client.post(
+            f"/renaming/approve/{batches[0].id}",
+            data=self.approval_data(rows, organ="OTHER", pid="AAAAAY"),
+            headers={"Accept": "application/json"},
+        )
+
+        self.assertEqual(200, preview.status_code)
+        self.assertEqual({"success": True, "pid": "AAAAAZ"}, preview.get_json())
+        self.assertEqual(200, approval.status_code)
+        self.assertTrue(approval.get_json()["success"])
+        _, saved = renaming.read_csv(self.batch / "name_mapping.csv")
+        self.assertEqual("OTHER", saved[0]["Organ"])
+        self.assertEqual("AAAAAZ", saved[0]["PID"])
 
     def test_approval_overrides_submitted_pid_after_organ_change(self):
         rows = self.add_second_accession()
