@@ -19,18 +19,13 @@ from copath_texttypes import (
 
 DEFAULT_INSERT_BATCH_SIZE = 900
 INVALID_ACCESSIONS_FILENAME = "invalid_accessions.csv"
-ACCESSION_PATTERN = re.compile(r"^([A-Za-z]+)(\d{2})-(\d+)$")
 
 acc_query = """
   SET NOCOUNT ON;
   DROP TABLE IF EXISTS #input_accessions;
   DROP TABLE IF EXISTS #matched_specimens;
   CREATE TABLE #input_accessions (
-      accession_id VARCHAR(60) NOT NULL,
-      numwheel_id VARCHAR(15) NOT NULL,
-      specnum_year SMALLINT NOT NULL,
-      specnum_num INT NOT NULL,
-      PRIMARY KEY (numwheel_id, specnum_year, specnum_num)
+      accession_id NVARCHAR(MAX) NOT NULL
   );
 
 {insert_statements}
@@ -73,9 +68,7 @@ acc_query = """
       s.status_date
   FROM c_specimen s
   JOIN #input_accessions i
-      ON i.numwheel_id = s.numwheel_id
-     AND i.specnum_year = s.specnum_year
-     AND i.specnum_num = s.specnum_num;
+      ON i.accession_id = s.specnum_formatted;
 
   WITH text_agg AS (
       SELECT
@@ -253,14 +246,10 @@ acc_query = """
 # identical ensures exact and longitudinal exports have the same columns.
 _EXACT_MATCH_SQL = """  FROM c_specimen s
   JOIN #input_accessions i
-      ON i.numwheel_id = s.numwheel_id
-     AND i.specnum_year = s.specnum_year
-     AND i.specnum_num = s.specnum_num;"""
+      ON i.accession_id = s.specnum_formatted;"""
 _HISTORY_MATCH_SQL = """  FROM c_specimen seed
   JOIN #input_accessions i
-      ON i.numwheel_id = seed.numwheel_id
-     AND i.specnum_year = seed.specnum_year
-     AND i.specnum_num = seed.specnum_num
+      ON i.accession_id = seed.specnum_formatted
   JOIN c_specimen s
       ON s.patdemog_id = seed.patdemog_id
      AND (
@@ -580,20 +569,9 @@ def escape_sql_literal(value):
 
 def parse_accession_id(accession_id):
     normalized_accession_id = accession_id.strip()
-    match = ACCESSION_PATTERN.fullmatch(normalized_accession_id)
-    if match is None:
-        raise ValueError("expected format PREFIXYY-NUMBER, e.g. SP25-0001")
-
-    numwheel_id, two_digit_year, specnum_num = match.groups()
-    year_value = int(two_digit_year)
-    specnum_year = 1900 + year_value if year_value >= 80 else 2000 + year_value
-
-    return {
-        "accession_id": normalized_accession_id,
-        "numwheel_id": numwheel_id.upper(),
-        "specnum_year": specnum_year,
-        "specnum_num": int(specnum_num),
-    }
+    if not normalized_accession_id:
+        raise ValueError("accession ID must not be blank")
+    return {"accession_id": normalized_accession_id}
 
 
 def split_valid_invalid_accessions(accession_ids):
@@ -613,11 +591,7 @@ def split_valid_invalid_accessions(accession_ids):
             })
             continue
 
-        accession_key = (
-            parsed_accession["numwheel_id"],
-            parsed_accession["specnum_year"],
-            parsed_accession["specnum_num"],
-        )
+        accession_key = parsed_accession["accession_id"].casefold()
         if accession_key in seen_accession_keys:
             continue
 
@@ -697,18 +671,13 @@ def format_accession_insert_statements(accessions, batch_size):
 
 def format_accession_insert_statement(accessions):
     formatted_rows = [
-        (
-            f"('{escape_sql_literal(accession['accession_id'])}', "
-            f"'{escape_sql_literal(accession['numwheel_id'])}', "
-            f"{accession['specnum_year']}, "
-            f"{accession['specnum_num']})"
-        )
+        f"(N'{escape_sql_literal(accession['accession_id'])}')"
         for accession in accessions
     ]
     values_block = ",\n  ".join(formatted_rows)
     return (
         "  INSERT INTO #input_accessions "
-        "(accession_id, numwheel_id, specnum_year, specnum_num)\n"
+        "(accession_id)\n"
         "  VALUES\n"
         f"  {values_block};"
     )

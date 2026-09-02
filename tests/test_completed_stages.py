@@ -106,7 +106,7 @@ class CompletedStagesTests(unittest.TestCase):
 
         self.assertEqual(context.completed_stages, {"QC": True, "Renamed": True})
 
-    def test_qc_row_validation_requires_all_fields_and_canonical_accession(self):
+    def test_qc_row_validation_requires_nonblank_accession_and_safe_name_fields(self):
         valid_row = {
             "AccessionID": "NP25-1234",
             "BlockNumber": "A1",
@@ -114,13 +114,14 @@ class CompletedStagesTests(unittest.TestCase):
         }
 
         self.assertEqual(qc_app._qc_row_validation_errors(valid_row), [])
-        self.assertIn(
-            "Accession ID must match A12-123",
-            qc_app._qc_row_validation_errors({**valid_row, "AccessionID": "NP2-1234"}),
+        self.assertEqual(
+            [], qc_app._qc_row_validation_errors(
+                {**valid_row, "AccessionID": "mixed Case / custom_id"}
+            )
         )
         self.assertIn(
-            "Accession ID may contain only uppercase letters, numbers, and hyphens",
-            qc_app._qc_row_validation_errors({**valid_row, "AccessionID": "np25-1234"}),
+            "Accession ID is required",
+            qc_app._qc_row_validation_errors({**valid_row, "AccessionID": "  "}),
         )
         self.assertIn(
             "Block Number is required",
@@ -141,7 +142,7 @@ class CompletedStagesTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(normalized["AccessionID"], "NP25-1234")
+        self.assertEqual(normalized["AccessionID"], "np25-1234")
         self.assertEqual(normalized["Stain"], "GFAP-DAB")
         self.assertEqual(normalized["BlockNumber"], "B-4")
         self.assertTrue(normalized["_is_complete"])
@@ -155,7 +156,7 @@ class CompletedStagesTests(unittest.TestCase):
         }
         unsafe_values = (".", "/", "\\", " ", "_", "&", ":", "*", "?", '"', "<", ">", "|")
 
-        for field in ("AccessionID", "Stain", "BlockNumber"):
+        for field in ("Stain", "BlockNumber"):
             for unsafe in unsafe_values:
                 with self.subTest(field=field, unsafe=unsafe):
                     malformed = dict(valid_row)
@@ -198,7 +199,7 @@ class CompletedStagesTests(unittest.TestCase):
         context = batches[0]
         context.refresh()
         row = context.data_manager.data[0]
-        row["AccessionID"] = "A12/123"
+        row["AccessionID"] = "  "
         item = context.queue_manager.get(0)
         item.completed_by_id = "reviewer"
         item.completed_at = "2026-07-22T12:00:00"

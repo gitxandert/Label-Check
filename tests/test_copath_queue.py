@@ -218,8 +218,12 @@ class QueueClientTests(unittest.TestCase):
         self.assertEqual(1, len(claimed))
         self.assertTrue(claimed[0].exists())
 
-    def test_accession_validation_prevents_traversal_and_excessive_requests(self):
-        for invalid in (["../worker"], ["np25-100"], ["NP25-100", "NP25-100"]):
+    def test_accession_validation_allows_arbitrary_values_but_rejects_blanks_and_duplicates(self):
+        self.assertEqual(
+            ["../worker", "np25-100"],
+            copath_queue.validate_accessions([" ../worker ", "np25-100"]),
+        )
+        for invalid in (["  "], ["NP25-100", "np25-100"]):
             with self.subTest(invalid=invalid), self.assertRaises(
                 copath_queue.QueueProtocolError
             ):

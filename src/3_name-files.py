@@ -7,9 +7,9 @@ The primary goals of this script are:
 1.  **Parse OCR Text:** Use regular expressions (regex) to find and extract critical information,
     specifically the Accession ID and the Stain type, from the combined OCR text of the label
     and macro images.
-2.  **Normalize Data:** Standardize the extracted data. Accession IDs are formatted consistently
-    (e.g., 'NP 22-950' becomes 'NP22-950'), and various OCR misreadings of stain names
-    (e.g., "H and E", "H+E") are mapped to a single canonical name ("H&E").
+2.  **Normalize Data:** Preserve accession IDs taken from semicolon-delimited filenames,
+    normalize recognized OCR accession variants, and map OCR stain variations such as
+    "H and E" and "H+E" to one canonical name ("H&E").
 3.  **Enrich the CSV:** Append the parsed and normalized data as new columns to the CSV.
     It also adds flags indicating whether the parsing was successful and a column for
     manual quality control in a subsequent review tool.
@@ -55,7 +55,6 @@ COL_EXTRACTION_SUCCESSFUL = "ExtractionSuccessful"
 # This column is added for compatibility with the manual review tool. It starts empty.
 COL_QC_PASSED = "ParsingQCPassed"
 
-CANONICAL_ACCESSION_PATTERN = re.compile(r"^[A-Z]{1,3}[0-9]{2}-[0-9]+$")
 DEFAULT_ACCESSION_PATTERN = r"\b([A-Za-z]{1,3}\s*\d{2}\s*[ -/]\s*\d+)\b"
 LOOSE_ACCESSION_PATTERN = re.compile(
     r"^\s*([A-Za-z]{1,3})\s*(\d{2})\s*[- /]\s*(\d+)\s*$"
@@ -239,7 +238,7 @@ def process_csv_row(
     # so only extract if the name is delimited by semicolons
     file_name_split = file_name.split(';')
     if len(file_name_split) > 1:
-        accession_id = normalize_accession_id(file_name_split[0])
+        accession_id = file_name_split[0].strip()
     else:
         # If no match is found, look in the label text
         accession_match = accession_pattern.search(search_text)
@@ -280,7 +279,6 @@ def process_csv_row(
     # The extraction is considered successful only if an ID, a stain, and a block number were found.
     updated_row[COL_EXTRACTION_SUCCESSFUL] = bool(
         accession_id
-        and CANONICAL_ACCESSION_PATTERN.fullmatch(accession_id)
         and canonical_stain
         and block_number
     )

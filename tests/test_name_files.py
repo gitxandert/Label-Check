@@ -16,7 +16,7 @@ class NameFilesAccessionTests(unittest.TestCase):
         self.assertEqual(name_files.normalize_accession_id("SP25/0001"), "SP25-0001")
         self.assertEqual(name_files.normalize_accession_id("A12 123"), "A12-123")
 
-    def test_process_row_requires_canonical_accession_for_success(self):
+    def test_semicolon_filename_uses_first_field_without_format_validation(self):
         stain_pattern, stain_lookup = name_files.build_stain_normalizer(
             name_files.STAIN_NAME_CORRECTIONS
         )
@@ -32,16 +32,17 @@ class NameFilesAccessionTests(unittest.TestCase):
             stain_pattern,
             stain_lookup,
         )
-        invalid = name_files.process_csv_row(
+        arbitrary = name_files.process_csv_row(
             {**base_row, "original_slide_path": "BAD;slide.svs"},
             accession_pattern,
             stain_pattern,
             stain_lookup,
         )
 
-        self.assertEqual(valid[name_files.COL_ACCESSION_ID], "NP22-950")
+        self.assertEqual(valid[name_files.COL_ACCESSION_ID], "np 22-950")
         self.assertTrue(valid[name_files.COL_EXTRACTION_SUCCESSFUL])
-        self.assertFalse(invalid[name_files.COL_EXTRACTION_SUCCESSFUL])
+        self.assertEqual(arbitrary[name_files.COL_ACCESSION_ID], "BAD")
+        self.assertTrue(arbitrary[name_files.COL_EXTRACTION_SUCCESSFUL])
 
     def test_default_pattern_accepts_documented_spaced_accession(self):
         match = re.compile(

@@ -59,7 +59,6 @@ COPATH_FIELDS = (
 IDENTIFIER_FIELDS = ("AccessionID", "Organ", "MRN", "PID")
 LONGITUDINAL_LOG_FIELDS = ("AccessionID", "MRN", "Error")
 
-ACCESSION_RE = re.compile(r"^[A-Z]{1,3}[0-9]{2}-[0-9]+$")
 PID_RE = re.compile(r"^[A-Z]{6}$")
 DATE_RE = re.compile(r"^(?:[0-9]{8}|XXXXXXXX)$")
 TIMEPOINT_RE = re.compile(r"^[A-Z0-9]{4}$")
@@ -183,7 +182,7 @@ def initialize_clone(clone_root: Path) -> None:
             accession = row_accession(row)
             organ = row.get("Organ", "").strip().upper()
             if accession:
-                migrated[accession] = {
+                migrated[accession_key(accession)] = {
                     "AccessionID": accession, "Organ": organ if organ in ORGANS else "UNKNOWN",
                     "MRN": row.get("MRN", "").strip(), "PID": row.get("PID", "").strip().upper(),
                 }
@@ -193,7 +192,7 @@ def initialize_clone(clone_root: Path) -> None:
             accession = row_accession(row)
             if not accession:
                 continue
-            current = migrated.setdefault(accession, {
+            current = migrated.setdefault(accession_key(accession), {
                 "AccessionID": accession, "Organ": organ, "MRN": "", "PID": "",
             })
             current["Organ"] = current["Organ"] or organ
@@ -227,15 +226,16 @@ def _validate_identifiers(rows: Sequence[Dict[str, str]]) -> None:
         organ = row.get("Organ", "").strip().upper()
         mrn = row.get("MRN", "").strip()
         pid = row.get("PID", "").strip().upper()
-        if not ACCESSION_RE.fullmatch(accession):
-            raise RenamingError(f"invalid accession in all_iuh_identifiers.csv: {accession or '(blank)'}")
+        if not accession:
+            raise RenamingError("blank accession in all_iuh_identifiers.csv")
         if organ not in ORGANS:
             raise RenamingError(f"invalid organ in all_iuh_identifiers.csv: {organ or '(blank)'}")
         if pid and not PID_RE.fullmatch(pid):
             raise RenamingError(f"invalid PID in all_iuh_identifiers.csv: {pid}")
-        if accession in accessions:
+        key = accession_key(accession)
+        if key in accessions:
             raise RenamingError(f"duplicate accession in all_iuh_identifiers.csv: {accession}")
-        accessions.add(accession)
+        accessions.add(key)
         if mrn and pid:
             key = (mrn, organ)
             if key in mrn_organ and mrn_organ[key] != pid:
@@ -295,8 +295,26 @@ def collapse_report_headers(fields: Sequence[str]) -> List[str]:
     return collapsed
 
 
+def clean_accession(value: object) -> str:
+    """Preserve accession spelling while removing surrounding whitespace."""
+    return str(value or "").strip()
+
+
+def accession_key(value: object) -> str:
+    """Return the case-insensitive identity key for an accession."""
+    return clean_accession(value).casefold()
+
+
 def row_accession(row: Dict[str, str]) -> str:
-    return (row.get("AccessionID") or row.get("accession_id") or "").strip().upper()
+    return clean_accession(row.get("AccessionID") or row.get("accession_id"))
+
+
+def row_accession_key(row: Dict[str, str]) -> str:
+    return accession_key(row_accession(row))
+
+
+def same_accession(left: object, right: object) -> bool:
+    return accession_key(left) == accession_key(right)
 
 
 def parse_bool(value: str) -> bool:
@@ -391,8 +409,8 @@ def validate_mapping_rows(rows: Sequence[Dict[str, str]]) -> List[str]:
     names = []
     for row in rows:
         accession = row.get("AccessionID", "")
-        if not ACCESSION_RE.fullmatch(accession):
-            errors.append(f"{accession or 'AccessionID'} must match A12-123")
+        if not clean_accession(accession):
+            errors.append("AccessionID is required")
         if row.get("Organ") not in ORGANS:
             errors.append(f"{accession}: invalid Organ")
         if not PID_RE.fullmatch(row.get("PID", "")):
@@ -428,7 +446,10 @@ def validate_mapping_rows(rows: Sequence[Dict[str, str]]) -> List[str]:
 def _clone_rows(clone_root: Path) -> Tuple[Dict[str, str], Dict[str, List[Dict[str, str]]], Dict[str, List[str]]]:
     initialize_clone(clone_root)
     _, rows = read_csv(clone_root / "all_iuh_identifiers.csv")
-    accession_org = {row_accession(row): row.get("Organ", "").upper() for row in rows if row_accession(row)}
+    accession_org = {
+        row_accession_key(row): row.get("Organ", "").upper()
+        for row in rows if row_accession(row)
+    }
     by_organ: Dict[str, List[Dict[str, str]]] = {}
     headers: Dict[str, List[str]] = {}
     for organ in ORGANS:
@@ -472,7 +493,7 @@ def _staged_pid_state(
     histories = {}
     observations = []
     identifier_by_accession = {
-        row_accession(row): row for row in identifiers if row_accession(row)
+        row_accession_key(row): row for row in identifiers if row_accession(row)
     }
 
     for mapping_path in sorted(batch_base.glob("SS*/*/name_mapping.csv")):
@@ -496,7 +517,7 @@ def _staged_pid_state(
             for row in pending:
                 accession = row_accession(row)
                 if accession:
-                    mrns[accession] = row.get("mrn", "").strip()
+                    mrns[accession_key(accession)] = row.get("mrn", "").strip()
         history_path = batch_root / "pending_CoPath_history.csv"
         if history_path.exists():
             try:
@@ -507,16 +528,18 @@ def _staged_pid_state(
                 histories[history_path] = (history_headers, history)
                 for row in history:
                     accession = row_accession(row)
-                    if accession and not mrns.get(accession):
-                        mrns[accession] = row.get("mrn", "").strip()
+                    key = accession_key(accession)
+                    if accession and not mrns.get(key):
+                        mrns[key] = row.get("mrn", "").strip()
         mappings[mapping_path] = (mapping_headers, mapping, mrns)
         seen = set()
         for row in mapping:
             accession = row_accession(row)
-            if not accession or accession in seen:
+            key = accession_key(accession)
+            if not accession or key in seen:
                 continue
-            seen.add(accession)
-            mrn = mrns.get(accession, "").strip()
+            seen.add(key)
+            mrn = mrns.get(key, "").strip()
             organ = row.get("Organ", "").strip().upper()
             if mrn and organ in ORGANS:
                 observations.append(((mrn, organ), row.get("PID", "").strip().upper()))
@@ -604,7 +627,7 @@ def repair_staged_pid_assignments(clone_root: Path, batch_base: Path) -> int:
         for row in rows:
             accession = row_accession(row)
             key = (
-                mrns.get(accession, "").strip(),
+                mrns.get(accession_key(accession), "").strip(),
                 row.get("Organ", "").strip().upper(),
             )
             canonical = pairs.get(key)
@@ -652,22 +675,22 @@ def pid_after_organ_change(
     additional_reserved: Iterable[str] = (),
 ) -> str:
     """Resolve authoritative PID after a staged accession changes organ."""
-    accession = accession.strip().upper()
+    accession = clean_accession(accession)
     target_organ = target_organ.strip().upper()
-    if not ACCESSION_RE.fullmatch(accession):
-        raise RenamingError("AccessionID must match A12-123")
+    if not accession:
+        raise RenamingError("Accession ID is required")
     if target_organ not in ORGANS:
         raise RenamingError("Select a valid Organ")
 
     repair_staged_pid_assignments(clone_root, batch_base)
     mapping_path = batch_root / "name_mapping.csv"
     _, mapping = read_csv(mapping_path)
-    current = next((row for row in mapping if row_accession(row) == accession), None)
+    current = next((row for row in mapping if same_accession(row_accession(row), accession)), None)
     if current is None:
         raise RenamingError("The accession is no longer available in this batch")
     identifiers = _identifier_rows(clone_root)
     reports = report_rows(batch_root, clone_root)
-    mrn = reports.get(accession, {}).get("mrn", "").strip()
+    mrn = reports.get(accession_key(accession), {}).get("mrn", "").strip()
     pairs = _pid_pairs(batch_base, identifiers)
     if mrn and (mrn, target_organ) in pairs:
         return pairs[(mrn, target_organ)]
@@ -852,7 +875,7 @@ def stage_longitudinal_history(
         headers, queried = read_csv(temporary)
         headers = collapse_report_headers(headers)
         identifiers = _identifier_rows(clone_root)
-        identifier_by_accession = {row_accession(row): row for row in identifiers}
+        identifier_by_accession = {row_accession_key(row): row for row in identifiers}
         _, clone_rows, _ = _clone_rows(clone_root)
         reserved = _reserved_pids(batch_base)
         canonical_pairs = _pid_pairs(batch_base, identifiers)
@@ -871,15 +894,19 @@ def stage_longitudinal_history(
                 "organ": organ,
                 "_accdate": clean_date(row.get("accession_date", "")),
                 "timepoint": "XXXX",
-                "image_type": "FNA" if accession.startswith("FN") else "WSI",
+                "image_type": "FNA" if accession.casefold().startswith("fn") else "WSI",
                 "_sampacqtype": derive_sample_type(row),
             })
-            existing_id = identifier_by_accession.get(accession)
+            key = accession_key(accession)
+            existing_id = identifier_by_accession.get(key)
             existing_raw: Optional[Dict[str, str]] = None
             if existing_id:
                 old_organ = existing_id.get("Organ", "").strip().upper()
                 existing_raw = next(
-                    (item for item in clone_rows.get(old_organ, []) if row_accession(item) == accession),
+                    (
+                        item for item in clone_rows.get(old_organ, [])
+                        if row_accession_key(item) == key
+                    ),
                     None,
                 )
             if existing_raw:
@@ -891,7 +918,7 @@ def stage_longitudinal_history(
                         row, organ, identifiers, reserved[organ], canonical_pairs
                     )
                 row["PID"] = pid
-            staged[accession] = row
+            staged[key] = row
         fields = list(dict.fromkeys([*headers, *DERIVED_COPATH_FIELDS]))
         atomic_write(batch_root / "pending_CoPath_history.csv", fields, staged.values())
         job.update({"status": "staged", "error": ""})
@@ -919,39 +946,49 @@ def prepare_batch(
     required = {"AccessionID", "Stain", "BlockNumber", "original_slide_path"}
     if not slides or not required.issubset(slides[0]):
         raise RenamingError(f"enriched.csv must contain {', '.join(sorted(required))}")
-    accessions = list(dict.fromkeys(row_accession(row) for row in slides))
-    invalid = [value for value in accessions if not ACCESSION_RE.fullmatch(value)]
-    if invalid:
-        raise RenamingError(f"invalid accession ID(s): {', '.join(invalid)}")
+    accessions: List[str] = []
+    seen_accessions = set()
+    display_accessions: Dict[str, str] = {}
+    for row in slides:
+        accession = row_accession(row)
+        key = accession_key(accession)
+        if not accession:
+            raise RenamingError("enriched.csv contains a blank accession ID")
+        if key not in seen_accessions:
+            accessions.append(accession)
+            seen_accessions.add(key)
+            display_accessions[key] = accession
 
     identifiers = _identifier_rows(clone_root)
-    identifier_by_accession = {row_accession(row): row for row in identifiers}
+    identifier_by_accession = {row_accession_key(row): row for row in identifiers}
     accession_org, clone_rows, _ = _clone_rows(clone_root)
     existing: Dict[str, Dict[str, str]] = {}
     for accession in accessions:
-        organ = accession_org.get(accession)
+        key = accession_key(accession)
+        organ = accession_org.get(key)
         if organ in ORGANS:
-            existing[accession] = next(
-                (row for row in clone_rows[organ] if row_accession(row) == accession), {}
+            existing[key] = next(
+                (row for row in clone_rows[organ] if row_accession_key(row) == key), {}
             )
-            existing[accession]["organ"] = organ
-            identifier = identifier_by_accession.get(accession, {})
-            existing[accession]["PID"] = existing[accession].get("PID") or identifier.get("PID", "")
-            existing[accession]["mrn"] = existing[accession].get("mrn") or identifier.get("MRN", "")
+            existing[key]["organ"] = organ
+            identifier = identifier_by_accession.get(key, {})
+            existing[key]["PID"] = existing[key].get("PID") or identifier.get("PID", "")
+            existing[key]["mrn"] = existing[key].get("mrn") or identifier.get("MRN", "")
 
     pending_path = batch_root / "pending_CoPath_data.csv"
-    unknown = [accession for accession in accessions if accession not in existing]
+    unknown = [accession for accession in accessions if accession_key(accession) not in existing]
     query(batch_root, unknown, pending_path)
     pending_headers, pending_rows = read_csv(pending_path)
     pending_headers = collapse_report_headers(pending_headers)
     pending_rows = [collapse_report_fields(row) for row in pending_rows]
     atomic_write(pending_path, pending_headers, pending_rows)
-    pending_by_accession = {row_accession(row): row for row in pending_rows}
+    pending_by_accession = {row_accession_key(row): row for row in pending_rows}
     reserved = _reserved_pids(batch_base)
     canonical_pairs = _pid_pairs(batch_base, identifiers)
     accession_values: Dict[str, Dict[str, str]] = {}
     for accession in accessions:
-        source = existing.get(accession) or pending_by_accession.get(accession)
+        key = accession_key(accession)
+        source = existing.get(key) or pending_by_accession.get(key)
         organ = (source or {}).get("organ") or derive_organ(source)
         organ = organ if organ in ORGANS else "UNKNOWN"
         pid = (source or {}).get("PID", "")
@@ -959,23 +996,25 @@ def prepare_batch(
             pid = _pid_for_identifiers(
                 source, organ, identifiers, reserved[organ], canonical_pairs
             )
-        accession_values[accession] = {
+        accession_values[key] = {
             "Organ": organ,
             "PID": pid,
             "AccessionDate": (source or {}).get("_accdate") or clean_date((source or {}).get("accession_date", "")),
             "Timepoint": (source or {}).get("timepoint") or "XXXX",
-            "ImageType": (source or {}).get("image_type") or ("FNA" if accession.startswith("FN") else "WSI"),
+            "ImageType": (source or {}).get("image_type") or (
+                "FNA" if accession.casefold().startswith("fn") else "WSI"
+            ),
             "SampAcqType": (source or {}).get("_sampacqtype") or derive_sample_type(source),
         }
 
     counters: Dict[Tuple[str, ...], int] = defaultdict(int)
     mapping_rows: List[Dict[str, str]] = []
     for slide in slides:
-        accession = row_accession(slide)
-        shared = accession_values[accession]
+        accession = display_accessions[row_accession_key(slide)]
+        shared = accession_values[accession_key(accession)]
         stain = (slide.get("Stain") or "XX").strip()
         block = (slide.get("BlockNumber") or "XX").strip()
-        key = (accession, *shared.values(), stain, block)
+        key = (accession_key(accession), *shared.values(), stain, block)
         row = {
             "AccessionID": accession, **shared, "Stain": stain, "BlockNumber": block,
             "SectionCount": f"{counters[key]:03d}",
@@ -989,9 +1028,10 @@ def prepare_batch(
         raise RenamingError("; ".join(errors))
     atomic_write(batch_root / "name_mapping.csv", MAPPING_FIELDS, mapping_rows)
     known_mrns = {row.get("MRN", "").strip() for row in identifiers if row.get("MRN", "").strip()}
+    unknown_keys = {accession_key(accession) for accession in unknown}
     new_rows = [
         row for row in pending_rows
-        if row_accession(row) in unknown
+        if row_accession_key(row) in unknown_keys
         and row.get("mrn", "").strip()
         and row.get("mrn", "").strip() not in known_mrns
     ]
@@ -1019,26 +1059,30 @@ def report_rows(batch_root: Path, clone_root: Path) -> Dict[str, Dict[str, str]]
     if pending.exists():
         _, rows = read_csv(pending)
         result.update({
-            row_accession(row): collapse_report_fields(row)
+            row_accession_key(row): collapse_report_fields(row)
             for row in rows
             if row_accession(row)
         })
     accession_org, clone_rows, _ = _clone_rows(clone_root)
-    for accession, organ in accession_org.items():
-        if accession not in result and organ in clone_rows:
-            row = next((item for item in clone_rows[organ] if row_accession(item) == accession), None)
+    for key, organ in accession_org.items():
+        if key not in result and organ in clone_rows:
+            row = next((item for item in clone_rows[organ] if row_accession_key(item) == key), None)
             if row:
-                result[accession] = row
+                result[key] = row
     return result
 
 
 def group_mapping(rows: Sequence[Dict[str, str]], reports: Dict[str, Dict[str, str]]) -> List[Dict[str, object]]:
     grouped: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    display_accessions: Dict[str, str] = {}
     for row in rows:
-        grouped[row["AccessionID"]].append(row)
+        key = accession_key(row["AccessionID"])
+        grouped[key].append(row)
+        display_accessions.setdefault(key, row["AccessionID"])
     result = []
-    for accession, slides in grouped.items():
-        report = reports.get(accession, {})
+    for key, slides in grouped.items():
+        accession = display_accessions[key]
+        report = reports.get(key, {})
         result.append({
             "accession": accession, "shared": slides[0], "slides": slides,
             "approved": all(parse_bool(row["Approved"]) for row in slides),
@@ -1067,11 +1111,18 @@ def update_group(
     _, rows = read_csv(mapping_path)
     if mapping_signature(rows) != expected_signature:
         raise RenamingError("The mapping changed in another session; reload and try again")
-    new_accession = values["AccessionID"]
-    target_exists = new_accession != old_accession and any(row["AccessionID"] == new_accession for row in rows)
-    target = next((row for row in rows if row["AccessionID"] == new_accession), None)
+    new_accession = clean_accession(values["AccessionID"])
+    if not new_accession:
+        raise RenamingError("Accession ID is required")
+    values["AccessionID"] = new_accession
+    old_key = accession_key(old_accession)
+    new_key = accession_key(new_accession)
+    target_exists = new_key != old_key and any(
+        row_accession_key(row) == new_key for row in rows
+    )
+    target = next((row for row in rows if row_accession_key(row) == new_key), None)
     for row in rows:
-        if row["AccessionID"] != old_accession:
+        if row_accession_key(row) != old_key:
             continue
         row["AccessionID"] = new_accession
         source = target if target_exists and target else values
@@ -1084,7 +1135,7 @@ def update_group(
         row["NewName"] = build_new_name(row)
     if target_exists:
         for row in rows:
-            if row["AccessionID"] == new_accession:
+            if row_accession_key(row) == new_key:
                 row["Approved"] = "False"
         renumber_merged_mapping(rows)
     errors = validate_mapping_rows(rows)
@@ -1095,7 +1146,7 @@ def update_group(
         pending_path = mapping_path.parent / "pending_CoPath_data.csv"
         if pending_path.exists():
             headers, pending = read_csv(pending_path)
-            pending = [row for row in pending if row_accession(row) != old_accession]
+            pending = [row for row in pending if row_accession_key(row) != old_key]
             atomic_write(pending_path, headers, pending)
     return rows, target_exists
 
@@ -1109,18 +1160,21 @@ def retry_group(
     query: Callable[[Path, Sequence[str], Path], None] = default_query,
 ) -> None:
     repair_staged_pid_assignments(clone_root, batch_base)
-    new_accession = new_accession.strip().upper()
-    if not ACCESSION_RE.fullmatch(new_accession):
-        raise RenamingError("AccessionID must match A12-123")
+    old_accession = clean_accession(old_accession)
+    new_accession = clean_accession(new_accession)
+    if not new_accession:
+        raise RenamingError("Accession ID is required")
+    old_key = accession_key(old_accession)
+    new_key = accession_key(new_accession)
     mapping_path = batch_root / "name_mapping.csv"
     _, mapping = read_csv(mapping_path)
-    current = next((row for row in mapping if row["AccessionID"] == old_accession), None)
+    current = next((row for row in mapping if row_accession_key(row) == old_key), None)
     if current is None:
         raise RenamingError("The accession is no longer available in this batch")
     target = next(
         (
             row for row in mapping
-            if new_accession != old_accession and row["AccessionID"] == new_accession
+            if new_key != old_key and row_accession_key(row) == new_key
         ),
         None,
     )
@@ -1129,22 +1183,22 @@ def retry_group(
     source: Optional[Dict[str, str]] = None
     source_from_history = False
     history_source_headers: List[str] = []
-    organ = accession_org.get(new_accession)
+    organ = accession_org.get(new_key)
     if organ in ORGANS:
-        source = next((row for row in clone_rows[organ] if row_accession(row) == new_accession), None)
+        source = next((row for row in clone_rows[organ] if row_accession_key(row) == new_key), None)
     # A corrected accession may already be present in this batch's pending CoPath
     # data (for example, from longitudinal history). Reuse it before issuing a
     # duplicate exact-accession query. An unchanged accession still forces retry.
-    if source is None and target is None and new_accession != old_accession:
-        source = report_rows(batch_root, clone_root).get(new_accession)
-    if source is None and target is None and new_accession != old_accession:
+    if source is None and target is None and new_key != old_key:
+        source = report_rows(batch_root, clone_root).get(new_key)
+    if source is None and target is None and new_key != old_key:
         history_path = batch_root / "pending_CoPath_history.csv"
         if history_path.exists():
             history_source_headers, history_rows = read_csv(history_path)
             history_source_headers = collapse_report_headers(history_source_headers)
             history_rows = [collapse_report_fields(row) for row in history_rows]
             source = next(
-                (row for row in history_rows if row_accession(row) == new_accession),
+                (row for row in history_rows if row_accession_key(row) == new_key),
                 None,
             )
             source_from_history = source is not None
@@ -1157,7 +1211,7 @@ def retry_group(
             headers, queried = read_csv(retry_path)
             headers = collapse_report_headers(headers)
             queried = [collapse_report_fields(row) for row in queried]
-            source = next((row for row in queried if row_accession(row) == new_accession), None)
+            source = next((row for row in queried if row_accession_key(row) == new_key), None)
             pending_path = batch_root / "pending_CoPath_data.csv"
             if pending_path.exists():
                 pending_headers, pending = read_csv(pending_path)
@@ -1165,24 +1219,27 @@ def retry_group(
                 pending = [collapse_report_fields(row) for row in pending]
             else:
                 pending_headers, pending = headers, []
-            pending = [row for row in pending if row_accession(row) not in {old_accession, new_accession}]
+            pending = [
+                row for row in pending
+                if row_accession_key(row) not in {old_key, new_key}
+            ]
             if source:
                 pending.append(source)
                 pending_headers = list(dict.fromkeys([*pending_headers, *source.keys()]))
             atomic_write(pending_path, pending_headers or ["accession_id"], pending)
         finally:
             retry_path.unlink(missing_ok=True)
-    if new_accession != old_accession:
+    if new_key != old_key:
         pending_path = batch_root / "pending_CoPath_data.csv"
         if pending_path.exists():
             pending_headers, pending = read_csv(pending_path)
             pending_headers = collapse_report_headers(pending_headers)
             pending = [collapse_report_fields(row) for row in pending]
-            pending = [row for row in pending if row_accession(row) != old_accession]
+            pending = [row for row in pending if row_accession_key(row) != old_key]
         else:
             pending_headers, pending = [], []
         if source_from_history and source is not None:
-            pending = [row for row in pending if row_accession(row) != new_accession]
+            pending = [row for row in pending if row_accession_key(row) != new_key]
             pending.append(source)
             pending_headers = list(dict.fromkeys([
                 *pending_headers, *history_source_headers, *source.keys(),
@@ -1203,18 +1260,19 @@ def retry_group(
         shared = {
             "Organ": organ, "PID": pid,
             "AccessionDate": clean_date((source or {}).get("accession_date", "")),
-            "Timepoint": "XXXX", "ImageType": "FNA" if new_accession.startswith("FN") else "WSI",
+            "Timepoint": "XXXX",
+            "ImageType": "FNA" if new_accession.casefold().startswith("fn") else "WSI",
             "SampAcqType": derive_sample_type(source),
         }
     for row in mapping:
-        if row["AccessionID"] == old_accession:
+        if row_accession_key(row) == old_key:
             row["AccessionID"] = new_accession
             row.update(shared)
             row["Approved"] = "False"
             row["NewName"] = build_new_name(row)
     if target:
         for row in mapping:
-            if row["AccessionID"] == new_accession:
+            if row_accession_key(row) == new_key:
                 row["Approved"] = "False"
         renumber_merged_mapping(mapping)
     errors = validate_mapping_rows(mapping)
@@ -1228,7 +1286,7 @@ def retry_group(
             raise RenamingError("enriched.csv must contain AccessionID")
         enriched_changed = False
         for row in enriched_rows:
-            if row_accession(row) == old_accession:
+            if row_accession_key(row) == old_key:
                 row["AccessionID"] = new_accession
                 enriched_changed = True
         if enriched_changed:
@@ -1255,23 +1313,24 @@ def finalize_batch(batch_root: Path, clone_root: Path) -> None:
         return
     accession_org, clone_rows, clone_headers = _clone_rows(clone_root)
     identifier_rows = _identifier_rows(clone_root)
-    identifiers = {row_accession(row): dict(row) for row in identifier_rows}
+    identifiers = {row_accession_key(row): dict(row) for row in identifier_rows}
     reports = report_rows(batch_root, clone_root)
-    approved_by_accession = {row["AccessionID"]: row for row in mapping}
+    approved_by_accession = {accession_key(row["AccessionID"]): row for row in mapping}
     backup_root = batch_root / "renaming_backups" / dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     touched: List[Tuple[Path, Optional[Path]]] = []
     try:
         touched_organs = set()
-        for accession, approved in approved_by_accession.items():
-            old_organ = accession_org.get(accession)
+        for key, approved in approved_by_accession.items():
+            accession = approved["AccessionID"]
+            old_organ = accession_org.get(key)
             if old_organ is not None:
                 clone_rows[old_organ] = [
-                    row for row in clone_rows[old_organ] if row_accession(row) != accession
+                    row for row in clone_rows[old_organ] if row_accession_key(row) != key
                 ]
                 touched_organs.add(old_organ)
-            raw = reports.get(accession)
+            raw = reports.get(key)
             mrn = (raw or {}).get("mrn", "").strip()
-            identifiers[accession] = {
+            identifiers[key] = {
                 "AccessionID": accession, "Organ": approved["Organ"],
                 "MRN": mrn, "PID": approved["PID"],
             }
@@ -1316,15 +1375,16 @@ def finalize_batch(batch_root: Path, clone_root: Path) -> None:
                 accession = row_accession(raw)
                 if not accession:
                     continue
-                old = identifiers.get(accession)
+                key = accession_key(accession)
+                old = identifiers.get(key)
                 old_organ = (old or {}).get("Organ", "").strip().upper()
-                approved = approved_by_accession.get(accession)
+                approved = approved_by_accession.get(key)
                 organ = approved["Organ"] if approved else raw.get("organ", "").strip().upper()
                 if organ not in ORGANS:
                     organ = old_organ if old_organ in ORGANS else derive_organ(raw)
                 if old_organ in ORGANS:
                     clone_rows[old_organ] = [
-                        item for item in clone_rows[old_organ] if row_accession(item) != accession
+                        item for item in clone_rows[old_organ] if row_accession_key(item) != key
                     ]
                     touched_organs.add(old_organ)
                 mrn = raw.get("mrn", "").strip()
@@ -1352,8 +1412,9 @@ def finalize_batch(batch_root: Path, clone_root: Path) -> None:
                         "timepoint": approved["Timepoint"], "image_type": approved["ImageType"],
                         "_sampacqtype": approved["SampAcqType"],
                     })
-                identifiers[accession] = {
-                    "AccessionID": accession, "Organ": organ, "MRN": mrn, "PID": pid,
+                identifiers[key] = {
+                    "AccessionID": approved["AccessionID"] if approved else accession,
+                    "Organ": organ, "MRN": mrn, "PID": pid,
                 }
                 clone_rows[organ].append(raw)
                 clone_headers[organ] = list(dict.fromkeys([*clone_headers[organ], *history_headers, *raw.keys()]))
@@ -1371,10 +1432,10 @@ def finalize_batch(batch_root: Path, clone_root: Path) -> None:
             headers, pending = read_csv(pending_path)
             headers = collapse_report_headers(headers)
             pending = [collapse_report_fields(raw) for raw in pending]
-            pending = [raw for raw in pending if row_accession(raw) in approved_by_accession]
+            pending = [raw for raw in pending if row_accession_key(raw) in approved_by_accession]
             headers = list(dict.fromkeys([*headers, *DERIVED_COPATH_FIELDS]))
             for raw in pending:
-                approved = approved_by_accession.get(row_accession(raw))
+                approved = approved_by_accession.get(row_accession_key(raw))
                 if approved:
                     raw.update({
                         "organ": approved["Organ"], "PID": approved["PID"], "_accdate": approved["AccessionDate"],

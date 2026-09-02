@@ -70,6 +70,35 @@ class RenamingDataTests(unittest.TestCase):
         self.assertEqual("BRAIN_AAAAAZ_20250304_XXXX_HE_WSI_REB4000.svs", rows[0]["NewName"])
         self.assertTrue(all(row["Approved"] == "False" for row in rows))
 
+    def test_prepare_preserves_arbitrary_accession_and_matches_copath_case_insensitively(self):
+        write_csv(
+            self.batch / "enriched.csv",
+            ["AccessionID", "Stain", "BlockNumber", "original_slide_path"],
+            [{
+                "AccessionID": "Custom / Id_7", "Stain": "HE",
+                "BlockNumber": "B4", "original_slide_path": "one.svs",
+            }],
+        )
+
+        def arbitrary_query(_batch, accessions, output):
+            self.assertEqual(["Custom / Id_7"], list(accessions))
+            write_csv(
+                output,
+                ["accession_id", "mrn", "accession_date"],
+                [{
+                    "accession_id": "CUSTOM / ID_7", "mrn": "MRN2",
+                    "accession_date": "2025-03-04",
+                }],
+            )
+
+        renaming.prepare_batch(
+            self.batch, self.clone, self.batch_base, arbitrary_query
+        )
+
+        _, rows = renaming.read_csv(self.batch / "name_mapping.csv")
+        self.assertEqual("Custom / Id_7", rows[0]["AccessionID"])
+        self.assertEqual("20250304", rows[0]["AccessionDate"])
+
     def test_prepare_maps_new_accessions_by_mrn_and_organ(self):
         write_csv(
             self.batch / "enriched.csv",

@@ -19,7 +19,6 @@ MAX_ACCESSIONS = 10_000
 HEARTBEAT_MAX_AGE_SECONDS = 15
 FUTURE_CLOCK_SKEW_SECONDS = 30
 MAX_JSON_BYTES = 64 * 1024 * 1024
-ACCESSION_PATTERN = re.compile(r"^[A-Z]{1,3}[0-9]{2}-[0-9]+$")
 REQUEST_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 ERROR_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 QUEUE_DIRECTORIES = ("requests", "processing", "results", "errors", "work")
@@ -61,12 +60,16 @@ def validate_accessions(values: object) -> List[str]:
     if len(values) > MAX_ACCESSIONS:
         raise QueueProtocolError(f"a request may contain at most {MAX_ACCESSIONS} accessions")
     normalized: List[str] = []
+    seen = set()
     for value in values:
-        if not isinstance(value, str) or not ACCESSION_PATTERN.fullmatch(value):
+        if not isinstance(value, str) or not value.strip():
             raise QueueProtocolError("a request contains an invalid accession ID")
-        normalized.append(value)
-    if len(set(normalized)) != len(normalized):
-        raise QueueProtocolError("a request contains duplicate accession IDs")
+        accession = value.strip()
+        key = accession.casefold()
+        if key in seen:
+            raise QueueProtocolError("a request contains duplicate accession IDs")
+        seen.add(key)
+        normalized.append(accession)
     return normalized
 
 
@@ -170,14 +173,15 @@ def validate_result_csv(
             ):
                 raise QueueProtocolError("The Windows CoPath worker returned a malformed CSV")
             rows = []
-            requested_set = set(requested)
+            requested_set = {value.strip().casefold() for value in requested}
             for row in reader:
                 if None in row:
                     raise QueueProtocolError("The Windows CoPath worker returned a malformed CSV")
                 clean = {key: value or "" for key, value in row.items()}
-                accession = clean["accession_id"].strip().upper()
-                if not ACCESSION_PATTERN.fullmatch(accession) or (
-                    scope == "exact_accession" and accession not in requested_set
+                accession = clean["accession_id"].strip()
+                if not accession or (
+                    scope == "exact_accession"
+                    and accession.casefold() not in requested_set
                 ):
                     raise QueueProtocolError(
                         "The Windows CoPath worker returned an accession that was not requested"

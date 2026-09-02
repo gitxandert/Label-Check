@@ -1434,12 +1434,12 @@ class DataManager:
         if not self.data:
             return
         id_counts = Counter(
-            row.get("AccessionID", "").strip()
+            renaming.accession_key(row.get("AccessionID", ""))
             for row in self.data
             if row.get("AccessionID", "").strip()
         )
         for row in self.data:
-            current_id = row.get("AccessionID", "").strip()
+            current_id = renaming.accession_key(row.get("AccessionID", ""))
             row["_accession_id_count"] = id_counts[current_id] if current_id else 0
     
     def get_row(self, index: int) -> Optional[Dict[str, Any]]:
@@ -2041,7 +2041,8 @@ _qc_filename_component_pattern = re.compile(r"^[A-Z0-9-]+$")
 def _normalize_qc_values(values: Dict[str, Any]) -> Dict[str, Any]:
     """Return QC values in their canonical form without hiding invalid input."""
     normalized = dict(values)
-    for field in ("AccessionID", "Stain", "BlockNumber"):
+    normalized["AccessionID"] = str(values.get("AccessionID") or "").strip()
+    for field in ("Stain", "BlockNumber"):
         value = str(values.get(field) or "").upper()
         if field == "Stain":
             value = value.replace("_", "-")
@@ -2055,12 +2056,6 @@ def _qc_row_validation_errors(row: Dict[str, Any]) -> List[str]:
     accession_id = str(row.get("AccessionID") or "")
     if not accession_id.strip():
         errors.append("Accession ID is required")
-    elif not _qc_filename_component_pattern.fullmatch(accession_id):
-        errors.append(
-            "Accession ID may contain only uppercase letters, numbers, and hyphens"
-        )
-    elif not _accession_pattern.fullmatch(accession_id):
-        errors.append("Accession ID must match A12-123")
 
     for field, label in (("Stain", "Stain"), ("BlockNumber", "Block Number")):
         value = str(row.get(field) or "")
@@ -2538,7 +2533,9 @@ def _post_qc_sdl_rows(
     header_columns = _sdl_header_columns(worksheet)
     accession_column = header_columns["Accession ID"]
     existing_accessions = {
-        str(worksheet.cell(row=row_number, column=accession_column).value).strip().upper()
+        renaming.accession_key(
+            worksheet.cell(row=row_number, column=accession_column).value
+        )
         for row_number in range(2, worksheet.max_row + 1)
         if worksheet.cell(row=row_number, column=accession_column).value is not None
     }
@@ -2549,10 +2546,11 @@ def _post_qc_sdl_rows(
         accession = renaming.row_accession(slide)
         if not accession:
             continue
-        slides_by_accession[accession].append(slide)
+        key = renaming.accession_key(accession)
+        slides_by_accession[key].append(slide)
         organ = slide.get("Organ", "").strip().upper()
-        if organ and accession not in mapping_organs:
-            mapping_organs[accession] = organ
+        if organ and key not in mapping_organs:
+            mapping_organs[key] = organ
 
     clone_organs: Dict[str, str] = {}
     renaming.initialize_clone(Path(Config.COPATH_CLONE))
@@ -2560,7 +2558,7 @@ def _post_qc_sdl_rows(
     if clone_index.exists():
         _, clone_rows = renaming.read_csv(clone_index)
         clone_organs = {
-            renaming.row_accession(row): row.get("Organ", "").strip().upper()
+            renaming.row_accession_key(row): row.get("Organ", "").strip().upper()
             for row in clone_rows
             if renaming.row_accession(row) and row.get("Organ", "").strip()
         }
@@ -2568,9 +2566,10 @@ def _post_qc_sdl_rows(
     batch_date = _strict_sdl_date(batch_root.name)
     scanner = _sdl_scanner_for_batch(batch_root)
     new_rows: List[Dict[str, Any]] = []
-    for accession, slides in slides_by_accession.items():
-        if accession in existing_accessions:
+    for key, slides in slides_by_accession.items():
+        if key in existing_accessions:
             continue
+        accession = renaming.row_accession(slides[0])
         if batch_date is not None:
             date_groups: Dict[Union[datetime.date, str], List[Dict[str, str]]] = {
                 batch_date: slides
@@ -2586,7 +2585,7 @@ def _post_qc_sdl_rows(
                 )
                 date_groups.setdefault(date_key, []).append(slide)
 
-        organ = mapping_organs.get(accession) or clone_organs.get(accession) or "UNKNOWN"
+        organ = mapping_organs.get(key) or clone_organs.get(key) or "UNKNOWN"
         for loaded_date, grouped_slides in date_groups.items():
             row = {header: None for header in SDL_HEADERS}
             row.update(
@@ -2644,7 +2643,7 @@ def _replace_sdl_accession(old_accession: str, new_accession: str) -> int:
             changed = 0
             for row_number in range(2, worksheet.max_row + 1):
                 cell = worksheet.cell(row=row_number, column=accession_column)
-                if str(cell.value or "").strip().upper() == old_accession:
+                if renaming.same_accession(cell.value, old_accession):
                     cell.value = new_accession
                     changed += 1
             if changed:
@@ -3076,7 +3075,7 @@ def _tq_sdl_accession_metadata(
             dates: Dict[str, set] = defaultdict(set)
             types: Dict[str, set] = defaultdict(set)
             for row in _read_sdl_rows(worksheet):
-                accession = row["values"]["Accession ID"].strip().upper()
+                accession = renaming.accession_key(row["values"]["Accession ID"])
                 loaded = row["values"]["Date Loaded"].strip()
                 slide_type = row["values"]["Type"].strip()
                 if accession and _strict_sdl_date(loaded):
@@ -3109,7 +3108,7 @@ def _tq_digitization_date(
     batch_date = _strict_sdl_date(batch_root.name)
     if batch_date:
         return batch_date.isoformat()
-    candidates = sdl_dates.get(accession.upper(), [])
+    candidates = sdl_dates.get(renaming.accession_key(accession), [])
     return candidates[0] if len(candidates) == 1 else ""
 
 
@@ -3145,7 +3144,7 @@ def _tq_catalog() -> Tuple[List[Dict[str, str]], List[str]]:
                         "contains a row missing OriginalPath, AccessionID, "
                         "Organ, PID, or NewName"
                     )
-                accession_metadata = sdl_metadata.get(accession.upper())
+                accession_metadata = sdl_metadata.get(renaming.accession_key(accession))
                 if not accession_metadata:
                     continue
                 slides.append(
@@ -3170,7 +3169,7 @@ def _tq_catalog() -> Tuple[List[Dict[str, str]], List[str]]:
                             original_path,
                             context.root,
                             accession,
-                            {accession.upper(): accession_metadata["dates"]},
+                            {renaming.accession_key(accession): accession_metadata["dates"]},
                         ),
                     }
                 )
@@ -3477,14 +3476,15 @@ def _tq_write_metadata_csv(slides: List[Dict[str, str]]) -> Path:
     accessions: Dict[str, Dict[str, Any]] = {}
     try:
         for slide in slides:
-            accession = slide.get("accession", "").strip().upper()
+            accession = slide.get("accession", "").strip()
+            accession_identity = renaming.accession_key(accession)
             pid = slide.get("pid", "").strip().upper()
             if not accession or not pid:
                 raise TQError(
                     "Transfer metadata requires an accession ID and PID for every slide."
                 )
             summary = accessions.setdefault(
-                accession,
+                accession_identity,
                 {"accession_id": accession, "pid": pid, "num_slides": 0},
             )
             if summary["pid"] != pid:
@@ -3570,7 +3570,7 @@ def _tq_update_sdl_push_status(all_slides: List[Dict[str, str]]) -> int:
     grouped: Dict[Tuple[str, str], set] = defaultdict(set)
     for slide in all_slides:
         if slide["digitization_date"]:
-            grouped[(slide["accession"].upper(), slide["digitization_date"])].add(
+            grouped[(renaming.accession_key(slide["accession"]), slide["digitization_date"])].add(
                 slide["original_path"]
             )
     workbook = None
@@ -3584,14 +3584,14 @@ def _tq_update_sdl_push_status(all_slides: List[Dict[str, str]]) -> int:
                     worksheet.cell(
                         row=row_number, column=columns["Accession ID"]
                     ).value or ""
-                ).strip().upper()
+                ).strip()
                 loaded = _format_sdl_value(
                     "Date Loaded",
                     worksheet.cell(
                         row=row_number, column=columns["Date Loaded"]
                     ).value,
                 )
-                paths = grouped.get((accession, loaded), set())
+                paths = grouped.get((renaming.accession_key(accession), loaded), set())
                 if not paths or not paths.issubset(successes):
                     continue
                 status_cell = worksheet.cell(
@@ -5338,10 +5338,10 @@ def renaming_retry(batch_id: str):
     if context is None:
         flash("The batch is no longer available for renaming.", "warning")
         return redirect(url_for("renaming_page"))
-    old_accession = request.form.get("old_accession", "").strip().upper()
-    new_accession = request.form.get("accession_id", "").strip().upper()
-    if not renaming.ACCESSION_RE.fullmatch(new_accession):
-        flash("AccessionID must match A12-123.", "error")
+    old_accession = request.form.get("old_accession", "").strip()
+    new_accession = request.form.get("accession_id", "").strip()
+    if not new_accession:
+        flash("Accession ID is required.", "error")
     elif _start_renaming_job(
         context, old_accession=old_accession, new_accession=new_accession, force=True
     ):
@@ -5425,7 +5425,7 @@ def renaming_pid(batch_id: str):
             "success": False,
             "message": "The batch is no longer available for renaming.",
         }), 404
-    accession = request.args.get("accession", "").strip().upper()
+    accession = request.args.get("accession", "").strip()
     organ = request.args.get("organ", "").strip().upper()
     reserved_pids = request.args.getlist("reserved_pid")
     expected_signature = request.args.get("mapping_signature", "")
@@ -5469,9 +5469,9 @@ def renaming_approve(batch_id: str):
         flash("The batch is no longer available for renaming.", "warning")
         return redirect(url_for("renaming_page"))
     mapping_path = context.root / "name_mapping.csv"
-    old_accession = request.form.get("old_accession", "").strip().upper()
+    old_accession = request.form.get("old_accession", "").strip()
     values = {
-        "AccessionID": request.form.get("accession_id", "").strip().upper(),
+        "AccessionID": request.form.get("accession_id", "").strip(),
         "Organ": request.form.get("organ", "").strip().upper(),
         "AccessionDate": request.form.get("accession_date", "").strip().upper(),
         "Timepoint": request.form.get("timepoint", "").strip().upper(),
@@ -5481,6 +5481,8 @@ def renaming_approve(batch_id: str):
     updated: Optional[List[Dict[str, str]]] = None
     merged = False
     try:
+        if not values["AccessionID"]:
+            raise renaming.RenamingError("Accession ID is required")
         if _renaming_job_state(batch_id).get("status") in {"preparing", "retrying"}:
             raise renaming.RenamingError(
                 "Wait for the active CoPath job to finish before approving names"
@@ -5509,17 +5511,22 @@ def renaming_approve(batch_id: str):
             )
             _, current_rows = renaming.read_csv(mapping_path)
             repaired_signature = renaming.mapping_signature(current_rows)
+            old_key = renaming.accession_key(old_accession)
+            new_key = renaming.accession_key(values["AccessionID"])
             target_exists = any(
-                row["AccessionID"] == values["AccessionID"]
+                renaming.accession_key(row["AccessionID"]) == new_key
                 for row in current_rows
-                if row["AccessionID"] != old_accession
+                if renaming.accession_key(row["AccessionID"]) != old_key
             )
-            if values["AccessionID"] != old_accession and not target_exists:
+            if new_key != old_key and not target_exists:
                 raise renaming.RenamingError(
                     "Retry CoPath after changing an accession ID before approving it"
                 )
             current = next(
-                (row for row in current_rows if row["AccessionID"] == old_accession),
+                (
+                    row for row in current_rows
+                    if renaming.accession_key(row["AccessionID"]) == old_key
+                ),
                 None,
             )
             if current is None:
@@ -5538,6 +5545,11 @@ def renaming_approve(batch_id: str):
                 mapping_path, old_accession, values, slide_values,
                 repaired_signature,
             )
+        if (
+            values["AccessionID"] != old_accession
+            and renaming.same_accession(values["AccessionID"], old_accession)
+        ):
+            _replace_sdl_accession(old_accession, values["AccessionID"])
         if merged:
             message = "Accessions were merged. Review and approve the combined group."
             category = "info"

@@ -95,14 +95,14 @@ class WorkerTests(unittest.TestCase):
 
     def test_invalid_request_publishes_safe_error(self):
         request_id = "3" * 32
-        self.publish(request_id, ["../secret"])
+        self.publish(request_id, ["  "])
         self.worker.run_once()
 
         error = copath_queue.read_json(
             self.worker.paths["errors"] / f"{request_id}.json"
         )
         self.assertEqual("invalid_request", error["code"])
-        self.assertNotIn("secret", error["message"])
+        self.assertNotIn("accessions", error["message"])
         self.assertEqual([], self.calls)
 
     def test_result_must_be_subset_of_request(self):

@@ -296,7 +296,7 @@ the unit tests and Docker test target. Install locks only with
 
 If those values are stored only in `.env`, substitute their actual Windows
 paths in the command. The worker writes a heartbeat every five seconds, accepts
-only validated accession lists (up to 10,000), and uses the signed-in user's
+nonblank, case-insensitively unique accession lists (up to 10,000), and uses the signed-in user's
 native Windows identity through `Trusted_Connection=yes`. Press Ctrl+C for a
 clean shutdown; the heartbeat is removed and the renaming page reports the
 worker offline instead of waiting for the full query timeout.
