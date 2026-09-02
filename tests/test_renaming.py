@@ -611,10 +611,19 @@ class RenamingPageTests(unittest.TestCase):
         self.clone = self.root / "clone"
         (self.batch / "label").mkdir(parents=True)
         (self.batch / "macro").mkdir()
+        (self.batch / "label" / "one.png").write_bytes(b"label image")
+        (self.batch / "macro" / "one.png").write_bytes(b"macro image")
         write_csv(
             self.batch / "enriched.csv",
-            ["AccessionID", "Stain", "BlockNumber", "ParsingQCPassed", "original_slide_path"],
-            [{"AccessionID": "NP25-100", "Stain": "HE", "BlockNumber": "B4", "ParsingQCPassed": "TRUE", "original_slide_path": "one.svs"}],
+            [
+                "AccessionID", "Stain", "BlockNumber", "ParsingQCPassed",
+                "original_slide_path", "label_path", "macro_path",
+            ],
+            [{
+                "AccessionID": "NP25-100", "Stain": "HE", "BlockNumber": "B4",
+                "ParsingQCPassed": "TRUE", "original_slide_path": "one.svs",
+                "label_path": "label/one.png", "macro_path": "macro/one.png",
+            }],
         )
         write_csv(self.batch / "completed_stages.csv", ["QC", "Renamed"], [{"QC": "True", "Renamed": "False"}])
         write_csv(self.clone / "all_accessions.csv", ["AccessionID", "Organ"], [])
@@ -722,6 +731,48 @@ class RenamingPageTests(unittest.TestCase):
         self.assertIn(b"reserved_pid", detail.data)
         self.assertIn(b'name="pid" value="AAAAAA" maxlength="6" required readonly', detail.data)
         self.assertIn(b'class="success approve-button"', detail.data)
+
+    def test_page_links_to_label_and_macro_images(self):
+        batches, _ = app_module._renaming_batches()
+
+        response = self.client.get(f"/renaming?batch={batches[0].id}")
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn(
+            f'href="/data_images/{batches[0].id}/label/one.png" target="_blank" rel="noopener">Label</a>'.encode(),
+            response.data,
+        )
+        self.assertIn(
+            f'href="/data_images/{batches[0].id}/macro/one.png" target="_blank" rel="noopener">Macro</a>'.encode(),
+            response.data,
+        )
+        label = self.client.get(f"/data_images/{batches[0].id}/label/one.png")
+        macro = self.client.get(f"/data_images/{batches[0].id}/macro/one.png")
+        self.assertEqual(b"label image", label.data)
+        self.assertEqual(b"macro image", macro.data)
+        label.close()
+        macro.close()
+
+    def test_page_omits_links_for_missing_images(self):
+        write_csv(
+            self.batch / "enriched.csv",
+            [
+                "AccessionID", "Stain", "BlockNumber", "ParsingQCPassed",
+                "original_slide_path", "label_path", "macro_path",
+            ],
+            [{
+                "AccessionID": "NP25-100", "Stain": "HE", "BlockNumber": "B4",
+                "ParsingQCPassed": "TRUE", "original_slide_path": "one.svs",
+                "label_path": "label/missing.png", "macro_path": "../outside.png",
+            }],
+        )
+        batches, _ = app_module._renaming_batches()
+
+        response = self.client.get(f"/renaming?batch={batches[0].id}")
+
+        self.assertEqual(200, response.status_code)
+        self.assertNotIn(b">Label</a>", response.data)
+        self.assertNotIn(b">Macro</a>", response.data)
 
     def test_replace_sdl_accession_updates_existing_rows(self):
         workbook = load_workbook(app_module.Config.SDL_FILE_PATH)
@@ -942,6 +993,8 @@ class RenamingPageTests(unittest.TestCase):
         self.assertFalse(payload["finalized"])
         self.assertFalse(payload["merged"])
         self.assertIn('class="accession-form approved"', payload["group_html"])
+        self.assertIn(">Label</a>", payload["group_html"])
+        self.assertIn(">Macro</a>", payload["group_html"])
         _, saved = renaming.read_csv(self.batch / "name_mapping.csv")
         first = next(row for row in saved if row["AccessionID"] == "NP25-100")
         second = next(row for row in saved if row["AccessionID"] == "NP25-200")

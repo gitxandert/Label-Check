@@ -21,7 +21,15 @@
         <div class="slide"><strong>Original path</strong><strong>Stain</strong><strong>Block</strong><strong>Section</strong><strong>New name</strong></div>
         {% for slide in group.slides %}
         <div class="slide">
-            <span class="path">{{ slide.OriginalPath }}</span>
+            <div>
+                <span class="path">{{ slide.OriginalPath }}</span>
+                {% if slide.LabelImageURL or slide.MacroImageURL %}
+                <span class="image-links">
+                    {% if slide.LabelImageURL %}<a href="{{ slide.LabelImageURL }}" target="_blank" rel="noopener">Label</a>{% endif %}
+                    {% if slide.MacroImageURL %}<a href="{{ slide.MacroImageURL }}" target="_blank" rel="noopener">Macro</a>{% endif %}
+                </span>
+                {% endif %}
+            </div>
             <input type="hidden" name="original_path_{{ loop.index0 }}" value="{{ slide.OriginalPath }}">
             <input name="stain_{{ loop.index0 }}" value="{{ slide.Stain }}" required>
             <input name="block_number_{{ loop.index0 }}" value="{{ slide.BlockNumber }}" required>

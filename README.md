@@ -219,9 +219,13 @@ read-only permissions. The remaining paths are ordinary Windows bind mounts.
 Create and share `IMAGE_STAGING_HOST` (normally `D:\image_staging`) with Docker
 Desktop. Before each TQ upload, Label-Check copies selected GT450 slides to
 `<IMAGE_STAGING_HOST>\<destination directory>\<renamed slide>.svs`, removes the
-identifying label and macro from those copies, then gives only the staged paths
-to TQ. A staging or deidentification failure prevents the whole selection from
-uploading. Files confirmed successful by TQ are removed; failed files remain for
+identifying label and macro from those copies, then gives the staged slide paths
+and a generated metadata CSV to TQ. Each transfer uploads that CSV as
+`<destination directory>/metadata.csv` after the slides. It contains
+`accession_id,pid,num_slides`, with one row per accession
+and the number of selected slides for that accession. A staging or
+deidentification failure prevents the whole selection from uploading. Files
+confirmed successful by TQ are removed; failed files remain for
 diagnosis and are replaced from GT450 on retry. Size this directory for the
 largest transfer selection and restrict it to the workstation operators and
 Docker Desktop service account.

@@ -2912,6 +2912,7 @@ TQ_LOG_FIELDS = (
     "digitization_date",
     "status",
 )
+TQ_METADATA_FIELDS = ("accession_id", "pid", "num_slides")
 TQ_FILTER_FIELDS = (
     "None",
     "Organ",
@@ -2942,6 +2943,7 @@ class TQJob:
         slides: List[Dict[str, str]],
         all_slides: List[Dict[str, str]],
         manifest_path: Optional[Path] = None,
+        metadata_path: Optional[Path] = None,
     ):
         self.id = job_id
         self.owner_id = owner_id
@@ -2949,6 +2951,7 @@ class TQJob:
         self.slides = slides
         self.all_slides = all_slides
         self.manifest_path = manifest_path
+        self.metadata_path = metadata_path
         self.status = "running"
         self.return_code: Optional[int] = None
         self.output = ""
@@ -3464,7 +3467,50 @@ def _tq_config() -> Dict[str, Any]:
     return values
 
 
-def _tq_write_manifest(slides: List[Dict[str, str]]) -> Path:
+def _tq_write_metadata_csv(slides: List[Dict[str, str]]) -> Path:
+    directory = Path(Config.INSTANCE_DIR) / "tq_manifests"
+    directory.mkdir(parents=True, exist_ok=True)
+    descriptor, path_value = tempfile.mkstemp(
+        prefix="metadata-", suffix=".csv", dir=directory
+    )
+    path = Path(path_value)
+    accessions: Dict[str, Dict[str, Any]] = {}
+    try:
+        for slide in slides:
+            accession = slide.get("accession", "").strip().upper()
+            pid = slide.get("pid", "").strip().upper()
+            if not accession or not pid:
+                raise TQError(
+                    "Transfer metadata requires an accession ID and PID for every slide."
+                )
+            summary = accessions.setdefault(
+                accession,
+                {"accession_id": accession, "pid": pid, "num_slides": 0},
+            )
+            if summary["pid"] != pid:
+                raise TQError(
+                    f"Transfer metadata found multiple PIDs for accession {accession}."
+                )
+            summary["num_slides"] += 1
+
+        with os.fdopen(descriptor, "w", newline="", encoding="utf-8") as handle:
+            descriptor = -1
+            writer = csv.DictWriter(handle, fieldnames=TQ_METADATA_FIELDS)
+            writer.writeheader()
+            writer.writerows(accessions[key] for key in sorted(accessions))
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        if descriptor != -1:
+            os.close(descriptor)
+        path.unlink(missing_ok=True)
+        raise
+    return path
+
+
+def _tq_write_manifest(
+    slides: List[Dict[str, str]], metadata_path: Path
+) -> Path:
     directory = Path(Config.INSTANCE_DIR) / "tq_manifests"
     directory.mkdir(parents=True, exist_ok=True)
     descriptor, path_value = tempfile.mkstemp(
@@ -3486,6 +3532,13 @@ def _tq_write_manifest(slides: List[Dict[str, str]]) -> Path:
                     "destination_name": slide["destination_name"],
                 }
                 for slide in slides
+            )
+            writer.writerow(
+                {
+                    "original_path": str(metadata_path),
+                    "destination_dir": slides[0]["staging_dir"],
+                    "destination_name": "metadata.csv",
+                }
             )
             handle.flush()
             os.fsync(handle.fileno())
@@ -3811,7 +3864,8 @@ def _run_tq_job(job: TQJob) -> None:
         _tq_download_slides(job)
         _tq_deidentify_slides(job)
         _tq_append_output(job, "Starting TQ upload.\n")
-        job.manifest_path = _tq_write_manifest(job.slides)
+        job.metadata_path = _tq_write_metadata_csv(job.slides)
+        job.manifest_path = _tq_write_manifest(job.slides, job.metadata_path)
         command = [
             Config.TQ_EXECUTABLE,
             "pusher",
@@ -3827,11 +3881,18 @@ def _run_tq_job(job: TQJob) -> None:
         )
     except Exception as exc:
         _tq_fail_before_upload(job, exc)
+        _tq_cleanup_job_files(job)
         with _tq_state_lock:
             if _tq_active_job_id == job.id:
                 _tq_active_job_id = None
         return
     _read_tq_output(job)
+
+
+def _tq_cleanup_job_files(job: TQJob) -> None:
+    for path in (job.manifest_path, job.metadata_path):
+        if path is not None:
+            path.unlink(missing_ok=True)
 
 
 def _read_tq_output(job: TQJob) -> None:
@@ -3890,8 +3951,7 @@ def _read_tq_output(job: TQJob) -> None:
         job.status = "failed"
         job.return_code = job.process.poll() if job.process else None
     finally:
-        if job.manifest_path is not None:
-            job.manifest_path.unlink(missing_ok=True)
+        _tq_cleanup_job_files(job)
         with _tq_state_lock:
             if _tq_active_job_id == job.id:
                 _tq_active_job_id = None
@@ -5219,7 +5279,7 @@ def renaming_page():
             )
             _, rows = renaming.read_csv(mapping_path)
             reports = renaming.report_rows(context.root, Path(Config.COPATH_CLONE))
-        groups = renaming.group_mapping(rows, reports)
+        groups = _renaming_groups_with_image_links(context, rows, reports)
         signature = renaming.mapping_signature(rows)
     except renaming.RenamingError as exc:
         flash(str(exc), "error")
@@ -5302,7 +5362,7 @@ def _renaming_group_html(
     group = next(
         (
             candidate
-            for candidate in renaming.group_mapping(rows, reports)
+            for candidate in _renaming_groups_with_image_links(context, rows, reports)
             if candidate["accession"] == accession
         ),
         None,
@@ -5319,6 +5379,41 @@ def _renaming_group_html(
         group_key=f"updated-{uuid.uuid4().hex}",
         job_state=_renaming_job_state(context.id),
     )
+
+
+def _renaming_groups_with_image_links(
+    context: BatchContext,
+    rows: List[Dict[str, str]],
+    reports: Dict[str, Dict[str, str]],
+) -> List[Dict[str, object]]:
+    """Group mappings and attach safe, existing label/macro image URLs."""
+    _, enriched_rows = renaming.read_csv(context.root / "enriched.csv")
+    images_by_slide = {
+        row.get("original_slide_path", ""): row
+        for row in enriched_rows
+        if row.get("original_slide_path", "")
+    }
+    groups = renaming.group_mapping(rows, reports)
+    for group in groups:
+        for slide in group["slides"]:
+            source = images_by_slide.get(slide["OriginalPath"], {})
+            for source_key, destination_key in (
+                ("label_path", "LabelImageURL"),
+                ("macro_path", "MacroImageURL"),
+            ):
+                image_path = context.data_manager.get_absolute_path(
+                    source.get(source_key, "")
+                )
+                if image_path and os.path.isfile(image_path):
+                    relative_path = os.path.relpath(
+                        image_path, context.root
+                    ).replace(os.sep, "/")
+                    slide[destination_key] = url_for(
+                        "serve_relative_image",
+                        batch=context.id,
+                        filepath=relative_path,
+                    )
+    return groups
 
 
 @app.route("/renaming/pid/<batch_id>", methods=["GET"])

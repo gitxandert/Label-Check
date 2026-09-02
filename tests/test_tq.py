@@ -346,6 +346,94 @@ class TQTransferTests(unittest.TestCase):
         with self.assertRaisesRegex(app_module.TQError, "ftp_addr"):
             app_module._tq_config()
 
+    def test_metadata_csv_aggregates_accessions_and_uploads_last(self):
+        slides = [dict(slide) for slide in self.catalog()]
+        other = dict(slides[0])
+        other.update(
+            {
+                "accession": "NP25-200",
+                "pid": "AAAAAB",
+                "original_path": "three.svs",
+                "staged_path": "staged-three.svs",
+                "destination_name": "three.svs",
+            }
+        )
+        slides.append(other)
+        for slide in slides:
+            slide["staging_dir"] = "StudyA"
+            slide["destination_dir"] = app_module._tq_destination_dir(
+                "StudyA", slide
+            )
+
+        metadata_path = app_module._tq_write_metadata_csv(slides)
+        manifest_path = app_module._tq_write_manifest(slides, metadata_path)
+        try:
+            with metadata_path.open("r", newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                self.assertEqual(
+                    ["accession_id", "pid", "num_slides"], reader.fieldnames
+                )
+                self.assertEqual(
+                    [
+                        {
+                            "accession_id": "NP25-100",
+                            "pid": "AAAAAA",
+                            "num_slides": "2",
+                        },
+                        {
+                            "accession_id": "NP25-200",
+                            "pid": "AAAAAB",
+                            "num_slides": "1",
+                        },
+                    ],
+                    list(reader),
+                )
+            with manifest_path.open("r", newline="", encoding="utf-8") as handle:
+                manifest = list(csv.DictReader(handle))
+            self.assertEqual(len(slides) + 1, len(manifest))
+            self.assertEqual(
+                {
+                    "original_path": str(metadata_path),
+                    "destination_dir": "StudyA",
+                    "destination_name": "metadata.csv",
+                },
+                manifest[-1],
+            )
+        finally:
+            metadata_path.unlink(missing_ok=True)
+            manifest_path.unlink(missing_ok=True)
+
+    def test_metadata_csv_rejects_multiple_pids_for_one_accession(self):
+        slides = [dict(slide) for slide in self.catalog()]
+        slides[1]["pid"] = "AAAAAB"
+        metadata_dir = Path(app_module.Config.INSTANCE_DIR) / "tq_manifests"
+
+        with self.assertRaisesRegex(app_module.TQError, "multiple PIDs"):
+            app_module._tq_write_metadata_csv(slides)
+
+        self.assertEqual([], list(metadata_dir.glob("metadata-*.csv")))
+
+    def test_failed_upload_cleans_metadata_and_manifest(self):
+        slide = dict(self.catalog()[0])
+        slide["staging_dir"] = "StudyA"
+        slide["destination_dir"] = app_module._tq_destination_dir(
+            "StudyA", slide
+        )
+        job = app_module.TQJob(
+            "upload-failure", self.user.id, None, [slide], [slide]
+        )
+        job.metadata_path = app_module._tq_write_metadata_csv(job.slides)
+        job.manifest_path = app_module._tq_write_manifest(
+            job.slides, job.metadata_path
+        )
+        job.process = FakeProcess(return_code=1)
+
+        app_module._read_tq_output(job)
+
+        self.assertEqual("failed", job.status)
+        self.assertFalse(job.metadata_path.exists())
+        self.assertFalse(job.manifest_path.exists())
+
     def run_result_job(self, slide, all_slides):
         slide = dict(slide)
         slide["destination_dir"] = app_module._tq_destination_dir(
@@ -481,6 +569,13 @@ class TQTransferTests(unittest.TestCase):
             self.assertEqual(["tq", "pusher", "--paths"], command[:3])
             with Path(command[3]).open("r", newline="", encoding="utf-8") as handle:
                 captured["manifest"] = list(csv.DictReader(handle))
+            metadata_row = captured["manifest"][-1]
+            self.assertEqual("StudyA", metadata_row["destination_dir"])
+            self.assertEqual("metadata.csv", metadata_row["destination_name"])
+            with Path(metadata_row["original_path"]).open(
+                "r", newline="", encoding="utf-8"
+            ) as handle:
+                captured["metadata"] = list(csv.DictReader(handle))
             staged_path = captured["manifest"][0]["original_path"]
             self.assertEqual(b"deidentified-slide", Path(staged_path).read_bytes())
             output = (
@@ -497,8 +592,20 @@ class TQTransferTests(unittest.TestCase):
         manifest_row = captured["manifest"][0]
         self.assertEqual(slide["staged_path"], manifest_row["original_path"])
         self.assertEqual("StudyA/BRAIN/AAAAAA", manifest_row["destination_dir"])
+        self.assertEqual(
+            [
+                {
+                    "accession_id": "NP25-100",
+                    "pid": "AAAAAA",
+                    "num_slides": "1",
+                }
+            ],
+            captured["metadata"],
+        )
         self.assertEqual("succeeded", job.status)
         self.assertFalse(Path(slide["staged_path"]).exists())
+        self.assertFalse(job.metadata_path.exists())
+        self.assertFalse(job.manifest_path.exists())
         output_markers = [
             "Downloaded D:\\image_staging",
             "Starting deidentify_anonymize.py",
